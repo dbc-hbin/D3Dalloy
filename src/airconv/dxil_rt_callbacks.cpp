@@ -32,9 +32,9 @@
  *   - An intersection shader reports candidates with `dx.op.reportHit`. D3D12 gives
  *     it a value result: true when the hit was reported (the any-hit shader accepted
  *     it), false when the reported distance is outside the active ray interval or
- *     the any-hit shader rejected it. It is an ordinary call - it may run any number
- *     of times in one invocation and the shader keeps going afterwards - so the
- *     lowering replaces the call with its value and never terminates the body.
+ *     the any-hit shader rejected it. A continuing report resumes the intersection
+ *     shader with that value. AcceptHitAndEndSearch, including the first-hit flag's
+ *     implicit accept, terminates the intersection shader as well as the search.
  */
 
 #include "dxil_rt_callbacks.hpp"
@@ -530,6 +530,12 @@ void EmitCandidateCommit(
       b, control, kRtCandidateCommittedInstanceID, asWord(b, identity.instance_id)
     );
     storeField(b, control, kRtCandidateCommitted, b.getInt32(1));
+    // First-hit is an implicit AcceptHitAndEndSearch after an accepted report.
+    // Rejected candidates never reach this block and cannot end the search.
+    Value *flags = loadField(b, block, layout.hit_state + offsetof(SM50_RT_HIT_STATE, RayFlags), b.getInt32Ty());
+    Value *ended = loadField(b, control, kRtCandidateEndSearch, b.getInt32Ty());
+    storeField(b, control, kRtCandidateEndSearch,
+      b.CreateOr(ended, b.CreateLShr(b.CreateAnd(flags, b.getInt32(4)), b.getInt32(2))));
   });
 }
 
@@ -545,8 +551,8 @@ void EmitCommittedHitStateRestore(
   Value *have_committed = builder.CreateICmpNE(committed, builder.getInt32(0));
 
   /*
-   * Nothing is emitted until a hit has actually been committed: the first report of
-   * an invocation has to see the ray's own interval, not a tightened one.
+   * Only an accepted hit publishes committed ids/kind and tightens the active
+   * interval. A rejected first report must retain the incoming upper bound.
    */
   emitConditional(builder, have_committed, "rt.committed", [&](IRBuilder<> &b) {
     const uint32_t base = layout.hit_state;
@@ -565,7 +571,6 @@ void EmitCommittedHitStateRestore(
       b, control, kRtCandidateDistance, Type::getFloatTy(llvm_context)
     );
     Value *kind = loadField(b, control, kRtCandidateHitKind, Type::getInt32Ty(llvm_context));
-    storeField(b, block, base + offsetof(SM50_RT_HIT_STATE, RayTCurrent), distance);
     storeField(b, block, base + offsetof(SM50_RT_HIT_STATE, HitKind), kind);
 
     /*
@@ -580,6 +585,11 @@ void EmitCommittedHitStateRestore(
       b.CreateSelect(b.CreateFCmpOLT(distance, t_max), distance, t_max)
     );
   });
+  // Any-hit temporarily observes the reported distance. The intersection shader
+  // resumes with the active upper bound even when no report in this callback was
+  // accepted (including a native callback entered after another primitive won).
+  storeField(builder, block, layout.hit_state + offsetof(SM50_RT_HIT_STATE, RayTCurrent),
+    loadField(builder, control, kRtCandidateTMax, builder.getFloatTy()));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -615,6 +625,25 @@ llvm::Value *EmitIntersectionResult(
   Value *packed = PoisonValue::get(result);
   packed = builder.CreateInsertValue(packed, accept, 0);
   return builder.CreateInsertValue(packed, continue_search, 1);
+}
+
+void EmitIntersectionReturn(
+  Module &module, const RaytracingExportContext &context, Value *block, IRBuilder<> &builder
+) {
+  if (context.query_callbacks) {
+    builder.CreateRetVoid();
+    return;
+  }
+  Value *control = CandidateControlPointer(module, context, block, builder);
+  Value *committed = builder.CreateICmpNE(
+    loadField(builder, control, kRtCandidateCommitted, builder.getInt32Ty()), builder.getInt32(0));
+  Value *decision = EmitIntersectionResult(module, context, block, committed, builder);
+  Value *packed = PoisonValue::get(builder.GetInsertBlock()->getParent()->getReturnType());
+  packed = builder.CreateInsertValue(packed,
+    loadField(builder, control, kRtCandidateDistance, builder.getFloatTy()), 0);
+  packed = builder.CreateInsertValue(packed, builder.CreateExtractValue(decision, 0), 1);
+  packed = builder.CreateInsertValue(packed, builder.CreateExtractValue(decision, 1), 2);
+  builder.CreateRet(packed);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -855,6 +884,19 @@ llvm::Error LowerReportHitCall(
   if (call.getType() != Type::getInt1Ty(llvm_context))
     result = builder.CreateZExt(reported, call.getType());
   call.replaceAllUsesWith(result);
+  // AcceptHitAndEndSearch also terminates the intersection shader that called
+  // ReportHit. The same applies to the implicit end caused by the first-hit flag.
+  // Keep the suffix reachable only for a continuing report, including IgnoreHit.
+  BasicBlock *head = call.getParent();
+  BasicBlock *resume = head->splitBasicBlock(call.getIterator(), "rt.report.resume");
+  head->getTerminator()->eraseFromParent();
+  BasicBlock *ended = BasicBlock::Create(llvm_context, "rt.report.end", head->getParent(), resume);
+  builder.SetInsertPoint(head);
+  builder.CreateCondBr(
+    builder.CreateICmpNE(loadField(builder, control, kRtCandidateEndSearch, builder.getInt32Ty()),
+                         builder.getInt32(0)), ended, resume);
+  IRBuilder<> finish(ended);
+  EmitIntersectionReturn(module, context, block, finish);
   call.eraseFromParent();
   return llvm::Error::success();
 }

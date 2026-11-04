@@ -14,6 +14,8 @@ llvm::LoadInst *capturedLoad(llvm::IRBuilder<> &builder, llvm::Type *type, llvm:
                            llvm::MaybeAlign alignment = {});
 /* `coarse`: SM50_SHADER_D3D12_COARSE_SHADING is present (variable-rate coarse pixel shading, msaa_coarse.hpp). */
 /* `conservative`: SM50_SHADER_D3D12_CONSERVATIVE_RASTER; geometric coverage comes from the gather pass. */
+/* SM50_MSAA_GPU_TILE_TASKS reads array coverage at tile.target_layer. Inactive tasks exit before app/resource
+ * work; active app/helper quads keep their full tile while coverage and replay enforce the exact task scissor. */
 llvm::Error transformPixel(llvm::Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarse,
                            bool conservative);
 llvm::Error maskSampleFrequency(llvm::Module &module, uint32_t sampleMask);

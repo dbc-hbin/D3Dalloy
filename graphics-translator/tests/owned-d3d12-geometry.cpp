@@ -1657,18 +1657,45 @@ int casesIndirectStripExpansion(Context &c, const Shaders &s) {
     UINT count;   // indices of command 0 (from index 0)
     UINT start2;  // command 2: start index (count2 indices), base vertex 1
     UINT count2;
+    bool frontier = false;
   };
   std::vector<Float2> vertices;
   for (int k = 0; k < 16; ++k)
     vertices.push_back(corner(float(2 + 4 * (k % 8)), float(4 + 8 * (k / 8))));
-  const std::vector<Strip> strips = {
+  std::vector<Strip> strips = {
       {"indirect-strip-cut", D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, &s.tri,
        {0, 1, 2, 3, 0xffff, 5, 6, 7, 0xffff, 0xffff, 8, 9, 10, 11, 12}, 8, 8, 7},
       {"indirect-triadj-strip", D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
        &s.triadj, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, 10, 2, 8},
   };
+  // The two live segments cross the 256/512 scan boundaries; cut padding also spans whole empty blocks.
+  // Command 2 starts at an unaligned 16-bit index and restarts the same segments with a different base vertex.
+  for (bool adjacency : {false, true}) {
+    std::vector<uint16_t> indices(521, 0xffff);
+    for (UINT first : {250u, 508u})
+      for (UINT i = 0; i < (adjacency ? 10u : 7u); i++) indices[first + i] = uint16_t(i);
+    strips.push_back({adjacency ? "indirect-triadj-strip-scan" : "indirect-strip-cut-scan",
+                      adjacency ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ : D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                      D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, adjacency ? &s.triadj : &s.tri,
+                      std::move(indices), 521, 247, 274});
+  }
+  // A raw-index scan is bounded to 256 positions per scheduler slot. Long empty cut runs
+  // cross a 64-slot quantum, while live strips straddle scan boundaries and the final tail.
+  // The second command must restart assembly and use its own base, even after the long cursor.
+  for (bool adjacency : {false, true}) {
+    std::vector<uint16_t> indices(65 * 256 + 17, 0xffff);
+    for (UINT i = 0; i < 6; ++i) indices[250 + i] = uint16_t(i);
+    for (UINT first : {257u, 510u, 16381u})
+      for (UINT i = 0; i < (adjacency ? 10u : 7u); ++i) indices[first + i] = uint16_t(i);
+    strips.push_back({adjacency ? "indirect-frontier-triadj-carry" : "indirect-frontier-strip-cut-carry",
+                      adjacency ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ : D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+                      D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, adjacency ? &s.triadj : &s.tri,
+                      std::move(indices), 65 * 256 + 17, 16379, 20, true});
+  }
   for (const auto &strip : strips)
     for (bool so : {false, true}) {
+      if (strip.frontier && !so)
+        continue;
       D3D12_INPUT_ELEMENT_DESC element = {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
                                           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0};
       D3D12_SO_DECLARATION_ENTRY entries[2] = {{0, "SV_Position", 0, 0, 4, 0}, {0, "COLOR", 0, 0, 4, 0}};
@@ -1702,6 +1729,11 @@ int casesIndirectStripExpansion(Context &c, const Shaders &s) {
       };
       auto record = [&](bool indirect) {
         Result result;
+        if (strip.frontier && indirect) {
+          std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=geometry shader=%s case=%s begin\n",
+                       useDxil ? "dxil" : "dxbc", strip.name);
+          std::fflush(stderr);
+        }
         D3D12_VERTEX_BUFFER_VIEW view;
         auto vb = vertexBuffer(c, vertices, view);
         auto ib = buffer(c.device.Get(), strip.indices.size() * 2 + 16, D3D12_HEAP_TYPE_UPLOAD,
@@ -1728,7 +1760,7 @@ int casesIndirectStripExpansion(Context &c, const Shaders &s) {
         sd.pArgumentDescs = &argument;
         ComPtr<ID3D12CommandSignature> signature;
         check(c.device->CreateCommandSignature(&sd, nullptr, IID_PPV_ARGS(&signature)), "strip-signature");
-        constexpr UINT kSoBytes = 256 * 32; // every record fits: no overflow masks a difference
+        const UINT kSoBytes = (strip.frontier ? 512u : 256u) * 32; // every record fits
         auto target = buffer(c.device.Get(), kSoBytes + 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT);
         auto readback = buffer(c.device.Get(), kSoBytes + 256, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         auto zero = buffer(c.device.Get(), kSoBytes + 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -1785,11 +1817,27 @@ int casesIndirectStripExpansion(Context &c, const Shaders &s) {
         const auto *bytes = static_cast<const uint8_t *>(mapped);
         std::memcpy(&result.filled, bytes + kSoBytes, sizeof(result.filled));
         result.so.assign(bytes, bytes + kSoBytes);
+        if (strip.frontier)
+          require(std::all_of(bytes + kSoBytes + 8, bytes + kSoBytes + 256,
+                              [](uint8_t value) { return value == 0; }), "frontier-strip-so-tail-guard");
         readback->Unmap(0, &none);
         range = {0, sizeof(result.statistics)};
         check(stats->Map(0, &range, &mapped), "strip-map-stats");
         std::memcpy(&result.statistics, mapped, sizeof(result.statistics));
         stats->Unmap(0, &none);
+        if (strip.frontier) {
+          const bool adjacency = strip.topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+          const uint64_t wantedInvocations = adjacency ? 13u : 48u;
+          const uint64_t wantedPrimitives = adjacency ? 52u : 96u;
+          require(result.statistics.GSInvocations == wantedInvocations &&
+                  result.statistics.GSPrimitives == wantedPrimitives &&
+                  result.filled == wantedPrimitives * 3 * stride, "frontier-strip-complete-consumer-counts");
+          if (indirect) {
+            std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=geometry shader=%s case=%s end\n",
+                         useDxil ? "dxil" : "dxbc", strip.name);
+            std::fflush(stderr);
+          }
+        }
         return result;
       };
       const Result direct = record(false), indirect = record(true);
@@ -1807,6 +1855,11 @@ int casesIndirectStripExpansion(Context &c, const Shaders &s) {
                   (unsigned long long)direct.filled);
       if (!statsEqual || !soEqual || !b.GSInvocations)
         fail((name + "-equal").c_str());
+      if (strip.frontier)
+        std::printf("%s_CAPTURE_FRONTIER_PASS shader=%s case=%s raw_positions=16657 carry=1 "
+                    "commands=2 gs=%llu primitives=%llu bytes=%llu guards=1 direct=exact\n",
+                    kPrefix, useDxil ? "dxil" : "dxbc", strip.name, a.GSInvocations, a.GSPrimitives,
+                    (unsigned long long)indirect.filled);
       std::printf("%s_CASE_PASS shader=%s case=%s-equal\n", kPrefix, useDxil ? "dxil" : "dxbc", name.c_str());
       ++cases;
     }

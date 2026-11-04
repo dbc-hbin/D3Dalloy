@@ -19,6 +19,14 @@ VSOut vs_pass(float2 position : POSITION) {
   return o;
 }
 
+// Distinguish scheduler instance cursors without changing tessellation factors or domain points.
+// Two commands also fetch different VB positions in the focused frontier fixture.
+VSOut vs_frontier(float2 position : POSITION, uint instance : SV_InstanceID) {
+  VSOut o;
+  o.position = float4(position, float(instance) / 64.0, 1);
+  return o;
+}
+
 struct TriConstants {
   float edge[3] : SV_TessFactor;
   float inside : SV_InsideTessFactor;

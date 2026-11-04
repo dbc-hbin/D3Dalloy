@@ -3,7 +3,9 @@
 
 #include "airconv_context.hpp"
 #include "air_signature.hpp"
+#include "capture_frontier.hpp"
 #include "dxil_converter.hpp"
+#include "mesh_index_buffer_view.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -524,6 +526,11 @@ MDNode *conservativeOutput(LLVMContext &context, StringRef name, StringRef type)
 // the original pair and expands it without invoking the application VS again.
 Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, bool capture,
                 bool conservative) {
+  const bool gpuTileTasks = options.variant & SM50_MSAA_GPU_TILE_TASKS;
+  const bool nativeTransport = options.variant == SM50_CAPTURE_VERTEX_NATIVE ||
+                               options.variant == SM50_REPLAY_VERTEX_NATIVE;
+  if (gpuTileTasks && (capture || (options.variant & ~SM50_MSAA_GPU_TILE_TASKS) != SM50_MSAA_VERTEX_REPLAY))
+    return invalid("GPU tile tasks require captured vertex replay");
   if (options.line_mode != SM50_MSAA_LINE_NONE && options.line_mode != SM50_MSAA_LINE_ALIASED &&
       options.line_mode != SM50_MSAA_LINE_ALPHA_AA && options.line_mode != SM50_MSAA_LINE_QUADRILATERAL)
     return invalid("unknown line raster mode");
@@ -537,9 +544,52 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   auto *oldMetadata = vertices->getOperand(0);
   auto *original = dyn_cast<Function>(cast<ValueAsMetadata>(oldMetadata->getOperand(0))->getValue());
   auto *oldInputs = dyn_cast<MDTuple>(oldMetadata->getOperand(2));
-  if (!original || !oldInputs || original->arg_size() != oldInputs->getNumOperands() ||
-      original->getReturnType()->isVoidTy())
+  if (!original || !oldInputs || original->arg_size() != oldInputs->getNumOperands())
     return invalid("missing rasterizing vertex return or AIR arguments");
+  // SO_NO_RASTERIZED_STREAM permits a VS with no position, including a void
+  // native return. Its SO epilogue is still executed exactly once. The private
+  // record only needs a dummy position because no raster consumer uses it.
+  if (capture && nativeTransport) {
+    auto *outputs = dyn_cast<MDTuple>(oldMetadata->getOperand(1));
+    bool hasPosition = false;
+    if (outputs)
+      for (const auto &operand : outputs->operands()) {
+        auto *field = dyn_cast<MDNode>(operand.get());
+        auto *kind = field && field->getNumOperands() ? dyn_cast<MDString>(field->getOperand(0)) : nullptr;
+        hasPosition |= kind && kind->getString() == "air.position";
+      }
+    if (original->getReturnType()->isVoidTy() || !hasPosition) {
+      LLVMContext &context = module.getContext();
+      auto *float4 = FixedVectorType::get(Type::getFloatTy(context), 4);
+      auto *wrapperType = StructType::get(context, {float4}, true);
+      auto originalName = original->getName().str();
+      original->setName(originalName + ".so_body");
+      auto *wrapper = Function::Create(FunctionType::get(
+          wrapperType, original->getFunctionType()->params(), false),
+          Function::ExternalLinkage, originalName, module);
+      wrapper->setCallingConv(original->getCallingConv());
+      IRBuilder<> wrapperBuilder(BasicBlock::Create(context, "entry", wrapper));
+      SmallVector<Value *, 20> arguments;
+      for (auto &argument : wrapper->args()) arguments.push_back(&argument);
+      wrapperBuilder.CreateCall(original, arguments);
+      Value *position = Constant::getNullValue(float4);
+      position = wrapperBuilder.CreateInsertElement(position, ConstantFP::get(Type::getFloatTy(context), 1),
+                                                      wrapperBuilder.getInt32(3));
+      wrapperBuilder.CreateRet(wrapperBuilder.CreateInsertValue(UndefValue::get(wrapperType), position, 0));
+      original->setLinkage(Function::InternalLinkage);
+      SmallVector<Metadata *, 8> fields(oldMetadata->op_begin(), oldMetadata->op_end());
+      fields[0] = ValueAsMetadata::get(wrapper);
+      fields[1] = MDTuple::get(context, {MDTuple::get(context, {
+          MDString::get(context, "air.position"), MDString::get(context, "air.arg_type_name"),
+          MDString::get(context, "float4"), MDString::get(context, "air.arg_name"),
+          MDString::get(context, "so_private_position")})});
+      oldMetadata = MDTuple::get(context, fields);
+      vertices->setOperand(0, oldMetadata);
+      original = wrapper;
+    }
+  }
+  if (original->getReturnType()->isVoidTy())
+    return invalid("missing rasterizing vertex return");
   uint64_t bytes = module.getDataLayout().getTypeAllocSize(original->getReturnType()).getFixedValue();
   if (!bytes || (bytes & 3) || bytes / 4 > UINT32_MAX)
     return invalid("native output cannot be represented as dword records");
@@ -559,7 +609,7 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     .primitive_id_offset_dwords = ~0u,
   };
   auto *structLayout = module.getDataLayout().getStructLayout(nativeStruct);
-  unsigned positionField = ~0u;
+  unsigned positionField = ~0u, clipField = ~0u;
   for (unsigned i = 0; i < oldOutputs->getNumOperands(); ++i) {
     auto *field = dyn_cast<MDTuple>(oldOutputs->getOperand(i));
     auto *kind = field && field->getNumOperands() ? dyn_cast<MDString>(field->getOperand(0)) : nullptr;
@@ -575,6 +625,14 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
                  : nullptr;
     if (target) *target = uint32_t(offset / 4);
     if (kind->getString() == "air.position") positionField = i;
+    if (kind->getString() == "air.clip_distance") {
+      auto *distances = dyn_cast<ArrayType>(nativeStruct->getElementType(i));
+      if (clipField != ~0u || !distances || !distances->getElementType()->isFloatTy() ||
+          distances->getNumElements() > 8)
+        return invalid("native clip distance output must be one bounded float array");
+      clipField = i;
+      layout.clip_distance_count = unsigned(distances->getNumElements());
+    }
     if (kind->getString() == "air.vertex_output") {
       auto *name = field->getNumOperands() > 1 ? dyn_cast<MDString>(field->getOperand(1)) : nullptr;
       if (name && name->getString() == "user(d3dalloy_primitive_id)")
@@ -599,7 +657,7 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   uint32_t user_scalars = 0;
   for (uint32_t i = 0; i < layout.user_count; ++i)
     user_scalars += (layout.users[i].size_bytes + 3) / 4;
-  for (uint32_t i = layout.user_count; i-- && user_scalars > 116;) {
+  for (uint32_t i = layout.user_count; !nativeTransport && i-- && user_scalars > 116;) {
     layout.users[i].flags |= 1;
     ++layout.spill_count;
     user_scalars -= (layout.users[i].size_bytes + 3) / 4;
@@ -608,10 +666,13 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     return invalid("rasterizing vertex shader has no position output");
   if (nativeStruct->getElementType(positionField) != FixedVectorType::get(Type::getFloatTy(module.getContext()), 4))
     return invalid("native vertex position must be float4");
+  // Task bounds are applied by native scissoring. Re-clipping the captured geometry here would create
+  // newly snapped edge endpoints and change sample coverage, even with a guard around the tile.
+  layout.flags |= SM50_MSAA_VERTEX_GPU_TILE_TASKS_SUPPORTED;
   if (options.layout_out) *options.layout_out = layout;
 
   unsigned vertexArg = ~0u, baseVertexArg = ~0u, instanceArg = ~0u, baseInstanceArg = ~0u;
-  unsigned controlArg = ~0u, indicesArg = ~0u;
+  unsigned controlArg = ~0u, indicesArg = ~0u, frontierArg = ~0u;
   for (unsigned i = 0; i < oldInputs->getNumOperands(); ++i) {
     auto kind = inputKind(*cast<MDNode>(oldInputs->getOperand(i)));
     if (capture && kind == "air.vertex_input")
@@ -631,6 +692,7 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
         if (!value) break;
         if (value->getZExtValue() == SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL) controlArg = i;
         if (value->getZExtValue() == SM50_BINDING_INDEX_VERTEX_INDICES) indicesArg = i;
+        if (value->getZExtValue() == SM50_BINDING_INDEX_CAPTURE_FRONTIER) frontierArg = i;
         break;
       }
     }
@@ -658,8 +720,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   metadata.push_back(air::BuildBufferArgumentMetadata(recordArg, recordsBinding(capture), context,
                                                       module.getDataLayout()));
   unsigned boundsArg = ~0u, replayIndicesArg = ~0u;
-  const bool line = !capture && options.line_mode != SM50_MSAA_LINE_NONE;
-  const bool conservativeTriangles = !capture && !line && conservative;
+  const bool line = !capture && !nativeTransport && options.line_mode != SM50_MSAA_LINE_NONE;
+  const bool conservativeTriangles = !capture && !nativeTransport && !line && conservative;
   if (line || conservativeTriangles) {
     boundsArg = parameters.size();
     parameters.push_back(PointerType::get(Type::getInt32Ty(context), unsigned(air::AddressSpace::constant)));
@@ -684,7 +746,7 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   original->setName(originalName + ".msaa_body");
   auto nativeFields = nativeStruct->elements();
   SmallVector<Type *, 12> replayFields(nativeFields.begin(), nativeFields.end());
-  if (!capture) {
+  if (!capture && !nativeTransport) {
     replayFields.push_back(nativeStruct->getElementType(positionField));
     replayFields.push_back(Type::getFloatTy(context));
     replayFields.push_back(Type::getFloatTy(context));
@@ -717,7 +779,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   }
   auto *compactReturn = StructType::get(context, compactFields, true);
   auto *entry = Function::Create(FunctionType::get(capture ? Type::getVoidTy(context)
-                                                          : compactReturn, parameters, false),
+                                                          : nativeTransport ? nativeStruct : compactReturn,
+                                                   parameters, false),
                                  Function::ExternalLinkage, originalName, module);
   entry->setCallingConv(original->getCallingConv());
   auto *first = BasicBlock::Create(context, "entry", entry);
@@ -725,7 +788,15 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   auto *records = entry->getArg(recordArg);
   auto *ordinal = capture ? builder.CreateExtractElement(entry->getArg(positionArg), builder.getInt32(0))
                           : static_cast<Value *>(entry->getArg(positionArg));
-  auto *offset = builder.CreateMul(builder.CreateZExt(ordinal, builder.getInt64Ty()), builder.getInt64(stride));
+  Value *frontier = nullptr;
+  if (capture && frontierArg != ~0u)
+    for (unsigned i = 0; i < originalArgs.size(); ++i)
+      if (originalArgs[i] == frontierArg) frontier = entry->getArg(i);
+  Value *recordOrdinal = ordinal;
+  if (frontier)
+    recordOrdinal = builder.CreateAdd(ordinal, dxbc::load_capture_frontier(builder, frontier,
+        offsetof(SM50_CAPTURE_FRONTIER_CONTROL, producer_record_base)));
+  auto *offset = builder.CreateMul(builder.CreateZExt(recordOrdinal, builder.getInt64Ty()), builder.getInt64(stride));
   auto *record = builder.CreateBitCast(builder.CreateGEP(builder.getInt32Ty(), records, offset),
                                       PointerType::get(original->getReturnType(), unsigned(air::AddressSpace::device)));
 
@@ -743,21 +814,31 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
                                 builder.CreateConstInBoundsGEP1_32(builder.getInt32Ty(), control, word));
     };
     auto *positions = load(offsetof(SM50_SO_CAPTURE_CONTROL, positions_per_instance) / 4);
-    auto *count = load(offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4);
-    auto *validCount = builder.CreateAnd(builder.CreateICmpULT(ordinal, count),
-                                         builder.CreateICmpNE(positions, builder.getInt32(0)));
+    Value *count = load(offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4);
+    Value *validCount = builder.CreateAnd(builder.CreateICmpULT(ordinal, count),
+                                          builder.CreateICmpNE(positions, builder.getInt32(0)));
+    if (frontier) {
+      count = dxbc::load_capture_frontier(builder, frontier,
+          offsetof(SM50_CAPTURE_FRONTIER_CONTROL, producer_count));
+      validCount = builder.CreateAnd(builder.CreateICmpULT(ordinal, count),
+          builder.CreateICmpULT(recordOrdinal, dxbc::load_capture_frontier(builder, frontier,
+              offsetof(SM50_CAPTURE_FRONTIER_CONTROL, local_key_count))));
+    }
     auto *validBlock = BasicBlock::Create(context, "valid_ordinal", entry);
     auto *done = BasicBlock::Create(context, "done", entry);
     builder.CreateCondBr(validCount, validBlock, done);
     builder.SetInsertPoint(validBlock);
-    auto *positionInInstance = builder.CreateURem(ordinal, positions);
-    auto *activePositions = load(offsetof(SM50_MSAA_VERTEX_CAPTURE_CONTROL, active_positions_per_instance) / 4);
+    auto *positionInInstance = frontier ? ordinal : builder.CreateURem(ordinal, positions);
+    auto *activePositions = frontier ? count :
+        load(offsetof(SM50_MSAA_VERTEX_CAPTURE_CONTROL, active_positions_per_instance) / 4);
     auto *activeBlock = BasicBlock::Create(context, "valid_position", entry);
     builder.CreateCondBr(builder.CreateICmpULT(positionInInstance, activePositions), activeBlock, done);
     builder.SetInsertPoint(activeBlock);
-    auto *key = builder.CreateAdd(positionInInstance,
-                                  load(offsetof(SM50_SO_CAPTURE_CONTROL, first_position) / 4));
-    auto *instance = builder.CreateUDiv(ordinal, positions);
+    auto *key = builder.CreateAdd(positionInInstance, frontier ?
+        dxbc::load_capture_frontier(builder, frontier, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, first_position)) :
+        load(offsetof(SM50_SO_CAPTURE_CONTROL, first_position) / 4));
+    auto *instance = frontier ? dxbc::load_capture_frontier(builder, frontier,
+        offsetof(SM50_CAPTURE_FRONTIER_CONTROL, instance_base)) : builder.CreateUDiv(ordinal, positions);
     auto *indexSize = load(offsetof(SM50_SO_CAPTURE_CONTROL, index_size) / 4);
     auto *indexed = builder.CreateICmpNE(indexSize, builder.getInt32(0));
     auto *word = builder.CreateAdd(load(offsetof(SM50_SO_CAPTURE_CONTROL, index_first) / 4),
@@ -768,12 +849,28 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     auto *shadeBlock = BasicBlock::Create(context, "shade", entry);
     builder.CreateCondBr(indexed, indexBlock, shadeBlock);
     builder.SetInsertPoint(indexBlock);
+    auto *viewBlock = BasicBlock::Create(context, "read_index_view", entry);
+    auto *rawBlock = BasicBlock::Create(context, "read_raw_index", entry);
+    builder.CreateCondBr(builder.CreateICmpEQ(indexSize, builder.getInt32(8)), viewBlock, rawBlock);
+    builder.SetInsertPoint(viewBlock);
+    auto *viewIndex = dxbc::load_mesh_index_buffer_view(builder, indexWords,
+      builder.CreateAdd(key, load(offsetof(SM50_SO_CAPTURE_CONTROL, index_first) / 4)));
+    auto *viewWords = builder.CreateBitCast(indexWords,
+      builder.getInt32Ty()->getPointerTo(cast<PointerType>(indexWords->getType())->getAddressSpace()));
+    auto *viewFormat = builder.CreateLoad(builder.getInt32Ty(),
+      builder.CreateConstGEP1_32(builder.getInt32Ty(), viewWords, 3));
+    auto *viewRestart = builder.CreateSelect(builder.CreateICmpEQ(viewFormat, builder.getInt32(42)),
+                                            builder.getInt32(~0u), builder.getInt32(0xffff));
+    auto *viewEnd = builder.GetInsertBlock();
+    auto *joinIndex = BasicBlock::Create(context, "join_index", entry);
+    builder.CreateBr(joinIndex);
+    builder.SetInsertPoint(rawBlock);
     auto *lo = builder.CreateZExt(builder.CreateLoad(builder.getInt16Ty(),
       builder.CreateGEP(builder.getInt16Ty(), indexWords, builder.CreateZExt(word, builder.getInt64Ty()))),
       builder.getInt32Ty());
     auto *isWide = builder.CreateICmpEQ(indexSize, builder.getInt32(4));
+    auto *rawRestart = builder.CreateSelect(isWide, builder.getInt32(~0u), builder.getInt32(0xffff));
     auto *highBlock = BasicBlock::Create(context, "read_high_index", entry);
-    auto *joinIndex = BasicBlock::Create(context, "join_index", entry);
     builder.CreateCondBr(isWide, highBlock, joinIndex);
     builder.SetInsertPoint(highBlock);
     auto *hi = builder.CreateZExt(builder.CreateLoad(builder.getInt16Ty(),
@@ -782,10 +879,14 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     auto *wideIndex = builder.CreateOr(lo, builder.CreateShl(hi, 16));
     builder.CreateBr(joinIndex);
     builder.SetInsertPoint(joinIndex);
-    auto *index = builder.CreatePHI(builder.getInt32Ty(), 2);
-    index->addIncoming(lo, indexBlock);
+    auto *index = builder.CreatePHI(builder.getInt32Ty(), 3);
+    index->addIncoming(lo, rawBlock);
     index->addIncoming(wideIndex, highBlock);
-    auto *restart = builder.CreateSelect(isWide, builder.getInt32(~0u), builder.getInt32(0xffff));
+    index->addIncoming(viewIndex, viewEnd);
+    auto *restart = builder.CreatePHI(builder.getInt32Ty(), 3);
+    restart->addIncoming(rawRestart, rawBlock);
+    restart->addIncoming(rawRestart, highBlock);
+    restart->addIncoming(viewRestart, viewEnd);
     // List topologies can legitimately reference the maximum index; strip cut
     // semantics are topology dependent, not a property of the index format.
     auto *stripCut = builder.CreateICmpNE(
@@ -793,7 +894,8 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     builder.CreateCondBr(builder.CreateAnd(stripCut, builder.CreateICmpEQ(index, restart)),
                          done, shadeBlock);
     builder.SetInsertPoint(shadeBlock);
-    auto *base = builder.CreateSelect(indexed, builder.getInt32(0),
+    auto *base = builder.CreateSelect(indexed, frontier ?
+      load(offsetof(SM50_SO_CAPTURE_CONTROL, base_vertex) / 4) : builder.getInt32(0),
       load(offsetof(SM50_SO_CAPTURE_CONTROL, padding) / 4 + 1));
     auto *vertex = builder.CreateAdd(key, base);
     auto *startInstance = load(offsetof(SM50_SO_CAPTURE_CONTROL, padding) / 4);
@@ -817,6 +919,18 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
     auto *kernel = module.getOrInsertNamedMetadata("air.kernel");
     kernel->addOperand(entryMetadata(*entry, *oldMetadata, metadata, false));
   } else {
+    if (nativeTransport) {
+      auto *value = builder.CreateAlignedLoad(nativeStruct, record, Align(4));
+      if (module.getModuleFlag(dxil::kAtomic64PhaseFlag))
+        value->setMetadata(dxil::kAtomic64Metadata, MDNode::get(module.getContext(), {}));
+      builder.CreateRet(value);
+      // Keep every original return member and its metadata, including native
+      // distance/viewport/layer outputs. Native replay needs no MSAA varyings.
+      vertices->setOperand(0, entryMetadata(*entry, *oldMetadata, metadata, true));
+      original->dropAllReferences();
+      original->eraseFromParent();
+      return Error::success();
+    }
     Value *result;
     if (line) {
       result = expandedLine(builder, ordinal, records, entry->getArg(replayIndicesArg),
@@ -916,9 +1030,12 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
 } // namespace
 
 Error transformVertex(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &options, bool conservative) {
-  if (options.variant == SM50_MSAA_VERTEX_CAPTURE)
+  const unsigned variant = options.variant & ~SM50_MSAA_GPU_TILE_TASKS;
+  if (variant == SM50_MSAA_VERTEX_CAPTURE || variant == SM50_CAPTURE_VERTEX_NATIVE)
     return transform(module, options, true, false);
-  if (options.variant == SM50_MSAA_VERTEX_REPLAY) {
+  if (variant == SM50_REPLAY_VERTEX_NATIVE)
+    return transform(module, options, false, false);
+  if (variant == SM50_MSAA_VERTEX_REPLAY) {
     if (auto error = transform(module, options, false, conservative))
       return error;
     if (conservative && options.line_mode == SM50_MSAA_LINE_NONE)

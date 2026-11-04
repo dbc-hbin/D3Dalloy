@@ -23,6 +23,7 @@
 #include "d3d12_pipeline.hpp"
 #include "d3d12_pipeline_cache.hpp"
 #include "d3d12_shader_failure.hpp"
+#include "owned_atomic64_constants.hpp"
 #include "d3dalloy_format.hpp"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
@@ -519,7 +520,22 @@ ShaderImmutableConstants::Initialize(
     }
     memcpy(memory + offset + relocations[i].Offset, &address, sizeof(address));
   }
+  if (compiled.ConstantRelocationCount && std::any_of(relocations, relocations + compiled.ConstantRelocationCount, [](const auto &relocation) {
+        return relocation.TargetOffset == SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT;
+      })) {
+    atomic64_relocations.assign(relocations, relocations + compiled.ConstantRelocationCount);
+    size = compiled.ConstantDataSize;
+    this->alignment = alignment;
+    mapped = memory + offset;
+  }
   return S_OK;
+}
+
+HRESULT ShaderImmutableConstants::CopyForAtomic64(uint64_t context, uint64_t address, void *destination) const {
+  return CopyAtomic64Constants(destination, mapped, size, address, context,
+      std::span<const SM50_CONSTANT_RELOCATION>(atomic64_relocations),
+      SM50_CONSTANT_RELOCATION_TARGET_ATOMIC64_CONTEXT, SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE)
+      ? S_OK : E_INVALIDARG;
 }
 
 HRESULT
@@ -646,6 +662,11 @@ protected:
   /* Coarse shading variants, indexed by statistics_enabled. */
   std::array<std::unique_ptr<MSAAPipelineVariants>, 2> msaa_coarse_variants;
   std::array<bool, 2> msaa_coarse_variants_attempted{};
+  std::array<std::unique_ptr<MSAAPipelineVariants>, 4> msaa_frontier_variants;
+  std::array<bool, 4> msaa_frontier_variants_attempted{};
+  std::mutex capture_frontier_pso_mutex;
+  std::array<std::unique_ptr<CaptureFrontierPipelines>, 2> capture_frontier_variants;
+  std::array<bool, 2> capture_frontier_variants_attempted{};
   WMTRenderPipelineInfo msaa_original_info{};
   bool msaa_dual_source = false;
   std::mutex mesh_pso_mutex;
@@ -855,6 +876,8 @@ protected:
       if (stage[0] == 'M' && (capture_pixels || replay_pixels)) {
         capture.type = SM50_SHADER_D3D12_MSAA_MESH;
         capture.variant = capture_pixels ? SM50_MSAA_VERTEX_CAPTURE : SM50_MSAA_VERTEX_REPLAY;
+        if (replay_pixels && (key & kMeshMSAAGPUTileTasks))
+          capture.variant |= SM50_MSAA_GPU_TILE_TASKS;
         capture.layout_out = &variant.vertex_layout;
         capture.mesh_layout_out = &variant.capture_layout;
         capture.line_mode = owned_line_mode;
@@ -962,6 +985,12 @@ protected:
     void *tail = statistics ? static_cast<void *>(&stats) : static_cast<void *>(&common);
     const bool capture_pixels = key & kMeshMSAACapture;
     const bool replay_vertices = key & kMeshMSAAReplay;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA frontier{};
+    frontier.type = SM50_SHADER_D3D12_CAPTURE_FRONTIER;
+    if (key & kMeshCaptureFrontier) {
+      frontier.next = tail;
+      tail = &frontier;
+    }
     SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
     atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
     if (uses_atomic64) {
@@ -970,6 +999,8 @@ protected:
     SM50_SHADER_D3D12_MSAA_MESH_DATA msaa_mesh{};
     msaa_mesh.type = SM50_SHADER_D3D12_MSAA_MESH;
     msaa_mesh.variant = replay_vertices ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
+    if (replay_vertices && (key & kMeshMSAAGPUTileTasks))
+      msaa_mesh.variant |= SM50_MSAA_GPU_TILE_TASKS;
     msaa_mesh.layout_out = &variant.vertex_layout;
     msaa_mesh.mesh_layout_out = &variant.capture_layout;
     variant.capture_layout.threads_per_group = gs_pass ? 1 : 32;
@@ -2455,11 +2486,155 @@ public:
     return &variant;
   }
 
-  const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics_enabled, bool coarse) override {
+  const CaptureFrontierPipelines *GetCaptureFrontierPipelines(bool statistics_enabled) override {
+    if (mesh_kind != MeshPipelineKind::None || !WaitNativePipeline())
+      return nullptr;
+    std::lock_guard lock(capture_frontier_pso_mutex);
+    auto &cached = capture_frontier_variants[statistics_enabled];
+    auto &attempted = capture_frontier_variants_attempted[statistics_enabled];
+    if (attempted) return cached.get();
+    attempted = true;
+    auto variants = std::make_unique<CaptureFrontierPipelines>();
+    SM50_SHADER_COMMON_DATA common{};
+    common.type = SM50_SHADER_COMMON;
+    common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
+    common.metal_version = uses_atomic64 ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
+    // Replay also lowers the original DXIL before removing its application
+    // body. Keep canonical Atomic64 bindings/phase semantics in every role.
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
+    atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
+    atomic_phase.next = &common;
+    SM50_SHADER_COMPILATION_ARGUMENT_DATA frontier{};
+    frontier.type = SM50_SHADER_D3D12_CAPTURE_FRONTIER;
+    frontier.next = uses_atomic64 ? static_cast<void *>(&atomic_phase) : static_cast<void *>(&common);
+    WMT::Reference<WMT::Error> error;
+    auto compile = [&](const SharedShaderBytecode &source, const char *name,
+                       SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, ShaderImmutableConstants &constants,
+                       WMT::Reference<WMT4::Function> &function) -> bool {
+      SM50Error compile_error;
+      SM50ShaderBitcode compiled;
+      std::shared_ptr<const ShaderStageArtifact> artifact;
+      if (device_->GetShaderArtifactCache().CompileShader({source.data(), source.size()}, args, name,
+                                                         &compiled, &compile_error, artifact)) {
+        ERR("Failed to compile capture frontier ", name, ": ", SM50GetErrorMessageString(compile_error));
+        return false;
+      }
+      SM50_COMPILED_BITCODE bytecode{};
+      if (artifact) bytecode = artifact->view;
+      else SM50GetCompiledBitcode(compiled, &bytecode);
+      if (FAILED(constants.Initialize(device_, bytecode, compiled))) return false;
+      auto library = device_->GetShaderArtifactCache().Library(
+          device_->GetMetal4Compiler(), bytecode, compiled, error);
+      function = library ? device_->GetShaderArtifactCache().Function(library, name)
+                         : WMT::Reference<WMT4::Function>();
+      return bool(function);
+    };
+    WMT::Reference<WMT4::Function> capture_vertex, replay_vertex, replay_fragment;
+    const bool rasterize = indirect_info.rasterization_enabled;
+    for (uint32_t replay = 0; replay < (rasterize ? 2u : 1u); ++replay) {
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
+      statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
+      statistics.next = &frontier;
+      SM50_SHADER_D3D12_MSAA_VERTEX_DATA native{};
+      native.type = SM50_SHADER_D3D12_MSAA_VERTEX;
+      native.variant = replay ? SM50_REPLAY_VERTEX_NATIVE : SM50_CAPTURE_VERTEX_NATIVE;
+      native.sample_count = EffectiveRasterSampleCount();
+      native.layout_out = &variants->vertex_layout;
+      native.next = statistics_enabled && !replay ? static_cast<void *>(&statistics)
+                                                 : static_cast<void *>(&frontier);
+      std::vector<SM50_SO_CAPTURE_ELEMENT> elements;
+      SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA capture{};
+      void *tail = &native;
+      if (!replay) {
+        const auto &source = statistics_enabled ? statistics_capture_elements : stream_output.elements;
+        elements.reserve(source.size());
+        for (const auto &element : source)
+          elements.push_back({element.semantic_name.c_str(), element.semantic_index, element.start_component,
+                              element.component_count, element.dword_offset});
+        capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
+        capture.record_dwords = statistics_enabled ? pipeline_statistics_capture.record_dwords
+                                                   : stream_output.streams[0].record_dwords;
+        capture.num_elements = elements.size();
+        capture.elements = elements.data();
+        capture.next = tail;
+        tail = &capture;
+      }
+      SM50_SHADER_GS_PASS_THROUGH_DATA no_raster{};
+      if (!rasterize) {
+        no_raster.type = SM50_SHADER_GS_PASS_THROUGH;
+        no_raster.DataEncoded = ~0u;
+        no_raster.RasterizationDisabled = true;
+        no_raster.next = tail;
+        tail = &no_raster;
+      }
+      SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
+      layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+      layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+      layout.slot_mask = slot_mask;
+      layout.num_elements = pull_ia_elements.size();
+      layout.elements = pull_ia_elements.data();
+      layout.next = tail;
+      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
+      root.type = SM50_SHADER_ROOT_SIGNATURE;
+      root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
+      root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
+      root.next = &layout;
+      if (!compile(pull_vs_bytecode, "vs_main",
+          reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+          replay ? variants->replay_vertex_constants : variants->capture_constants,
+          replay ? replay_vertex : capture_vertex))
+        return nullptr;
+    }
+    WMTComputePipelineInfo capture_info;
+    WMT::InitializeComputePipelineInfo(capture_info);
+    capture_info.compute_function = capture_vertex.handle;
+    variants->capture = CreateNativePipeline(capture_info, error);
+    if (!variants->capture || !variants->vertex_layout.record_dwords) return nullptr;
+    if (rasterize) {
+      if (!statistics_ps_bytecode.empty()) {
+        SM50_SHADER_D3D12_LOGIC_OP_DATA logic_op = fetch_logic_op;
+        logic_op.next = &frontier;
+        void *tail = use_fetch_logic_op ? static_cast<void *>(&logic_op) : static_cast<void *>(&frontier);
+        SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
+        statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
+        statistics.next = tail;
+        if (statistics_enabled) tail = &statistics;
+        SM50_SHADER_PSO_PIXEL_SHADER_DATA pixel{};
+        pixel.type = SM50_SHADER_PSO_PIXEL_SHADER;
+        pixel.dual_source_blending = statistics_ps_dual_source_blending;
+        pixel.sample_mask = statistics_ps_sample_mask;
+        pixel.native_sample_count = owned_sample_frequency_pixel_shader ? EffectiveRasterSampleCount() : 1;
+        std::copy(statistics_ps_formats.begin(), statistics_ps_formats.end(), pixel.pixel_formats);
+        pixel.next = tail;
+        SM50_SHADER_ROOT_SIGNATURE_DATA root{};
+        root.type = SM50_SHADER_ROOT_SIGNATURE;
+        root.bytecode = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
+        root.bytecode_length = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
+        root.next = &pixel;
+        if (!compile(statistics_ps_bytecode, statistics_ps_name.c_str(),
+            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
+            variants->replay_fragment_constants, replay_fragment))
+          return nullptr;
+      }
+      auto replay_info = indirect_info;
+      replay_info.vertex_function = replay_vertex;
+      replay_info.fragment_function = replay_fragment;
+      variants->replay = CreateNativePipeline(replay_info, error);
+      if (!variants->replay) return nullptr;
+    }
+    cached = std::move(variants);
+    return cached.get();
+  }
+
+  const MSAAPipelineVariants *GetMSAAPipelineVariants(
+      bool statistics_enabled, bool coarse, bool frontier = false) override {
     std::lock_guard<std::mutex> lock(msaa_pso_mutex);
-    auto &cached = coarse ? msaa_coarse_variants[statistics_enabled]
+    const uint32_t frontier_cache_index = uint32_t(statistics_enabled) | (uint32_t(coarse) << 1);
+    auto &cached = frontier ? msaa_frontier_variants[frontier_cache_index]
+        : coarse ? msaa_coarse_variants[statistics_enabled]
         : statistics_enabled ? msaa_statistics_variants : msaa_variants;
-    auto &attempted = coarse ? msaa_coarse_variants_attempted[statistics_enabled]
+    auto &attempted = frontier ? msaa_frontier_variants_attempted[frontier_cache_index]
+        : coarse ? msaa_coarse_variants_attempted[statistics_enabled]
         : statistics_enabled ? msaa_statistics_variants_attempted : msaa_variants_attempted;
     if (attempted)
       return cached.get();
@@ -2516,6 +2691,7 @@ public:
       msaa.type = SM50_SHADER_D3D12_MSAA_PIXEL;
       msaa.variant = i == 3 ? SM50_MSAA_SAMPLE_APP : SM50_MSAA_COVERAGE + i;
       if (uses_atomic64) msaa.variant |= SM50_MSAA_ATOMIC_HELPERS;
+      if (variants->gpu_tile_tasks) msaa.variant |= SM50_MSAA_GPU_TILE_TASKS;
       msaa.sample_count = sample_count;
       msaa.center_pattern = owned_sample_desc.Quality == 0xfffffffeu;
       msaa.layout_out = &variants->layout;
@@ -2601,7 +2777,8 @@ public:
             ? kMeshTessellationGeometryPass : 0;
         if (!i) {
           const auto *capture = GetMeshPipeline(MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false,
-                                                              statistics_enabled) | pass | kMeshMSAACapture);
+                                                              statistics_enabled) | pass | kMeshMSAACapture |
+                                                 (frontier ? kMeshCaptureFrontier : 0));
           if (!capture) return false;
           variants->vertex_layout = capture->vertex_layout;
           captured_topology = capture->capture_layout.vertices_per_primitive == 1 ? WMTPrimitiveTopologyClassPoint
@@ -2610,7 +2787,10 @@ public:
           return true;
         }
         MeshPipelineVariant replay;
-        if (FAILED(BuildMeshPipeline(pass | (statistics_enabled ? 8 : 0) | kMeshMSAAReplay, replay, &line_interpolation))) return false;
+        if (FAILED(BuildMeshPipeline(pass | (statistics_enabled ? 8 : 0) | kMeshMSAAReplay |
+                                    (frontier ? kMeshCaptureFrontier : 0) |
+                                    (variants->gpu_tile_tasks ? kMeshMSAAGPUTileTasks : 0),
+                                    replay, &line_interpolation))) return false;
         variants->vertex_layout = replay.vertex_layout;
         variants->replay_vertex_constants = std::move(replay.mesh_constants);
         vertex_replay = replay.replay_function;
@@ -2620,6 +2800,7 @@ public:
       SM50_SHADER_D3D12_MSAA_VERTEX_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_VERTEX;
       msaa.variant = i ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
+      if (i && variants->gpu_tile_tasks) msaa.variant |= SM50_MSAA_GPU_TILE_TASKS;
       msaa.sample_count = sample_count;
       msaa.layout_out = &variants->vertex_layout;
       msaa.line_mode = owned_line_mode;
@@ -2631,6 +2812,12 @@ public:
       statistics.next = &common;
       msaa.next = statistics_enabled && !i ? static_cast<void *>(&statistics)
                                               : static_cast<void *>(&common);
+      SM50_SHADER_COMPILATION_ARGUMENT_DATA capture_frontier{};
+      capture_frontier.type = SM50_SHADER_D3D12_CAPTURE_FRONTIER;
+      if (frontier) {
+        capture_frontier.next = msaa.next;
+        msaa.next = &capture_frontier;
+      }
       SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
       atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
       // Original DXIL is lowered before replay removes the application body.
@@ -2697,7 +2884,14 @@ public:
       if (!i && !variants->capture) return false;
       return true;
     };
-    if (!compile_vertex(0) || !compile_pixel() || !compile_vertex(1))
+    // Native scissoring bounds GPU-generated tasks without changing replay geometry,
+    // including wireframe edges and the full original clip-distance signature.
+    if (!compile_vertex(0))
+      return nullptr;
+    variants->gpu_tile_tasks = variants->vertex_layout.flags & SM50_MSAA_VERTEX_GPU_TILE_TASKS_SUPPORTED;
+    if (!has_pixel_shader && variants->gpu_tile_tasks)
+      variants->layout.flags |= SM50_MSAA_PIXEL_GPU_TILE_TASKS;
+    if (!compile_pixel() || !compile_vertex(1))
       return nullptr;
     if (!variants->vertex_layout.record_dwords || !variants->layout.input_record_dwords ||
         !variants->layout.output_record_dwords || variants->layout.input_record_count < 128 ||
@@ -2719,16 +2913,20 @@ public:
     if (owned_line_mode != SM50_MSAA_LINE_NONE)
       coverage_info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     auto internal = WMT4::Library(device_->GetLib().getLibrary());
-    auto gather_fragment = device_->GetShaderArtifactCache().Function(internal, owned_conservative ? "msaa_gather_conservative_depth"
+    auto helper = [&](const char *name) {
+      const std::string selected = variants->gpu_tile_tasks ? std::string(name) + "_task" : name;
+      return device_->GetShaderArtifactCache().Function(internal, selected.c_str());
+    };
+    auto gather_fragment = helper(owned_conservative ? "msaa_gather_conservative_depth"
         : owned_line_mode == SM50_MSAA_LINE_NONE ? "msaa_gather_depth" : "msaa_gather_line_depth");
-    auto explicit_depth_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
+    auto explicit_depth_fragment = helper(sample_count == 1
         ? "msaa_explicit_depth_single" : "msaa_explicit_depth");
-    auto depth_only_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
+    auto depth_only_fragment = helper(sample_count == 1
         ? "msaa_explicit_depth_only_single" : "msaa_explicit_depth_only");
     if (!gather_fragment || !explicit_depth_fragment || !depth_only_fragment)
       return nullptr;
     if (emulated_depth_bounds) {
-      auto probe = device_->GetShaderArtifactCache().Function(internal, sample_count == 1 ? "msaa_depth_bounds_probe_single"
+      auto probe = helper(sample_count == 1 ? "msaa_depth_bounds_probe_single"
                                                           : "msaa_depth_bounds_probe");
       if (!probe) return nullptr;
       WMTComputePipelineInfo info;
@@ -2759,11 +2957,13 @@ public:
       return nullptr;
     }
     auto clear_info = coverage_info;
-    auto fullscreen_vertex = device_->GetShaderArtifactCache().Function(internal, "msaa_fullscreen_vertex");
-    auto clear_fragment = device_->GetShaderArtifactCache().Function(internal, "msaa_clear_coverage");
-    if (!fullscreen_vertex || !clear_fragment)
+    auto fullscreen_vertex = helper("msaa_fullscreen_vertex");
+    auto fullscreen_layer_vertex = helper("msaa_fullscreen_layer_vertex");
+    auto clear_fragment = helper("msaa_clear_coverage");
+    if (!fullscreen_vertex || !fullscreen_layer_vertex || !clear_fragment)
       return nullptr;
-    clear_info.vertex_function = fullscreen_vertex;
+    // Task coverage is a full-size array; the GPU task selects the slice.
+    clear_info.vertex_function = variants->gpu_tile_tasks ? fullscreen_layer_vertex : fullscreen_vertex;
     clear_info.max_vertex_amplification_count = 0;
     clear_info.fragment_function = clear_fragment;
     clear_info.depth_pixel_format = WMTPixelFormatInvalid;
@@ -2853,18 +3053,18 @@ public:
     if (single_sample_replay && has_pixel_shader && !variants->sample_frequency) {
       auto query_info = clear_info;
       for (auto &color : query_info.colors) color = {};
-      auto query_fragment = device_->GetShaderArtifactCache().Function(internal, sample_count == 1
+      auto query_fragment = helper(sample_count == 1
           ? "msaa_query_coverage_single" : "msaa_query_coverage");
       if (!query_fragment) return nullptr;
+      // The query pass has no attachments and must not export a target slice.
+      query_info.vertex_function = fullscreen_vertex;
       query_info.fragment_function = query_fragment;
       variants->query_coverage = CreateNativePipeline(query_info, error);
       if (!variants->query_coverage) {
         ERR("MSAA query coverage PSO failed: ", error.description().getUTF8String());
         return nullptr;
       }
-      auto layered_vertex = device_->GetShaderArtifactCache().Function(internal, "msaa_fullscreen_layer_vertex");
-      if (!layered_vertex) return nullptr;
-      replay_info.vertex_function = layered_vertex;
+      replay_info.vertex_function = fullscreen_layer_vertex;
       variants->replay_layer = CreateNativePipeline(replay_info, error);
       if (!variants->replay_layer) {
         ERR("MSAA layered fullscreen replay PSO failed: ", error.description().getUTF8String());

@@ -365,6 +365,17 @@ ReservedResource::Retain(const ReservedTileTarget &target) {
   entry->second.second++;
 }
 
+ReservedResource::~ReservedResource() {
+  // Remove only this resource's aliases before heaps_ releases native owners.
+  // Other resources and REUSE_SINGLE_TILE mappings retain their own references.
+  auto update = heap_index_.BeginUpdate();
+  for (const auto tile : mapped_tiles_) {
+    const auto &target = targets_[tile];
+    update.Remove(uintptr_t(target.heap.handle), target.heap_tile);
+  }
+  live_.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void
 ReservedResource::Release(const ReservedTileTarget &target) {
   if (target.heap_tile == kReservedNullTile)
@@ -380,27 +391,58 @@ ReservedResource::CurrentTarget(uint32_t tile) {
   return tile < targets_.size() ? targets_[tile] : ReservedTileTarget{};
 }
 
-void
+bool
+ReservedResource::HasMappingChanges(
+    const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
+) const {
+  std::lock_guard<d3dalloy::mutex> lock(mutex);
+  for (const auto &[tile, target] : assignments)
+    if (!(targets_[tile] == target)) return true;
+  return false;
+}
+
+bool
 ReservedResource::Apply(
     WMT::MTL4CommandQueue queue, WMT::Buffer buffer, WMT::Texture texture,
-    const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
+    const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments,
+    WMT::MTL4ComputeCommandEncoder publication,
+    std::vector<WMT::Reference<WMT::Heap>> *retirement_heaps
 ) {
   std::lock_guard<d3dalloy::mutex> lock(mutex);
   /* Later assignments to the same tile win, exactly like overlapping D3D12 regions. */
   std::vector<std::pair<uint32_t, ReservedTileTarget>> effective;
   effective.reserve(assignments.size());
+  if (retirement_heaps) {
+    if (assignments.size() > (retirement_heaps->max_size() - retirement_heaps->size()) / 2)
+      throw std::bad_alloc();
+    retirement_heaps->reserve(retirement_heaps->size() + assignments.size() * 2);
+  }
+  // Keep the catalog mutation guarded through native command preparation:
+  // an allocation failure there can leave native mappings only partly encoded.
+  // The guard poisons negative proofs on unwind. The caller's pending-native
+  // lease excludes proofs after MappingQueueMutex is released at enqueue.
+  auto update = heap_index_.BeginUpdate();
   for (const auto &[tile, target] : assignments) {
     if (targets_[tile] == target)
       continue;
+    const auto old = targets_[tile];
+    if (retirement_heaps) {
+      if (old.heap_tile != kReservedNullTile) retirement_heaps->emplace_back(old.heap);
+      if (target.heap_tile != kReservedNullTile) retirement_heaps->emplace_back(target.heap);
+    }
     Retain(target);
-    Release(targets_[tile]);
+    if (target.heap_tile != kReservedNullTile)
+      update.Add(uintptr_t(target.heap.handle), target.heap_tile);
+    if (old.heap_tile != kReservedNullTile)
+      update.Remove(uintptr_t(old.heap.handle), old.heap_tile);
+    Release(old);
     targets_[tile] = target;
     if (target.heap_tile == kReservedNullTile) mapped_tiles_.erase(tile);
     else mapped_tiles_.insert(tile);
     effective.emplace_back(tile, target);
   }
   if (effective.empty())
-    return;
+    return false;
   mapping_generation_++;
   if (is_buffer_)
     EncodeBuffer(queue, buffer, effective);
@@ -408,13 +450,31 @@ ReservedResource::Apply(
     EncodeTexture(queue, texture, effective);
   for (const auto &[format, atlas] : volume_cast_atlases_)
     EncodeTexture(queue, atlas, effective);
-  if (volume_device && status_buffer) {
+  if (publication && status_buffer) {
+    const uint64_t stride = status_bytes ? 1 : sizeof(uint32_t);
+    for (size_t i = 0; i < effective.size();) {
+      const uint32_t first = effective[i].first;
+      const bool mapped = effective[i].second.heap_tile != kReservedNullTile;
+      size_t count = 1;
+      while (i + count < effective.size() && effective[i + count].first == uint64_t(first) + count &&
+          (effective[i + count].second.heap_tile != kReservedNullTile) == mapped) ++count;
+      wmtcmd_blit_fillbuffer fill{};
+      fill.type = WMTBlitCommandFillBuffer;
+      fill.buffer = status_buffer;
+      fill.offset = uint64_t(first) * stride;
+      fill.length = uint64_t(count) * stride;
+      fill.value = mapped ? (status_bytes ? 1 : 0xff) : 0;
+      publication.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
+      i += count;
+    }
+  } else if (volume_device && status_buffer) {
     const HRESULT hr = volume_device->PublishSparseVolumeResidency(status_buffer, effective);
     if (FAILED(hr)) volume_device->ReportRemoval(hr);
   }
-  if (status_bytes)
+  if (!publication && status_bytes)
     for (const auto &[tile, target] : effective)
       status_bytes[tile] = target.heap_tile != kReservedNullTile;
+  return true;
 }
 
 uint64_t

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <set>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -68,6 +69,8 @@ public:
 
   struct Slot {
     std::vector<Version> versions;
+    uint32_t encoded_token = 0;
+    uint64_t encoded_queue = 0;
   };
 
   /** A submission id, handed out when a submission starts and retired when it completes. */
@@ -151,6 +154,8 @@ public:
       if (version->leases)
         --version->leases;
       if (Dead(*version, ActiveLowWatermark())) {
+        if (found->second.encoded_token == version->token)
+          ClearEncoding(found->second);
         released.push_back(std::move(version->payload));
         version = versions.erase(version);
       } else {
@@ -169,6 +174,43 @@ public:
     for (auto &version : found->second.versions)
       if (version.token == token)
         ++version.leases;
+  }
+
+  /**
+   * Remember the last writer actually encoded for this address. This is FIFO execution evidence,
+   * not publication or GPU completion: it neither makes a version live nor takes a lease. The
+   * caller must retain the encoded submission and validate its immutable metadata/native identity.
+   * An unknown token or zero queue invalidates any earlier execution evidence for the address.
+   */
+  Payload *
+  RecordEncoding(const Key &key, uint32_t token, uint64_t queue) {
+    auto found = slots_.find(key);
+    if (found == slots_.end())
+      return nullptr;
+    auto &slot = found->second;
+    ClearEncoding(slot);
+    if (!token || !queue)
+      return nullptr;
+    for (auto &version : slot.versions) {
+      if (version.token == token) {
+        slot.encoded_token = token;
+        slot.encoded_queue = queue;
+        return &version.payload;
+      }
+    }
+    return nullptr;
+  }
+
+  /** Only a still-retained version last encoded on this exact queue is a FIFO predecessor. */
+  const Payload *
+  FindEncoded(const Key &key, uint64_t queue) const {
+    auto found = slots_.find(key);
+    if (!queue || found == slots_.end() || found->second.encoded_queue != queue || !found->second.encoded_token)
+      return nullptr;
+    for (const auto &version : found->second.versions)
+      if (version.token == found->second.encoded_token)
+        return &version.payload;
+    return nullptr;
   }
 
   /**
@@ -193,6 +235,19 @@ public:
     return live;
   }
 
+  /** A shared native payload stays resident while any retained version still owns it. */
+  template <typename Predicate>
+  bool
+  HasRetainedPayload(const Key &key, Predicate &&predicate) const {
+    auto found = slots_.find(key);
+    if (found == slots_.end())
+      return false;
+    for (const auto &version : found->second.versions)
+      if (predicate(version.payload))
+        return true;
+    return false;
+  }
+
   /**
    * Report the token the GPU header holds for `key`. The matching version becomes live and every
    * superseded version is stamped against the submissions in flight right now.
@@ -207,13 +262,50 @@ public:
       return false;
     bool matched = false;
     for (auto &version : found->second.versions) {
+      const bool was_live = version.live;
       version.live = version.token == token;
       matched |= version.live;
+      // Execution can return to an older CPU-published token. The newest recorded
+      // version still needs an active-reader barrier if it was live before this observation.
+      if (was_live && !version.live) {
+        version.stamped = true;
+        version.barrier = ObservationBarrier();
+      }
     }
     if (!matched)
       return false;
     Stamp(found->second);
     return true;
+  }
+
+  /**
+   * Finish one GPU submission as a batch. Observe every authoritative mirror before dropping any
+   * submission lease or the active-submission barrier, then collect dead versions in one sweep.
+   * A zero token skips observation (including a failed submission); duplicate keys still release
+   * one lease per entry because the same recorded build may execute more than once.
+   */
+  template <typename ReadToken>
+  std::vector<std::pair<Key, Payload>>
+  CompleteSubmission(uint64_t id, std::span<const std::pair<Key, uint32_t>> leases, ReadToken &&read_token) {
+    for (const auto &lease : leases) {
+      const uint32_t observed = read_token(lease.first);
+      if (observed)
+        Observe(lease.first, observed);
+    }
+    for (const auto &[key, token] : leases) {
+      auto found = slots_.find(key);
+      if (found == slots_.end())
+        continue;
+      for (auto &version : found->second.versions) {
+        if (version.token == token && version.leases) {
+          --version.leases;
+          break;
+        }
+      }
+    }
+    if (id)
+      RetireSubmission(id);
+    return Sweep();
   }
 
   /**
@@ -232,6 +324,8 @@ public:
       auto &versions = entry.second.versions;
       for (auto version = versions.begin(); version != versions.end();) {
         if (Dead(*version, low)) {
+          if (entry.second.encoded_token == version->token)
+            ClearEncoding(entry.second);
           released.emplace_back(entry.first, std::move(version->payload));
           version = versions.erase(version);
         } else {
@@ -263,6 +357,12 @@ public:
   }
 
 private:
+  static void
+  ClearEncoding(Slot &slot) {
+    slot.encoded_token = 0;
+    slot.encoded_queue = 0;
+  }
+
   /**
    * Lowest id of any submission still in flight, or the highest possible id when none is. A
    * version stamped against a barrier at or above this value may still be read.

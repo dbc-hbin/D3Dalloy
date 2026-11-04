@@ -358,6 +358,7 @@ void add_pipeline_statistics(
 struct VertexIndexPullArgs {
   uint32_t control = ~0u;
   uint32_t indices = ~0u;
+  uint32_t frontier = ~0u;
 };
 
 VertexIndexPullArgs define_vertex_index_pull(air::FunctionSignatureBuilder &func_signature);
@@ -370,7 +371,7 @@ VertexIndexPullArgs define_vertex_index_pull(air::FunctionSignatureBuilder &func
  */
 VertexIndexPullArgs define_stream_output_capture(
   air::FunctionSignatureBuilder &func_signature, IRValue &epilogue, std::vector<StreamOutputCaptureRun> runs,
-  uint32_t record_dwords
+  uint32_t record_dwords, bool frontier = false
 );
 
 /**

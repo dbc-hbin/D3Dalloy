@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -551,6 +552,17 @@ Layout ticketLayout() {
   return l;
 }
 
+// Capture the original SM6.8 draw bases alongside the invocation-unique ticket.
+// The full payload distinguishes command/instance boundaries from scheduler offsets.
+Layout frontierLayout() {
+  Layout l;
+  l.entries = {{0, "TEXCOORD", 2, 0, 2, 0}, {0, "TEXCOORD", 0, 0, 4, 0}};
+  l.strides = {24};
+  l.slots[0] = {{kTicket, 0, 2}, {kA, 0, 4}};
+  l.rasterized = D3D12_SO_NO_RASTERIZED_STREAM;
+  return l;
+}
+
 // Packed DXIL shader: TEXCOORD1 occupies .zw of the register TEXCOORD0 uses for .xy, so its
 // StartComponent 0 is .z. Slot 0: TEXCOORD1.xy then TEXCOORD0.y, stride 12.
 Layout packedLayout() {
@@ -585,6 +597,8 @@ struct Draw {
   UINT indexByteOffset = 0;
   UINT sourceIndexOffset = 0;
   DXGI_FORMAT commandFormat = DXGI_FORMAT_UNKNOWN;
+  UINT indexViewSize = UINT_MAX;
+  bool nullIndexView = false;
 };
 
 struct Case {
@@ -595,6 +609,8 @@ struct Case {
   DXGI_FORMAT indexFormat = DXGI_FORMAT_R16_UINT;
   D3D12_INDEX_BUFFER_STRIP_CUT_VALUE cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
   bool packedShader = false; // capture tests/dxil/stream-output-packed-vs.dxil instead of kCaptureShader
+  bool frontierShader = false; // original SM6.8 bases and exact logical IA invocation count
+  bool frontierCarry = false;  // every use of one shaded IA position must keep the same ticket
   int distance = 0;          // kDistanceShader VS: 0 none, 1 vsFinite, 2 vsNonFinite (PS reads SV_ClipDistance0)
   std::array<bool, 4> bound{true, true, false, false};
   std::array<UINT64, 4> size{512, 512, 512, 512};
@@ -605,6 +621,7 @@ struct Case {
   UINT maxIndirect = UINT_MAX;   // MaxCommandCount; UINT_MAX selects all indirect records
   bool mutating = false;
   bool mixedIndexFormats = false;
+  bool conservative = false; // exercise the captured-vertex producer used by custom rasterization
   std::vector<Draw> repeatDraws; // same closed list, after a later GPU argument/count update
   UINT repeatCount = 0;
   Case(const char *n, Layout l, std::vector<std::vector<Draw>> d) : name(n), layout(std::move(l)), lists(std::move(d)) {}
@@ -632,6 +649,25 @@ UINT verticesPerPrimitive(D3D_PRIMITIVE_TOPOLOGY t) {
       t == D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ || t == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ)
     return 2;
   return 3;
+}
+
+UINT declaredIndexBytes(const Case &c, const Draw &d) {
+  if (d.indexViewSize != UINT_MAX)
+    return d.indexViewSize;
+  const DXGI_FORMAT format = d.commandFormat == DXGI_FORMAT_UNKNOWN ? c.indexFormat : d.commandFormat;
+  return c.mixedIndexFormats ? (format == DXGI_FORMAT_R16_UINT ? 8 : 16) : 256 - d.indexByteOffset;
+}
+
+UINT modelIndex(const Case &c, const Draw &d, UINT k) {
+  const DXGI_FORMAT format = d.commandFormat == DXGI_FORMAT_UNKNOWN ? c.indexFormat : d.commandFormat;
+  const UINT width = format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+  const UINT offset = (d.start + k) * width;
+  const UINT size = declaredIndexBytes(c, d);
+  if (d.nullIndexView || size < width || offset > size - width)
+    return 0;
+  const UINT source = d.sourceIndexOffset + offset / width;
+  require(source < c.indices.size(), "so-oracle-index-initialized");
+  return c.indices[source];
 }
 
 void modelDraw(const Case &c, const Draw &d, Model &m, std::array<UINT64, 2> &counts) {
@@ -667,7 +703,7 @@ void modelDraw(const Case &c, const Draw &d, Model &m, std::array<UINT64, 2> &co
     for (UINT k = 0; k < d.count; k++) {
       std::uint32_t key = k;
       if (d.indexed) {
-        key = c.indices[d.sourceIndexOffset + d.start + k];
+        key = modelIndex(c, d, k);
         if (cut && key == cutValue) {
           window.clear();
           stripIndex = 0;
@@ -730,6 +766,10 @@ void modelDraw(const Case &c, const Draw &d, Model &m, std::array<UINT64, 2> &co
         continue;
       for (UINT v = 0; v < vpp; v++) {
         Vertex vertex = modelVertex(prim[v], inst);
+        if (c.frontierShader) {
+          vertex.a[2] = d.indexed ? UINT(d.baseVertex) : d.start;
+          vertex.a[3] = d.startInstance;
+        }
         if (c.mutating)
           vertex.a[2] = d.rootValue + d.vertexValue;
         vertex.clip[0] = modelClip(c.distance, prim[v]);
@@ -773,6 +813,9 @@ struct GpuContext {
   ComPtr<ID3DBlob> vs, ps;
   ComPtr<ID3DBlob> distanceVs[2], distancePs;
   std::vector<std::uint8_t> packedVs; // DXIL
+  std::vector<std::uint8_t> frontierVs; // DXIL SM6.8, loaded only by focused frontier cases
+  UINT targetBytes = kTargetBytes, filledBase = kFilledBase;
+  UINT zeroOffset = kZeroOffset, soBufferBytes = kSoBufferBytes;
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12Fence> fence;
   HANDLE event = nullptr;
@@ -792,9 +835,13 @@ struct GpuContext {
       CloseHandle(event);
   }
 
-  void init(ID3D12Device *d, std::vector<std::uint8_t> packed) {
+  void init(ID3D12Device *d, std::vector<std::uint8_t> packed, UINT targetSize = kTargetBytes) {
     device = d;
     packedVs = std::move(packed);
+    targetBytes = targetSize;
+    filledBase = 4 * targetBytes;
+    zeroOffset = filledBase + 48;
+    soBufferBytes = filledBase + 64;
     D3D12_ROOT_PARAMETER parameter = {};
     parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameter.Descriptor = {0, 0};
@@ -833,9 +880,9 @@ struct GpuContext {
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "gpu-fence");
     event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     require(event != nullptr, "gpu-event");
-    so = createBuffer(device, kSoBufferBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
-    upload = createBuffer(device, kSoBufferBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    readback = createBuffer(device, kSoBufferBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    so = createBuffer(device, soBufferBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+    upload = createBuffer(device, soBufferBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    readback = createBuffer(device, soBufferBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     counter = createBuffer(device, 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
     predicate = createBuffer(device, 16, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
     indexBuffer = createBuffer(device, 256, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -989,6 +1036,9 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     if (c.mutating) {
       desc.VS = {mutableVs->GetBufferPointer(), mutableVs->GetBufferSize()};
       desc.InputLayout = {&vertexInput, 1};
+    } else if (c.frontierShader) {
+      require(!frontierVs.empty(), "frontier-vs-input");
+      desc.VS = {frontierVs.data(), frontierVs.size()};
     } else if (c.packedShader) {
       // DXIL VS without PS (DXBC and DXIL stages cannot be mixed in one pipeline).
       desc.VS = {packedVs.data(), packedVs.size()};
@@ -1010,6 +1060,8 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState.ConservativeRaster = c.conservative ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+                                                            : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
     desc.PrimitiveTopologyType = verticesPerPrimitive(topology) == 1   ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                                  : verticesPerPrimitive(topology) == 2 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                                                        : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -1028,20 +1080,23 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
   }
 
   D3D12_INDEX_BUFFER_VIEW indexView(const Case &c, const Draw &draw) const {
+    if (draw.nullIndexView && draw.indexViewSize == 0)
+      return {};
     const DXGI_FORMAT format = draw.commandFormat == DXGI_FORMAT_UNKNOWN ? c.indexFormat : draw.commandFormat;
-    const UINT size = c.mixedIndexFormats ? (format == DXGI_FORMAT_R16_UINT ? 8 : 16)
-                                          : 256 - draw.indexByteOffset;
-    return {indexBuffer->GetGPUVirtualAddress() + draw.indexByteOffset, size, format};
+    return {draw.nullIndexView ? 0 : indexBuffer->GetGPUVirtualAddress() + draw.indexByteOffset,
+            declaredIndexBytes(c, draw), format};
   }
 
   void runCase(const Case &c) {
+    std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PHASE case=%s begin\n", c.name);
+    std::fflush(stderr);
     // Reset the SO buffer, filled sizes, predicate, VS counter and render target.
     std::uint8_t *mapped = nullptr;
     check(upload->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "case-upload-map");
-    std::memset(mapped, kFill, kFilledBase);
-    std::memset(mapped + kFilledBase, 0, kSoBufferBytes - kFilledBase);
+    std::memset(mapped, kFill, filledBase);
+    std::memset(mapped + filledBase, 0, soBufferBytes - filledBase);
     for (UINT s = 0; s < 4; s++)
-      std::memcpy(mapped + kFilledBase + 4 * s, &c.filled[s], 4);
+      std::memcpy(mapped + filledBase + 4 * s, &c.filled[s], 4);
     upload->Unmap(0, nullptr);
     if (!c.indices.empty()) {
       check(indexBuffer->Map(0, nullptr, reinterpret_cast<void **>(&mapped)), "case-index-map");
@@ -1130,9 +1185,9 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
       argumentUpload->Unmap(0, nullptr);
     }
     Recording setup = makeRecording();
-    setup.list->CopyBufferRegion(so.Get(), 0, upload.Get(), 0, kSoBufferBytes);
-    setup.list->CopyBufferRegion(counter.Get(), 0, upload.Get(), kZeroOffset, 16);
-    setup.list->CopyBufferRegion(predicate.Get(), 0, upload.Get(), kZeroOffset, 16);
+    setup.list->CopyBufferRegion(so.Get(), 0, upload.Get(), 0, soBufferBytes);
+    setup.list->CopyBufferRegion(counter.Get(), 0, upload.Get(), zeroOffset, 16);
+    setup.list->CopyBufferRegion(predicate.Get(), 0, upload.Get(), zeroOffset, 16);
     const float black[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     setup.list->ClearRenderTargetView(rtvHeap->GetCPUDescriptorHandleForHeapStart(), black, 0, nullptr);
     if (hasIndirect) {
@@ -1200,7 +1255,7 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
       D3D12_STREAM_OUTPUT_BUFFER_VIEW views[4] = {};
       for (UINT s = 0; s < 4; s++)
         if (c.bound[s])
-          views[s] = {base + UINT64(s) * kTargetBytes, c.size[s], base + kFilledBase + 4 * s};
+          views[s] = {base + UINT64(s) * targetBytes, c.size[s], base + filledBase + 4 * s};
       list->SOSetTargets(0, 4, views);
       if (!c.indices.empty()) {
         const D3D12_INDEX_BUFFER_VIEW ibv = {indexBuffer->GetGPUVirtualAddress(), 256, c.indexFormat};
@@ -1264,8 +1319,8 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
                                 D3D12_RESOURCE_STATE_COPY_SOURCE};
     }
     copy.list->ResourceBarrier(2, toSource);
-    copy.list->CopyBufferRegion(readback.Get(), 0, so.Get(), 0, kSoBufferBytes);
-    copy.list->CopyBufferRegion(readback.Get(), kZeroOffset, counter.Get(), 0, 4);
+    copy.list->CopyBufferRegion(readback.Get(), 0, so.Get(), 0, soBufferBytes);
+    copy.list->CopyBufferRegion(readback.Get(), zeroOffset, counter.Get(), 0, 4);
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition = {rt.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
@@ -1315,13 +1370,30 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
       execute(lists);
     }
 
+    // Model only the records selected by ExecuteIndirect. Keeping inactive slots as no-work
+    // draws also lets the direct invocation oracle avoid submitting poisoned unused arguments.
+    Case active = c;
+    for (auto &draws : active.lists) {
+      UINT command = 0;
+      for (auto &draw : draws) {
+        if (!draw.indirect) {
+          command = 0;
+          continue;
+        }
+        if (c.predicate == 0 || command >= c.indirectCount || command >= c.maxIndirect) {
+          draw.count = 0;
+          draw.instances = 0;
+        }
+        ++command;
+      }
+    }
     // Model.
     Model m;
     for (UINT s = 0; s < 4; s++) {
-      m.bytes[s].assign(kTargetBytes, kFill);
+      m.bytes[s].assign(targetBytes, kFill);
       m.filled[s] = c.filled[s];
     }
-    for (const auto &draws : c.lists) {
+    for (const auto &draws : active.lists) {
       std::array<UINT64, 2> counts{};
       for (const auto &draw : draws)
         modelDraw(c, draw, m, counts);
@@ -1336,32 +1408,42 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     }
 
     // Compare.
-    const D3D12_RANGE range{0, SIZE_T(kSoBufferBytes)};
+    const D3D12_RANGE range{0, SIZE_T(soBufferBytes)};
     const std::uint8_t *bytes = nullptr;
     check(readback->Map(0, &range, reinterpret_cast<void **>(const_cast<std::uint8_t **>(&bytes))), "case-readback");
     UINT tickets = 0;
+    std::map<std::array<UINT, 4>, UINT> shadedTickets;
+    std::map<UINT, std::array<UINT, 4>> ticketOwners;
     for (UINT s = 0; s < 4; s++) {
       // Each captured record is one invocation's outputs: its ticket pair must be consistent.
       for (const UINT offset : m.tickets[s]) {
         std::uint32_t pair[2];
-        std::memcpy(pair, bytes + s * kTargetBytes + offset, 8);
+        std::memcpy(pair, bytes + s * targetBytes + offset, 8);
         if (pair[1] != ~pair[0]) {
           std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_RECORD_MIXED case=%s slot=%u byte=%u ticket=0x%08x,0x%08x\n",
                        c.name, s, offset, pair[0], pair[1]);
           fail(c.name);
         }
+        if (c.frontierCarry) {
+          std::array<UINT, 4> key;
+          std::memcpy(key.data(), bytes + s * targetBytes + offset + 8, sizeof(key));
+          const auto [same, inserted] = shadedTickets.emplace(key, pair[0]);
+          require(inserted || same->second == pair[0], "frontier-carry-keeps-shaded-ticket");
+          if (inserted)
+            require(ticketOwners.emplace(pair[0], key).second, "frontier-distinct-keys-have-distinct-tickets");
+        }
         std::memcpy(m.bytes[s].data() + offset, pair, 8);
         tickets++;
       }
-      for (UINT i = 0; i < kTargetBytes; i++) {
-        if (bytes[s * kTargetBytes + i] != m.bytes[s][i]) {
+      for (UINT i = 0; i < targetBytes; i++) {
+        if (bytes[s * targetBytes + i] != m.bytes[s][i]) {
           std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_TARGET_MISMATCH case=%s slot=%u byte=%u got=0x%02x want=0x%02x\n",
-                       c.name, s, i, bytes[s * kTargetBytes + i], m.bytes[s][i]);
+                       c.name, s, i, bytes[s * targetBytes + i], m.bytes[s][i]);
           fail(c.name);
         }
       }
       std::uint32_t filled;
-      std::memcpy(&filled, bytes + kFilledBase + 4 * s, 4);
+      std::memcpy(&filled, bytes + filledBase + 4 * s, 4);
       if (filled != m.filled[s]) {
         std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_FILLED_MISMATCH case=%s slot=%u got=%u want=%u\n", c.name, s,
                      filled, m.filled[s]);
@@ -1369,7 +1451,7 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
       }
     }
     std::uint32_t invocations;
-    std::memcpy(&invocations, bytes + kZeroOffset, 4);
+    std::memcpy(&invocations, bytes + zeroOffset, 4);
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     // Capture must not add a VS pass: invocations cover every unique (key, instance) of a complete
@@ -1377,7 +1459,7 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     // shade a vertex shared by strip primitives more than once). Indexed stream-output draws are
     // issued over their IA positions, so they stay within the no-cache bound (D3D11.3 FS 8.4:
     // [infinite cache .. no cache]): one invocation per primitive vertex, or per IA position.
-    std::uint32_t baseline = baselineInvocations(c);
+    std::uint32_t baseline = baselineInvocations(active);
     if (!c.repeatDraws.empty()) {
       Case second = c;
       second.lists = {c.repeatDraws};
@@ -1387,12 +1469,26 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     for (const auto &draws : c.lists)
       for (const auto &draw : draws)
         indexed |= draw.indexed;
-    const bool invocationsOk = indexed ? invocations <= std::max(m.maxInvocations, m.primitiveVertices)
-                                       : invocations == baseline;
+    const UINT64 nativeMaximum = std::max(m.maxInvocations, m.primitiveVertices);
+    if (c.frontierShader)
+      std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_FRONTIER_INVOCATIONS case=%s invocations=%u "
+                   "native_baseline=%u logical_positions=%llu native_min=%llu native_max=%llu keys=%zu\n",
+                   c.name, invocations, baseline, static_cast<unsigned long long>(m.maxInvocations),
+                   static_cast<unsigned long long>(m.minInvocations),
+                   static_cast<unsigned long long>(nativeMaximum), shadedTickets.size());
+    // The focused frontier shades each logical IA position once. Its native no-SO control
+    // can legally re-shade strip vertices, so compare that control to its cache interval.
+    const bool invocationsOk = c.frontierShader ? baseline >= m.minInvocations && baseline <= nativeMaximum
+                               : indexed ? invocations <= nativeMaximum : invocations == baseline;
     if (!invocationsOk || invocations < m.minInvocations) {
       std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_INVOCATIONS_MISMATCH case=%s got=%u baseline=%u min=%llu\n",
                    c.name, invocations, baseline, static_cast<unsigned long long>(m.minInvocations));
       fail(c.name);
+    }
+    if (c.frontierShader) {
+      require(invocations == m.maxInvocations, "frontier-shades-each-logical-ia-position-once");
+      if (c.frontierCarry)
+        require(shadedTickets.size() == m.maxInvocations, "frontier-carry-covers-every-logical-key");
     }
     const D3D12_RANGE queryRange{0, SIZE_T(2 * 4 * 16)};
     const UINT64 *stats = nullptr;
@@ -1433,13 +1529,20 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
                 "invocations=%u baseline=%u ia_positions=%llu tickets=%u\n",
                 c.name, static_cast<unsigned long long>(written), static_cast<unsigned long long>(needed), m.filled[0],
                 m.filled[1], invocations, baseline, static_cast<unsigned long long>(m.maxInvocations), tickets);
+    if (c.frontierShader)
+      std::printf("OWNED_D3D12_STREAM_OUTPUT_FRONTIER_PASS case=%s original_bases=1 exact_ia=1 "
+                  "carry=%u keys=%zu invocations=%u target_bytes=%u\n", c.name,
+                  UINT(c.frontierCarry), shadedTickets.size(), invocations, targetBytes);
+    std::fflush(stdout);
+    std::fprintf(stderr, "OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PHASE case=%s end\n", c.name);
+    std::fflush(stderr);
   }
 
   // VS invocations of the same draws with the same PSO minus its stream-output declaration.
   std::uint32_t baselineInvocations(const Case &c) {
     Recording setup = makeRecording();
-    setup.list->CopyBufferRegion(counter.Get(), 0, upload.Get(), kZeroOffset, 16);
-    setup.list->CopyBufferRegion(predicate.Get(), 0, upload.Get(), kZeroOffset, 16);
+    setup.list->CopyBufferRegion(counter.Get(), 0, upload.Get(), zeroOffset, 16);
+    setup.list->CopyBufferRegion(predicate.Get(), 0, upload.Get(), zeroOffset, 16);
     // Both copies promoted to COPY_DEST (a write state); later lists of the same execution need
     // explicit transitions before the UAV counter and the predicate are used.
     D3D12_RESOURCE_BARRIER toUse[2] = {};
@@ -1453,6 +1556,7 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     check(setup.list->Close(), "baseline-setup-close");
     auto pso = pipeline(c, false);
     std::vector<Recording> recordings;
+    std::vector<ComPtr<ID3D12Resource>> normalizedIndices;
     std::vector<ID3D12CommandList *> lists = {setup.list.Get()};
     for (const auto &draws : c.lists) {
       recordings.push_back(makeRecording());
@@ -1479,15 +1583,41 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
         if (!draw.instances)
           continue;
         list->IASetPrimitiveTopology(draw.topology);
+        const bool normalizeIndex = draw.indexed && (draw.nullIndexView || draw.indexViewSize != UINT_MAX);
         if (c.mutating) {
           list->SetGraphicsRoot32BitConstant(1, draw.rootValue, 0);
           const auto vb = vertexView(draw);
-          const auto ib = indexView(c, draw);
           list->IASetVertexBuffers(0, 1, &vb);
+          if (!normalizeIndex) {
+            const auto ib = indexView(c, draw);
+            list->IASetIndexBuffer(&ib);
+          }
+        }
+        UINT firstIndex = draw.start;
+        if (normalizeIndex && draw.count) {
+          // The direct oracle uses an ordinary in-bounds IB containing the specified zero
+          // results, independently of the indirect shader's guarded pointer implementation.
+          const DXGI_FORMAT format = draw.commandFormat == DXGI_FORMAT_UNKNOWN ? c.indexFormat : draw.commandFormat;
+          const UINT width = format == DXGI_FORMAT_R32_UINT ? 4 : 2;
+          auto indices = createBuffer(device, UINT64(draw.count) * width, D3D12_HEAP_TYPE_UPLOAD,
+                                      D3D12_RESOURCE_STATE_GENERIC_READ);
+          void *memory = nullptr;
+          check(indices->Map(0, nullptr, &memory), "so-oracle-index-map");
+          for (UINT k = 0; k < draw.count; k++) {
+            const UINT index = modelIndex(c, draw, k);
+            if (width == 2)
+              static_cast<std::uint16_t *>(memory)[k] = std::uint16_t(index);
+            else
+              static_cast<std::uint32_t *>(memory)[k] = index;
+          }
+          indices->Unmap(0, nullptr);
+          const D3D12_INDEX_BUFFER_VIEW ib = {indices->GetGPUVirtualAddress(), draw.count * width, format};
           list->IASetIndexBuffer(&ib);
+          normalizedIndices.push_back(std::move(indices));
+          firstIndex = 0;
         }
         if (draw.indexed)
-          list->DrawIndexedInstanced(draw.count, draw.instances, draw.start, draw.baseVertex, draw.startInstance);
+          list->DrawIndexedInstanced(draw.count, draw.instances, firstIndex, draw.baseVertex, draw.startInstance);
         else
           list->DrawInstanced(draw.count, draw.instances, draw.start, draw.startInstance);
       }
@@ -1500,15 +1630,15 @@ cbuffer Fixup : register(b0) { uint firstVertexCount; uint executedCount; uint d
     counterToSource.Transition = {counter.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
     copy.list->ResourceBarrier(1, &counterToSource);
-    copy.list->CopyBufferRegion(readback.Get(), kZeroOffset, counter.Get(), 0, 4);
+    copy.list->CopyBufferRegion(readback.Get(), zeroOffset, counter.Get(), 0, 4);
     check(copy.list->Close(), "baseline-copy-close");
     lists.push_back(copy.list.Get());
     execute(lists);
-    const D3D12_RANGE range{kZeroOffset, kZeroOffset + 4};
+    const D3D12_RANGE range{zeroOffset, zeroOffset + 4};
     const std::uint8_t *bytes = nullptr;
     check(readback->Map(0, &range, reinterpret_cast<void **>(const_cast<std::uint8_t **>(&bytes))), "baseline-map");
     std::uint32_t invocations;
-    std::memcpy(&invocations, bytes + kZeroOffset, 4);
+    std::memcpy(&invocations, bytes + zeroOffset, 4);
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     return invocations;
@@ -1589,6 +1719,71 @@ void runPackedPipelineCases(const GpuContext &gpu) {
 
 void runGSStreamCases(GpuContext &gpu, const std::vector<std::uint8_t> &dxilVs,
                       const std::vector<std::uint8_t> &dxilGs);
+
+size_t runFrontierCases(ID3D12Device *device, const std::vector<std::uint8_t> &packedVs) {
+  GpuContext gpu;
+  // Existing cases keep their original target sizes. Only this focused group retains every
+  // primitive on both sides of the 256-position/64-slot scheduler boundaries.
+  gpu.init(device, packedVs, 2 * 1024 * 1024);
+  gpu.initIndirect();
+  gpu.frontierVs = readFile("stream-output-frontier-vs.dxil");
+  auto indirect = [](Draw draw) { draw.indirect = true; return draw; };
+  std::vector<Case> cases;
+  {
+    // Direct SO uses index pulling too. Check the shader-visible original signed
+    // BaseVertex, then a nonindexed StartVertex, independently of indirect scheduling.
+    Case c{"direct_frontier_original_bases", frontierLayout(),
+           {{{D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 1, 2, 1, -37, 19},
+             points(2, 1, 11, 23)}}};
+    c.frontierShader = true;
+    c.indices = {111, 4};
+    c.indexFormat = DXGI_FORMAT_R32_UINT;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    // 34 producer chunks per instance: quantum 64 ends inside instance 1. The same IA
+    // position occurs in several SO triangles, but its already-shaded ticket must be identical.
+    Case c{"indirect_frontier_strip_carry_bases", frontierLayout(),
+           {{indirect({D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, false, 33 * 256 + 3, 2, 17, 0, 9})}}};
+    c.frontierShader = c.frontierCarry = true;
+    c.size[0] = gpu.targetBytes;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    // The original signed vertex base and instance base distinguish every command. Two
+    // unsafe records lie past the GPU count. Replay changes that count, never the recording.
+    Case c{"indirect_frontier_commands_replay_bases", frontierLayout(),
+           {std::vector<Draw>(67, indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true,
+                                          UINT_MAX, UINT_MAX, UINT_MAX, 0, 0}))}};
+    c.frontierShader = true;
+    c.indices = {111, 4};
+    c.indexFormat = DXGI_FORMAT_R32_UINT;
+    for (UINT command = 0; command < 65; ++command)
+      c.lists[0][command] = indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 1, 1, 1,
+                                     INT(3 * command) - 64, 7 + 5 * command});
+    c.indirectCount = 65;
+    c.repeatCount = 17;
+    c.repeatDraws.assign(c.lists[0].begin(), c.lists[0].begin() + c.repeatCount);
+    c.size[0] = gpu.targetBytes;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    // Buffer overflow must not stop the GPU cursor, shader side effects, or StorageNeeded.
+    // 33 chunks per instance cross quantum 64 even though only the first two points fit.
+    Case c{"indirect_frontier_overflow_progress", frontierLayout(),
+           {{indirect(points(8193, 2, 37, 19))}}};
+    c.frontierShader = true;
+    c.size[0] = 2 * 24;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  for (const auto &c : cases)
+    gpu.runCase(c);
+  return cases.size();
+}
 
 void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
   GpuContext gpu;
@@ -1784,6 +1979,44 @@ void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
     cases.push_back(c);
   }
   {
+    // MaxCommandCount is much larger than the initial metadata snapshot, but no record is live.
+    // A readback capacity must not become a draw-count bound or force full-MaxCommandCount allocation.
+    Case c{"indirect_bounded_snapshot_zero_count", one,
+           {std::vector<Draw>(4097, indirect(points(UINT_MAX, UINT_MAX)))}};
+    c.indirectCount = 0;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    // The inactive records are deliberately unsafe to execute. The first snapshot fits the one
+    // live command even though MaxCommandCount is larger than its bounded record storage.
+    Case c{"indirect_bounded_snapshot_small_count", one,
+           {std::vector<Draw>(4097, indirect(points(UINT_MAX, UINT_MAX)))}};
+    c.lists[0][0] = indirect(points(2, 2, 3, 4));
+    c.indirectCount = 1;
+    cases.push_back(std::move(c));
+  }
+  {
+    // Predication must reject the records before reading or sizing any of their huge draw counts.
+    Case c{"indirect_bounded_snapshot_predicate_zero", one,
+           {std::vector<Draw>(4097, indirect(points(UINT_MAX, UINT_MAX)))}};
+    c.indirectCount = 4097;
+    c.predicate = 0;
+    c.expectRt = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    // A closed recording first needs one record, then the GPU increases its count beyond the
+    // initial snapshot. The last live command proves that metadata growth did not truncate draws.
+    Case c{"indirect_bounded_snapshot_replay_growth", one, {std::vector<Draw>(4097, indirect(points(0)))}};
+    c.lists[0][0] = indirect(points(1));
+    c.lists[0][2045] = indirect(points(2, 1, 5));
+    c.indirectCount = 1;
+    c.repeatCount = 2046;
+    c.repeatDraws.assign(c.lists[0].begin(), c.lists[0].begin() + c.repeatCount);
+    cases.push_back(std::move(c));
+  }
+  {
     Case c{"indirect_draw_count_clamped_to_max", one, {{indirect(points(1)), indirect(points(1, 1, 6))}}};
     c.indirectCount = 7;
     c.maxIndirect = 2;
@@ -1877,6 +2110,52 @@ void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
     cases.push_back(c);
   }
   {
+    Case c{"indirect_mutating_bounded_views", one,
+           {{indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 3, 1, 1, 2, 3}),
+             indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 3, 1, 1, 1, 4}),
+             indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 2, 2, 0, 1, 5}),
+             indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 2, 1, 0, 2, 6}),
+             indirect({D3D_PRIMITIVE_TOPOLOGY_POINTLIST, true, 2, 1, 0, 1, 7})}}};
+    c.mutating = c.mixedIndexFormats = true;
+    c.indices = {4, 5, 6, 7, 8, 9, 10, 11};
+    auto &draws = c.lists[0];
+    draws[0].rootValue = 5; draws[0].vertexValue = 10;
+    draws[0].commandFormat = DXGI_FORMAT_R16_UINT; draws[0].indexViewSize = 4;
+    draws[1].rootValue = 7; draws[1].vertexValue = 20;
+    draws[1].commandFormat = DXGI_FORMAT_R32_UINT; draws[1].indexViewSize = 10;
+    draws[1].indexByteOffset = 16; draws[1].sourceIndexOffset = 4;
+    draws[2].rootValue = 11; draws[2].vertexValue = 10;
+    draws[2].commandFormat = DXGI_FORMAT_R16_UINT; draws[2].nullIndexView = true;
+    draws[3].rootValue = 13; draws[3].vertexValue = 20;
+    draws[3].commandFormat = DXGI_FORMAT_R32_UINT; draws[3].indexViewSize = 0;
+    draws[3].indexByteOffset = 16; draws[3].sourceIndexOffset = 4;
+    draws[4].rootValue = 17; draws[4].vertexValue = 10;
+    draws[4].nullIndexView = true; draws[4].indexViewSize = 0;
+    cases.push_back(std::move(c));
+  }
+  {
+    Case c{"indirect_mutating_bounded_strip_cut", one,
+           {{indirect({D3D_PRIMITIVE_TOPOLOGY_LINESTRIP, true, 5, 1, 0, 2, 3}),
+             indirect({D3D_PRIMITIVE_TOPOLOGY_LINESTRIP, true, 3, 1, 0, 1, 4})}}};
+    c.mutating = true;
+    c.indices = {4, 0xffffu, 5, 6};
+    c.cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+    c.lists[0][0].rootValue = 37; c.lists[0][0].vertexValue = 20;
+    c.lists[0][0].indexViewSize = 6;
+    c.lists[0][1].rootValue = 31; c.lists[0][1].vertexValue = 10;
+    c.lists[0][1].nullIndexView = true;
+    cases.push_back(std::move(c));
+  }
+  {
+    Case c{"indirect_mutating_bounded_conservative_triangle", one,
+           {{indirect({D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, true, 3, 1, 1, 2, 3})}}};
+    c.mutating = c.conservative = true;
+    c.indices = {4, 5, 6, 7};
+    c.lists[0][0].rootValue = 9; c.lists[0][0].vertexValue = 10;
+    c.lists[0][0].indexViewSize = 4;
+    cases.push_back(std::move(c));
+  }
+  {
     Case c{"indirect_reexecute_closed_list_changed_gpu_args", one,
            {{indirect(points(2)), indirect(points(1, 1, 5))}}};
     c.indirectCount = 2;
@@ -1886,7 +2165,8 @@ void runCaptureCases(ID3D12Device *device, std::vector<std::uint8_t> packedVs) {
   }
   for (const auto &c : cases)
     gpu.runCase(c);
-  std::printf("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=%zu\n", cases.size());
+  const size_t frontierCases = runFrontierCases(device, gpu.packedVs);
+  std::printf("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=%zu\n", cases.size() + frontierCases);
   // A PS reading SV_ClipDistance0 must not select the captured-pixel distance path when no stream
   // is rasterized: SO holds the raw VS distance bits (finite, and +/-inf) and the RT stays untouched.
   std::vector<Case> distanceCases;

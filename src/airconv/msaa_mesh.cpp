@@ -189,6 +189,9 @@ Error transformObject(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &op
 
 Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &options, bool conservative) {
   if (module.getNamedMetadata("air.object")) return transformObject(module, options);
+  const unsigned variant = options.variant & ~SM50_MSAA_GPU_TILE_TASKS;
+  if ((options.variant & SM50_MSAA_GPU_TILE_TASKS) && variant != SM50_MSAA_VERTEX_REPLAY)
+    return invalid("GPU tile tasks require captured mesh replay");
   auto *meshes = module.getNamedMetadata("air.mesh");
   if (!meshes || meshes->getNumOperands() != 1) return invalid("expected one mesh entry");
   auto *metadata = meshes->getOperand(0);
@@ -309,7 +312,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
     module.getOrInsertNamedMetadata("air.vertex")->addOperand(MDTuple::get(module.getContext(), vertex));
     dummy->eraseFromParent();
     SM50_SHADER_D3D12_MSAA_VERTEX_DATA replay{};
-    replay.variant = SM50_MSAA_VERTEX_REPLAY;
+    replay.variant = SM50_MSAA_VERTEX_REPLAY | (options.variant & SM50_MSAA_GPU_TILE_TASKS);
     replay.layout_out = options.layout_out;
     replay.line_mode = options.line_mode;
     replay.interpolation = options.interpolation;
@@ -331,7 +334,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
       }
     }
   }
-  if (options.variant == SM50_MSAA_VERTEX_REPLAY) {
+  if (variant == SM50_MSAA_VERTEX_REPLAY) {
     // The independently compiled replay retains no application stage or object payload.
     auto name = original->getName().str();
     auto *vertices = module.getNamedMetadata("air.vertex");
@@ -342,7 +345,7 @@ Error transformMesh(Module &module, const SM50_SHADER_D3D12_MSAA_MESH_DATA &opti
     replay->setName(name);
     return Error::success();
   }
-  if (options.variant != SM50_MSAA_VERTEX_CAPTURE) return invalid("unknown variant");
+  if (variant != SM50_MSAA_VERTEX_CAPTURE) return invalid("unknown variant");
   auto *vertices = module.getNamedMetadata("air.vertex");
   auto *replay = cast<Function>(cast<ValueAsMetadata>(vertices->getOperand(0)->getOperand(0))->getValue());
   vertices->eraseFromParent();

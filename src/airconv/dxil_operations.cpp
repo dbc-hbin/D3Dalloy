@@ -2143,7 +2143,37 @@ OperationLowerer::lowerWave(CallInst &call, uint32_t opcode, IRBuilder<> &builde
                              preserves(*call.getFunction());
     if (wave_lanes != kNativeWaveLanes || type->isIntegerTy(1) || type->isIntegerTy(8) || type->isIntegerTy(64) || native.empty() || exact_float) {
       Value *mask = participating_mask();
-      Value *lane = prefix ? lane_id() : nullptr;
+      const bool use_integer_tree = wave_lanes >= 8 && type->isIntegerTy() && !fp64_wave;
+      Value *lane = prefix || use_integer_tree ? lane_id() : nullptr;
+      if (use_integer_tree) {
+        // Each stage combines two aligned half-blocks. Every participating lane
+        // already has its own half's aggregate; the first active lane in the
+        // opposite half supplies its aggregate even when the ballot has holes.
+        // Keep every shuffle inside the logical wave and select self for an
+        // empty peer half before discarding that value with the identity.
+        Value *identity = waveIdentity(builder, kind, type, is_signed);
+        Value *aggregate = value;
+        if (Value *h = is_helper())
+          aggregate = builder.CreateSelect(h, identity, aggregate);
+        Value *exclusive = identity;
+        for (unsigned stride = 1; stride < wave_lanes; stride *= 2) {
+          Value *peer_base = builder.CreateXor(
+              builder.CreateAnd(lane, builder.getInt32(~(stride - 1))), builder.getInt32(stride));
+          Value *peer_mask = builder.CreateAnd(mask,
+              builder.CreateShl(builder.getInt32((1u << stride) - 1), peer_base));
+          Value *has_peer = builder.CreateICmpNE(peer_mask, builder.getInt32(0));
+          Value *source = builder.CreateSelect(has_peer, first_lane(peer_mask), lane);
+          Value *other = builder.CreateSelect(has_peer, shuffle(aggregate, source), identity);
+          if (prefix) {
+            Value *upper = builder.CreateICmpNE(
+                builder.CreateAnd(lane, builder.getInt32(stride)), builder.getInt32(0));
+            exclusive = builder.CreateSelect(upper,
+                waveCombine(builder, air_builder, kind, other, exclusive, is_signed), exclusive);
+          }
+          aggregate = waveCombine(builder, air_builder, kind, aggregate, other, is_signed);
+        }
+        return prefix ? exclusive : aggregate;
+      }
       return lane_loop(kind, value, is_signed, [&](unsigned source) -> Value * {
         Value *taken = mask_has(mask, source);
         if (prefix)

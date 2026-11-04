@@ -229,3 +229,124 @@ void coherenceConsumer(inout Payload p) {
 }
 [shader("closesthit")] void HoCoherenceHit(inout Payload p, Attr attr) { coherenceConsumer(p); }
 [shader("miss")] void HoCoherenceMiss(inout Payload p) { coherenceConsumer(p); }
+
+
+// A single procedural primitive reports far then near. This fixes the oracle's
+// order in shader code, independently of native BVH visitation order.
+ProceduralPrimitiveHitGroup HoFirstGroup = { "HoFirstAnyHit", "HoFirstClosestHit", "HoFirstIntersection" };
+ProceduralPrimitiveHitGroup HoFirstOpaqueGroup = { "", "HoFirstClosestHit", "HoFirstIntersection" };
+TriangleHitGroup HoFirstRejectGroup = { "HoFirstAnyHit", "" };
+
+void writeNoHitState(HitObject hit, uint base, bool callbackSeen) {
+  Out[base] = hit.GetRayFlags();
+  Out[base+1] = asuint(hit.GetRayTMin());
+  Out[base+2] = asuint(hit.GetRayTCurrent());
+  Out[base+3] = hit.IsHit() ? 1 : hit.IsMiss() ? 2 : 0;
+  float3 worldOrigin = hit.GetWorldRayOrigin(), worldDirection = hit.GetWorldRayDirection();
+  float3 objectOrigin = hit.GetObjectRayOrigin(), objectDirection = hit.GetObjectRayDirection();
+  [unroll] for (uint i = 0; i < 3; ++i) {
+    Out[base+4+i] = asuint(worldOrigin[i]);
+    Out[base+7+i] = asuint(worldDirection[i]);
+    Out[base+10+i] = asuint(objectOrigin[i]);
+    Out[base+13+i] = asuint(objectDirection[i]);
+  }
+  float3x4 objectToWorld = hit.GetObjectToWorld3x4(), worldToObject = hit.GetWorldToObject3x4();
+  [unroll] for (uint row = 0; row < 3; ++row)
+    [unroll] for (uint col = 0; col < 4; ++col) {
+      Out[base+16+row*4+col] = asuint(objectToWorld[row][col]);
+      Out[base+28+row*4+col] = asuint(worldToObject[row][col]);
+    }
+  Out[base+40] = hit.GetGeometryIndex();
+  Out[base+41] = hit.GetInstanceIndex();
+  Out[base+42] = hit.GetInstanceID();
+  Out[base+43] = hit.GetPrimitiveIndex();
+  Out[base+44] = hit.GetHitKind();
+  Attr a; hit.GetAttributes(a);
+  Out[base+45] = asuint(a.bary.x);
+  Out[base+46] = asuint(a.bary.y);
+  Out[base+47] = hit.GetShaderTableIndex();
+  Out[base+48] = callbackSeen;
+}
+
+void firstHitTrace(bool deferred) {
+  uint lane = DispatchRaysIndex().x;
+  uint mode = lane & 7;
+  [loop] for (uint iteration = 0; iteration < 2; ++iteration) {
+    uint base = lane * 32 + iteration * 16;
+    Out[base+1] = 0;
+    Out[base+2] = 0;
+    Payload p = {mode | (iteration << 4)};
+    uint flags = mode == 6 ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_FORCE_NON_OPAQUE;
+    if (mode == 1 || mode == 2 || mode == 5 || mode == 6 || mode == 7)
+      flags |= RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+    if (mode == 5) flags |= RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+    RayDesc ray = {float3(mode == 7 ? (iteration ? 2.25 : -10) : 4.25,0.25,-1.0 - 2.0 * iteration),
+                   0,float3(0,0,1),100};
+    if (deferred) {
+      HitObject hit = HitObject::TraceRay(Scene,flags,255,mode == 6 ? 1 : 0,1,0,ray,p);
+      Out[base+8] = p.value;
+      Out[base+9] = hit.IsHit() ? 1 : 2;
+      Out[base+10] = asuint(hit.GetRayTCurrent());
+      if (hit.IsHit()) {
+        Attr a; hit.GetAttributes(a);
+        Out[base+11] = asuint(a.bary.x);
+      }
+      if (mode == 4 && iteration == 1) {
+        // All reports were rejected after publishing nonzero candidate state.
+        writeNoHitState(hit,256,(p.value & 0xff00) != 0);
+        RayDesc madeRay = {float3(-7,0.375,-5),0.125,float3(0.125,-0.25,1.5),17.25};
+        writeNoHitState(HitObject::MakeMiss(RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0,madeRay),320,false);
+        writeNoHitState(HitObject::MakeNop(),384,false);
+      }
+      if (mode == 7 && iteration == 1)
+        writeNoHitState(hit,448,(p.value & 0xff00) != 0);
+      HitObject::Invoke(hit,p);
+    } else {
+      TraceRay(Scene,flags,255,mode == 6 ? 1 : 0,1,0,ray,p);
+      Out[base+8] = p.value;
+      Out[base+9] = 0;
+    }
+    Out[base] = p.value;
+  }
+}
+[shader("raygeneration")] void HoFirstRayGen() { firstHitTrace(false); }
+[shader("raygeneration")] void HoFirstDeferredRayGen() { firstHitTrace(true); }
+
+[shader("intersection")]
+void HoFirstIntersection() {
+  float3 objectOrigin = ObjectRayOrigin();
+  if (objectOrigin.x < 0 || objectOrigin.x > 1 || objectOrigin.y < 0 || objectOrigin.y > 1) return;
+  uint iteration = ObjectRayOrigin().z < -2 ? 1 : 0;
+  uint base = DispatchRaysIndex().x * 32 + iteration * 16;
+  Out[base+1] = 1;
+  float originOffset = -ObjectRayOrigin().z;
+  Attr farHit = {float2(0.75,0.125)};
+  bool farAccepted = ReportHit(originOffset + 0.75,91,farHit);
+  Out[base+12] = asuint(RayTCurrent());
+  Out[base+3] = farAccepted;
+  Out[base+2] |= 1;
+  Attr nearHit = {float2(0.25,0.625)};
+  bool nearAccepted = ReportHit(originOffset + 0.25,92,nearHit);
+  Out[base+13] = asuint(RayTCurrent());
+  Out[base+4] = nearAccepted;
+  Out[base+2] |= 2;
+}
+[shader("anyhit")]
+void HoFirstAnyHit(inout Payload p, Attr a) {
+  uint mode = p.value & 7;
+  uint iteration = (p.value >> 4) & 1;
+  p.value += 0x100;
+  if (mode == 7) IgnoreHit();
+  if (mode == 4 && iteration == 1) IgnoreHit();
+  if ((mode == 2 || (mode == 3 && iteration == 1)) && a.bary.x == 0.75) IgnoreHit();
+  if (mode == 3 && iteration == 0) AcceptHitAndEndSearch();
+}
+[shader("closesthit")]
+void HoFirstClosestHit(inout Payload p, Attr a) {
+  uint base = DispatchRaysIndex().x * 32 + ((p.value >> 4) & 1) * 16;
+  Out[base+5] = asuint(RayTCurrent());
+  Out[base+6] = HitKind();
+  Out[base+7] = asuint(a.bary.x);
+  p.value |= 0x10000;
+}
+[shader("miss")] void HoFirstMiss(inout Payload p) { p.value |= 0x20000; }

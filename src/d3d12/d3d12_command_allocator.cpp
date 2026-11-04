@@ -22,6 +22,21 @@
 
 namespace d3dalloy {
 
+static void DestroyRecordedRenderEncoder(RenderEncoderData *render) {
+  for (auto *tables : {render->submission_tables.get(), render->swizzle_tables.get()})
+    if (tables)
+      for (const auto &use : *tables) {
+        use.rootsig->ReleasePrivate();
+        use.heap->ReleasePrivate();
+      }
+  render->~RenderEncoderData();
+}
+
+RecordingHead::~RecordingHead() {
+  for (auto *render : detached_render_templates)
+    DestroyRecordedRenderEncoder(render);
+}
+
 MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type) :
     MTLD3D12Pageable<MTLD3D12CommandAllocator>(pDevice),
     type_(Type),
@@ -164,6 +179,31 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
   std::vector<ClosedPassShape> shapes;
   std::unordered_map<const EncoderData *, size_t> indices;
   size_t rtas = 0;
+  auto append_table = [](ClosedDescriptorShape &shape, const StandardSwizzleTableUse &table, uint64_t stages) {
+    if (!shape.descriptors_complete) return;
+    D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
+    table.heap->GetDesc(&desc); table.heap->GetGPUDescriptorHandleForHeapStart(&start);
+    if (!start.ptr || table.base < start.ptr || (table.base - start.ptr) % 32 || table.parameter == ~0u) {
+      shape.descriptors_complete = false; return;
+    }
+    const uint64_t base = (table.base - start.ptr) / 32;
+    if (base >= desc.NumDescriptors) { shape.descriptors_complete = false; return; }
+    for (const auto &binding : table.shader_bindings) {
+      uint64_t used_stages = stages;
+      if (!(stages & WMTMetal4StageDispatch) && !(binding.ShaderVisibilityMask & 1u))
+        used_stages = (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_VERTEX) ? WMTMetal4StageVertex : 0) |
+            (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_PIXEL) ? WMTMetal4StageFragment : 0);
+      table.rootsig->ForEachUsedDescriptorRange(table.rootsig->GetTableRanges(table.parameter), {&binding,1},
+          [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
+        if (!shape.descriptors_complete || kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
+        if (!used_stages || offset >= desc.NumDescriptors - base || count > desc.NumDescriptors - base - offset) {
+          shape.descriptors_complete = false; return;
+        }
+        shape.descriptors.push_back({table.heap,uint32_t(base+offset),uint32_t(count),used_stages,
+            bool(binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS)});
+      });
+    }
+  };
   for (auto *record = head.next; record; record = record->next) {
     ClosedPassShape shape{record};
     const std::unique_ptr<std::vector<StandardSwizzleTableUse>> *tables = nullptr;
@@ -174,36 +214,45 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
     } else if (record->type == EncoderType::Compute) {
       const auto &compute = *static_cast<ComputeEncoderData *>(record);
       tables = &compute.submission_tables; stages = WMTMetal4StageDispatch;
+      shape.dispatch_access_complete = compute.dispatch_access_complete && compute.submission_access_complete &&
+          compute.dispatch_accesses.size() > 1;
+      size_t dispatch_index = 0;
       for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); cmd;
-           cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null()))
+           cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null())) {
         if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
             cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
             cmd->type != WMTComputeCommandDispatch) shape.compute_commands_complete = false;
-    }
-    if (tables && *tables) for (const auto &table : **tables) {
-      D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
-      table.heap->GetDesc(&desc); table.heap->GetGPUDescriptorHandleForHeapStart(&start);
-      if (!start.ptr || table.base < start.ptr || (table.base - start.ptr) % 32 || table.parameter == ~0u) {
-        shape.descriptors_complete = false; break;
+        if (cmd->type == WMTComputeCommandDispatch) {
+          if (dispatch_index >= compute.dispatch_accesses.size() ||
+              compute.dispatch_accesses[dispatch_index].command != cmd ||
+              !compute.dispatch_accesses[dispatch_index].complete) shape.dispatch_access_complete = false;
+          ++dispatch_index;
+        }
       }
-      const uint64_t base = (table.base - start.ptr) / 32;
-      if (base >= desc.NumDescriptors) {shape.descriptors_complete = false; break;}
-      for (const auto &binding : table.shader_bindings) {
-        uint64_t used_stages = stages;
-        if (!(stages & WMTMetal4StageDispatch) && !(binding.ShaderVisibilityMask & 1u))
-          used_stages = (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_VERTEX) ? WMTMetal4StageVertex : 0) |
-              (binding.ShaderVisibilityMask & (1u << D3D12_SHADER_VISIBILITY_PIXEL) ? WMTMetal4StageFragment : 0);
-        table.rootsig->ForEachUsedDescriptorRange(table.rootsig->GetTableRanges(table.parameter), {&binding,1},
-            [&](uint64_t offset, uint64_t count, D3D12_DESCRIPTOR_RANGE_TYPE kind) {
-          if (!shape.descriptors_complete || kind == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) return;
-          if (!used_stages || offset >= desc.NumDescriptors - base || count > desc.NumDescriptors - base - offset) {
-            shape.descriptors_complete = false; return;
+      shape.dispatch_access_complete &= shape.compute_commands_complete &&
+          dispatch_index == compute.dispatch_accesses.size();
+      if (shape.dispatch_access_complete) for (const auto &dispatch : compute.dispatch_accesses) {
+        ClosedDispatchShape closed;
+        closed.buffers = dispatch.buffers;
+        for (const auto index : dispatch.tables) {
+          if (!compute.submission_tables || index >= compute.submission_tables->size()) {
+            closed.descriptors_complete = false; break;
           }
-          shape.descriptors.push_back({table.heap,uint32_t(base+offset),uint32_t(count),used_stages,
-              bool(binding.Flags & MTL_SM50_SHADER_ARGUMENT_WRITE_ACCESS)});
-        });
+          append_table(closed, (*compute.submission_tables)[index], stages);
+        }
+        shape.dispatch_access_complete &= closed.descriptors_complete;
+        shape.dispatches.push_back(std::move(closed));
       }
+    } else if (record->type == EncoderType::CaptureFrontier) {
+      // A frontier is one opaque logical draw. Internal preparation boundaries
+      // anchor to this node instead of falling back to the start of the list.
+      const auto &frontier = *static_cast<CaptureFrontierEncoderData *>(record);
+      if (!frontier.producer || !frontier.consumer) return E_FAIL;
+      indices.emplace(frontier.producer, shapes.size());
+      indices.emplace(frontier.consumer, shapes.size());
+      shape.descriptors_complete = false;
     }
+    if (tables && *tables) for (const auto &table : **tables) append_table(shape, table, stages);
     rtas += record->type == EncoderType::Raytracing;
     indices.emplace(record,shapes.size()); shapes.push_back(std::move(shape));
   }
@@ -313,17 +362,7 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         reinterpret_cast<ClearEncoderData *>(next)->~ClearEncoderData();
         break;
       case EncoderType::Render:
-        if (auto &uses = reinterpret_cast<RenderEncoderData *>(next)->submission_tables; uses)
-          for (const auto &use : *uses) {
-            use.rootsig->ReleasePrivate();
-            use.heap->ReleasePrivate();
-          }
-        if (auto &uses = reinterpret_cast<RenderEncoderData *>(next)->swizzle_tables; uses)
-          for (const auto &use : *uses) {
-            use.rootsig->ReleasePrivate();
-            use.heap->ReleasePrivate();
-          }
-        reinterpret_cast<RenderEncoderData *>(next)->~RenderEncoderData();
+        DestroyRecordedRenderEncoder(static_cast<RenderEncoderData *>(next));
         break;
       case EncoderType::Blit:
         reinterpret_cast<BlitEncoderData *>(next)->~BlitEncoderData();
@@ -355,6 +394,9 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
         break;
       case EncoderType::WorkGraph:
         reinterpret_cast<WorkGraphEncoderData *>(next)->~WorkGraphEncoderData();
+        break;
+      case EncoderType::CaptureFrontier:
+        static_cast<CaptureFrontierEncoderData *>(next)->~CaptureFrontierEncoderData();
         break;
       case EncoderType::FenceBarrier:
         reinterpret_cast<FenceBarrierEncoderData *>(next)->~FenceBarrierEncoderData();

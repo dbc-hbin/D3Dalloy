@@ -3453,7 +3453,7 @@ Converter::DomainGetLocation(
 
 llvm::Value *
 Converter::DomainGeneratePrimitives(
-    llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive
+    llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *Lane
 ) {
   using namespace llvm;
 
@@ -3475,6 +3475,8 @@ Converter::DomainGeneratePrimitives(
   Ops.push_back(DataPtr);
   Tys.push_back(air.getMeshHandleType());
   Ops.push_back(air.getMeshHandle());
+  Tys.push_back(Lane->getType());
+  Ops.push_back(Lane);
 
   std::string FnName = "d3dalloy.domain_generate_primitives";
   switch (Primitive) {
@@ -3497,7 +3499,8 @@ Converter::DomainGeneratePrimitives(
 
 llvm::Value *
 Converter::DomainGeneratePrimitivesCapture(
-    llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr
+    llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr,
+    llvm::Value *Lane
 ) {
   using namespace llvm;
 
@@ -3511,8 +3514,8 @@ Converter::DomainGeneratePrimitivesCapture(
                 {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)}}
   );
 
-  Value *Ops[] = {WorkloadIndex, DataPtr, IndicesPtr};
-  Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType(), IndicesPtr->getType()};
+  Value *Ops[] = {WorkloadIndex, DataPtr, IndicesPtr, Lane};
+  Type *Tys[] = {WorkloadIndex->getType(), DataPtr->getType(), IndicesPtr->getType(), Lane->getType()};
 
   std::string FnName = "d3dalloy.domain_generate_primitives";
   switch (Primitive) {

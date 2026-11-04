@@ -1,4 +1,6 @@
 #include "dxbc_converter.hpp"
+#include "capture_frontier.hpp"
+#include "mesh_index_buffer_view.hpp"
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
@@ -246,7 +248,8 @@ SM50_SHADER_METAL_VERSION required_metal_version(const llvm::Module &module, SM5
 void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_version,
                          const SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel) {
   using namespace llvm;
-  if (msaa_pixel && (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) != SM50_MSAA_COVERAGE)
+  if (msaa_pixel &&
+      (msaa_pixel->variant & ~(SM50_MSAA_ATOMIC_HELPERS | SM50_MSAA_GPU_TILE_TASKS)) != SM50_MSAA_COVERAGE)
     metal_version = std::max(metal_version, SM50_SHADER_METAL_400);
   metal_version = required_metal_version(module, metal_version);
   auto &context = module.getContext();
@@ -538,9 +541,11 @@ void claim_pixel_invocation(
 
 VertexIndexPullArgs define_stream_output_capture(
   air::FunctionSignatureBuilder &func_signature, IRValue &epilogue, std::vector<StreamOutputCaptureRun> runs,
-  uint32_t record_dwords
+  uint32_t record_dwords, bool frontier
 ) {
   auto args = define_vertex_index_pull(func_signature);
+  if (frontier)
+    args.frontier = define_capture_frontier(func_signature);
   // MSAA-only capture uses this argument layout to pull IA indices, but has no
   // stream-output record. It must not claim keys in the caller's fallback buffer.
   if (!record_dwords) return args;
@@ -572,6 +577,12 @@ VertexIndexPullArgs define_stream_output_capture(
         builder.CreateAdd(builder.CreateMul(ctx.resource.instance_id, positions_per_instance), ctx.resource.so_capture_key),
         first_position
       );
+      if (args.frontier != ~0u) {
+        auto *cursor = ctx.function->getArg(args.frontier);
+        auto *first = load_capture_frontier(builder, cursor, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, first_position));
+        auto *base = load_capture_frontier(builder, cursor, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, producer_record_base));
+        record = builder.CreateAdd(builder.CreateSub(ctx.resource.so_capture_key, first), base);
+      }
       auto *claim_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture_claim", ctx.function);
       auto *capture_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture", ctx.function);
       auto *done_bb = llvm::BasicBlock::Create(ctx.llvm, "so_capture_done", ctx.function);
@@ -652,6 +663,15 @@ void apply_vertex_index_pull(
   builder.CreateCondBr(builder.CreateICmpNE(index_size, builder.getInt32(0)), pull_bb, join_bb);
 
   builder.SetInsertPoint(pull_bb);
+  auto *view_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_view", function);
+  auto *raw_bb = llvm::BasicBlock::Create(builder.getContext(), "vertex_index_raw", function);
+  builder.CreateCondBr(builder.CreateICmpEQ(index_size, builder.getInt32(8)), view_bb, raw_bb);
+  builder.SetInsertPoint(view_bb);
+  auto *view_index = load_mesh_index_buffer_view(builder, indices, builder.CreateAdd(index_first, key));
+  auto *view_with_base = builder.CreateAdd(view_index, base_vertex);
+  auto *view_end = builder.GetInsertBlock();
+  builder.CreateBr(join_bb);
+  builder.SetInsertPoint(raw_bb);
   auto *wide = builder.CreateICmpEQ(index_size, builder.getInt32(4));
   auto *word = builder.CreateAdd(index_first, builder.CreateSelect(wide, builder.CreateShl(key, 1), key));
   auto load_word = [&](llvm::Value *at) {
@@ -676,14 +696,24 @@ void apply_vertex_index_pull(
   builder.CreateBr(join_bb);
 
   builder.SetInsertPoint(join_bb);
-  auto *vertex_id = builder.CreatePHI(int_ty, 2);
+  auto *vertex_id = builder.CreatePHI(int_ty, 3);
   vertex_id->addIncoming(key, entry);
   vertex_id->addIncoming(index, merge_bb);
-  auto *vertex_id_with_base = builder.CreatePHI(int_ty, 2);
+  vertex_id->addIncoming(view_index, view_end);
+  auto *vertex_id_with_base = builder.CreatePHI(int_ty, 3);
   vertex_id_with_base->addIncoming(resource.vertex_id_with_base, entry);
   vertex_id_with_base->addIncoming(with_base, merge_bb);
+  vertex_id_with_base->addIncoming(view_with_base, view_end);
+  // IA position draws use a synthetic native base of zero. SM6.8 still exposes
+  // the original signed BaseVertexLocation for indexed draws. Preserve its
+  // exact i32 bits; non-indexed draws retain the native StartVertexLocation.
+  auto *original_base_vertex = builder.CreatePHI(int_ty, 3);
+  original_base_vertex->addIncoming(resource.base_vertex_id, entry);
+  original_base_vertex->addIncoming(base_vertex, merge_bb);
+  original_base_vertex->addIncoming(base_vertex, view_end);
   resource.vertex_id = vertex_id;
   resource.vertex_id_with_base = vertex_id_with_base;
+  resource.base_vertex_id = original_base_vertex;
 }
 
 RegisterComponentType
@@ -866,6 +896,7 @@ llvm::Error convert_dxbc_pixel_shader(
   std::optional<PixelStatisticsClaim> stats_claim;
   if (stats && claim_arg)
     stats_claim = define_pixel_statistics_claim(func_signature);
+  const uint32_t frontier_index = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
                                    rootsig->bytecode_length
@@ -948,6 +979,7 @@ llvm::Error convert_dxbc_pixel_shader(
     builder.CreateRet(value);
   }
 
+  offset_capture_frontier_pixel_primitive(function, function_metadata, frontier_index);
   module.getOrInsertNamedMetadata("air.fragment")
     ->addOperand(function_metadata);
 
@@ -1104,7 +1136,8 @@ llvm::Error convert_dxbc_vertex_shader(
   SM50_SHADER_D3D12_MSAA_VERTEX_DATA *msaa_vertex = nullptr;
   args_get_data<SM50_SHADER_D3D12_MSAA_VERTEX, SM50_SHADER_D3D12_MSAA_VERTEX_DATA>(pArgs, &msaa_vertex);
   if (index_pull && (so_capture || vertex_so) &&
-      !(msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE && so_capture && !vertex_so))
+      !(msaa_vertex && (msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE ||
+                        msaa_vertex->variant == SM50_CAPTURE_VERTEX_NATIVE) && so_capture && !vertex_so))
     return llvm::make_error<UnsupportedFeature>("standalone index pulling and stream output on the same vertex shader");
   std::vector<StreamOutputCaptureRun> so_capture_runs;
   if (so_capture) {
@@ -1218,7 +1251,8 @@ llvm::Error convert_dxbc_vertex_shader(
   VertexIndexPullArgs vertex_index_args;
   if (so_capture)
     vertex_index_args =
-      define_stream_output_capture(func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords);
+      define_stream_output_capture(func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords,
+                                   capture_frontier_enabled(pArgs));
   else if (index_pull)
     vertex_index_args = define_vertex_index_pull(func_signature);
 
@@ -2422,8 +2456,8 @@ AIRCONV_API int SM50Compile(
     ((d3dalloy::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
   const bool mark_rov_buffers = !msaa_vertex &&
-    (!msaa_pixel || (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) == SM50_MSAA_PIXEL ||
-      (msaa_pixel->variant & ~SM50_MSAA_ATOMIC_HELPERS) == SM50_MSAA_SAMPLE_APP) &&
+    (!msaa_pixel || (msaa_pixel->variant & ~(SM50_MSAA_ATOMIC_HELPERS | SM50_MSAA_GPU_TILE_TASKS)) == SM50_MSAA_PIXEL ||
+      (msaa_pixel->variant & ~(SM50_MSAA_ATOMIC_HELPERS | SM50_MSAA_GPU_TILE_TASKS)) == SM50_MSAA_SAMPLE_APP) &&
     root_signature && SM50NeedsRasterOrderedBufferMarker(pShader, root_signature->bytecode,
       root_signature->bytecode_length);
   const uint32_t marker_samples = pixel_pso && pixel_pso->native_sample_count
@@ -2436,7 +2470,8 @@ AIRCONV_API int SM50Compile(
   SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA *existing_capture = nullptr;
   d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE, SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA>(pArgs, &existing_capture);
   SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA synthetic_capture{};
-  if (msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE && !existing_capture) {
+  if (msaa_vertex && (msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE ||
+                      msaa_vertex->variant == SM50_CAPTURE_VERTEX_NATIVE) && !existing_capture) {
     synthetic_capture.next = pArgs;
     synthetic_capture.type = SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE;
     pArgs = (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&synthetic_capture;

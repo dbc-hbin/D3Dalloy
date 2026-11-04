@@ -14,6 +14,7 @@
 #include <algorithm>
 
 #include "air_signature.hpp"
+#include "capture_frontier.hpp"
 #include "airconv_context.hpp"
 #include "airconv_public.h"
 #include "msaa_pixel.hpp"
@@ -1474,7 +1475,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       )) {
     if (module.stage != Stage::Vertex)
       return unsupported("stream output capture outside a vertex shader");
-    if (index_pull && !(msaa_vertex && msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE))
+    if (index_pull && !(msaa_vertex && (msaa_vertex->variant == SM50_MSAA_VERTEX_CAPTURE ||
+                                      msaa_vertex->variant == SM50_CAPTURE_VERTEX_NATIVE)))
       return unsupported("standalone index pulling and stream output on the same vertex shader");
     for (uint32_t i = 0; i < so_capture->num_elements; i++) {
       auto &element = so_capture->elements[i];
@@ -1645,12 +1647,15 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
       );
     if (so_capture)
       vertex_index_args = dxbc::define_stream_output_capture(
-        func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords
+        func_signature, epilogue, std::move(so_capture_runs), so_capture->record_dwords,
+        dxbc::capture_frontier_enabled(args)
       );
     else if (index_pull)
       vertex_index_args = dxbc::define_vertex_index_pull(func_signature);
   }
 
+  const uint32_t frontier_pixel_index = module.stage == Stage::Pixel && dxbc::capture_frontier_enabled(args)
+      ? dxbc::define_capture_frontier(func_signature) : ~0u;
   dxbc::initialize_sample_mask_constant(module_ir, args);
   if (module.stage == Stage::Pixel && (pso_sample_mask != 0xffffffff || coarse_mask_output)) {
     auto assigned_index = func_signature.DefineOutput(air::OutputCoverageMask{});
@@ -1838,6 +1843,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
   else
     builder.CreateRet(return_value);
 
+  dxbc::offset_capture_frontier_pixel_primitive(function, function_metadata, frontier_pixel_index);
   llvm::StringRef kind = module.stage == Stage::Pixel    ? "air.fragment"
                          : module.stage == Stage::Vertex ? "air.vertex"
                                                          : "air.kernel";

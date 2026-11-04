@@ -24,7 +24,11 @@ std::vector<uint8_t> producerShader(const char *entry) {
   const std::string name = std::string("atomic64-producers-") + entry + ".dxil";
   return readFile(std::wstring(name.begin(), name.end()).c_str());
 }
-void runProducer(Gpu &gpu, ID3D12RootSignature *root, const ProducerCase &c, UINT samples) {
+void runProducer(Gpu &gpu, ID3D12RootSignature *root, const ProducerCase &c, UINT samples, bool indirect = false) {
+  if (indirect) {
+    std::fprintf(stderr, "OWNED_D3D12_ATOMIC64_PRODUCERS_PHASE case=%s samples=%u begin\n", c.name, samples);
+    std::fflush(stderr);
+  }
   begin();
   const auto vs = producerShader(c.vs), hs = producerShader(c.hs), ds = producerShader(c.ds),
              gs = producerShader(c.gs), as = producerShader(c.as), ms = producerShader(c.ms), ps = producerShader("ps_sample");
@@ -74,6 +78,28 @@ void runProducer(Gpu &gpu, ID3D12RootSignature *root, const ProducerCase &c, UIN
   }
   auto logs = gpu.uavBuffer(initial_logs), cells = gpu.uavBuffer(initial_cells);
   gpu.rawUav(0, logs.Get()); gpu.structuredUav(1, cells.Get(), 8);
+  ComPtr<ID3D12Resource> argumentUpload, argumentBuffer;
+  ComPtr<ID3D12CommandSignature> indirectSignature;
+  if (indirect) {
+    // Both argument and count are written into DEFAULT storage by this GPU list.
+    // Every original producer lane and pixel oracle below also covers this route.
+    struct Arguments { D3D12_DRAW_ARGUMENTS draw; UINT count, padding[3]; };
+    const Arguments arguments{{3, 2, 0, 0}, 1, {0, 0, 0}};
+    static_assert(sizeof(Arguments) == 32);
+    argumentUpload = gpu.buffer(sizeof(arguments), D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    argumentBuffer = gpu.buffer(sizeof(arguments), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    void *mapped = nullptr;
+    check(argumentUpload->Map(0, nullptr, &mapped), "Map(producer indirect arguments)");
+    std::memcpy(mapped, &arguments, sizeof(arguments));
+    argumentUpload->Unmap(0, nullptr);
+    gpu.list->CopyBufferRegion(argumentBuffer.Get(), 0, argumentUpload.Get(), 0, sizeof(arguments));
+    gpu.transition(argumentBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DRAW_ARGUMENTS), 1, &argument, 0};
+    check(gpu.device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&indirectSignature)),
+          "CreateCommandSignature(producer DRAW)");
+  }
   D3D12_RESOURCE_DESC rt{}; rt.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   rt.Width = rt.Height = 8; rt.DepthOrArraySize = rt.MipLevels = 1;
   rt.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rt.SampleDesc.Count = samples; rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -93,7 +119,11 @@ void runProducer(Gpu &gpu, ID3D12RootSignature *root, const ProducerCase &c, UIN
   if (c.ms) { ComPtr<ID3D12GraphicsCommandList6> list6; check(gpu.list.As(&list6),"QueryInterface(List6)");
     list6->DispatchMesh(c.grid[0],c.grid[1],c.grid[2]);
   } else { gpu.list->IASetPrimitiveTopology(c.hs ? D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    gpu.list->DrawInstanced(3,2,0,0); }
+    if (indirect)
+      gpu.list->ExecuteIndirect(indirectSignature.Get(), 1, argumentBuffer.Get(), 0,
+                                argumentBuffer.Get(), sizeof(D3D12_DRAW_ARGUMENTS));
+    else
+      gpu.list->DrawInstanced(3,2,0,0); }
   ID3D12Resource *copy_source = target.Get();
   if (samples > 1) {
     rt.SampleDesc.Count = 1;
@@ -133,6 +163,10 @@ void runProducer(Gpu &gpu, ID3D12RootSignature *root, const ProducerCase &c, UIN
   image->Unmap(0,nullptr);
   std::printf("OWNED_D3D12_ATOMIC64_PRODUCERS_CASE case=%s samples=%u status=%s\n",c.name,samples,g_case_mismatches?"FAIL":"PASS");
   if (g_case_mismatches) ++g_failures;
+  if (indirect) {
+    std::fprintf(stderr, "OWNED_D3D12_ATOMIC64_PRODUCERS_PHASE case=%s samples=%u end\n", c.name, samples);
+    std::fflush(stderr);
+  }
 }
 }
 int wmain() {
@@ -151,6 +185,12 @@ int wmain() {
   D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc{}; desc.Version=D3D_ROOT_SIGNATURE_VERSION_1_1; desc.Desc_1_1.NumParameters=2; desc.Desc_1_1.pParameters=parameters;
   auto root=rootSignature(device.Get(),desc);
   for (const auto &c:producer_cases) for (UINT samples:{1u,4u}) runProducer(gpu,root.Get(),c,samples);
-  std::printf("OWNED_D3D12_ATOMIC64_PRODUCERS_%s cases=18 stages=VS,HS,DS,GS,AS,MS\n",g_failures?"FAIL":"PASS");
+  for (UINT i = 0; i < 5; ++i) {
+    auto c = producer_cases[i];
+    const std::string name = std::string(c.name) + "_indirect";
+    c.name = name.c_str();
+    for (UINT samples : {1u, 4u}) runProducer(gpu, root.Get(), c, samples, true);
+  }
+  std::printf("OWNED_D3D12_ATOMIC64_PRODUCERS_%s cases=28 stages=VS,HS,DS,GS,AS,MS\n",g_failures?"FAIL":"PASS");
   return g_failures?1:0;
 }

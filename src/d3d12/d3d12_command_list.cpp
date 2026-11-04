@@ -460,6 +460,7 @@ class MTLD3D12GraphicsCommandListImpl
   std::array<D3D12_VERTEX_BUFFER_VIEW, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_;
 
   uint64_t index_buffer_address;
+  uint32_t index_buffer_size;
   WMT::Buffer index_buffer;
   WMTIndexType index_type;
   uint64_t index_offset;
@@ -493,9 +494,21 @@ class MTLD3D12GraphicsCommandListImpl
   WMT::Reference<WMT::ComputePipelineState> predication_snapshot_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> predication_arguments_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> mesh_indirect_pipeline_;
+  // Shared by GS/HS/DS ExecuteIndirect and DISPATCH_MESH. The optional IBV is
+  // copied after the draw record into an aligned 64-byte output slot.
+  struct MeshIndirectControl {
+    uint64_t arguments, count, predicate, max_threadgroups;
+    uint32_t stride, max_commands, argument_words, predicate_not_equal, per_group, control_points;
+    uint64_t index_arguments;
+    uint32_t argument_stride_words, index_argument_offset;
+  };
+  static_assert(sizeof(MeshIndirectControl) == 72);
+  static_assert(sizeof(SM50_GPU_INDEX_BUFFER_VIEW) == 32 && offsetof(SM50_GPU_INDEX_BUFFER_VIEW, first_index) == 16);
   WMT::Reference<WMT::ComputePipelineState> mesh_strip_cut_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> mesh_strip_reduce_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> tess_capture_clear_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> tess_capture_compact_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> tess_capture_reduce_pipeline_, primitive_scan_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> predication_copy_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> predication_pitched_copy_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> d24_upload_pipeline_;
@@ -619,7 +632,6 @@ class MTLD3D12GraphicsCommandListImpl
   WMT::Reference<WMT::ComputePipelineState> so_assemble_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> so_assemble_gs_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> so_positions_pipeline_;
-  WMT::Reference<WMT::ComputePipelineState> so_indirect_preflight_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> msaa_assembly_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> msaa_bounds_pipeline_;
   std::shared_ptr<StreamOutputDrawData> so_pending_;
@@ -776,7 +788,8 @@ class MTLD3D12GraphicsCommandListImpl
   bool EnsurePredicationPipelines() {
     if (predication_snapshot_pipeline_ && predication_arguments_pipeline_ && predication_copy_pipeline_ &&
         predication_pitched_copy_pipeline_ && mesh_indirect_pipeline_ && mesh_strip_cut_pipeline_ && tess_capture_clear_pipeline_ &&
-        tess_capture_compact_pipeline_)
+        tess_capture_compact_pipeline_ && mesh_strip_reduce_pipeline_ && tess_capture_reduce_pipeline_ &&
+        primitive_scan_pipeline_)
       return true;
     constexpr auto source = R"(
 #include <metal_stdlib>
@@ -827,6 +840,9 @@ struct D3DalloyMeshIndirectControl {
   uint predicate_not_equal;
   uint per_group;        // vertices (GS) or patches (TS) advanced per object threadgroup; 0: DISPATCH_MESH grid
   uint control_points;   // TS: vertices per patch, GS: 0
+  ulong index_arguments; // first signature record, or 0 for an inherited/no IB
+  uint argument_stride_words;
+  uint index_argument_offset;
 };
 kernel void d3dalloy_mesh_indirect_arguments(constant D3DalloyMeshIndirectControl &control [[buffer(0)]],
                                          device uint *arguments_out [[buffer(1)]],
@@ -835,7 +851,7 @@ kernel void d3dalloy_mesh_indirect_arguments(constant D3DalloyMeshIndirectContro
   if (index >= control.max_commands)
     return;
   device const uint *source = (device const uint *)(control.arguments + ulong(index) * control.stride);
-  device uint *arguments = arguments_out + index * 8;
+  device uint *arguments = arguments_out + ulong(index) * control.argument_stride_words;
   uint limit = control.count ? *(device const uint *)control.count : control.max_commands;
   bool execute = index < limit;
   if (control.predicate) {
@@ -844,6 +860,19 @@ kernel void d3dalloy_mesh_indirect_arguments(constant D3DalloyMeshIndirectContro
   }
   for (uint i = 0; i < control.argument_words; i++)
     arguments[i] = execute ? source[i] : 0;
+  if (control.index_arguments) {
+    // A signature IBV can begin at only four-byte alignment. Copy its words
+    // into the slot's aligned view, and never read a skipped/empty draw's IBV.
+    device uint *view = arguments + 8;
+    if (execute && arguments[0] && arguments[1]) {
+      device const uint *ib = (device const uint *)(control.index_arguments +
+          ulong(index) * control.stride + control.index_argument_offset);
+      for (uint i = 0; i < 4; ++i) view[i] = ib[i];
+      view[4] = arguments[2]; // first index, used by SO/strip assembly's view pull
+    } else {
+      for (uint i = 0; i < 5; ++i) view[i] = 0;
+    }
+  }
   if (!control.per_group) {
     /* D3D12_DISPATCH_MESH_ARGUMENTS: the grid itself. Each dimension must be < 64k and the product <= 2^22. */
     uint3 grid = uint3(arguments[0], arguments[1], arguments[2]);
@@ -860,11 +889,74 @@ kernel void d3dalloy_mesh_indirect_arguments(constant D3DalloyMeshIndirectContro
   else
     dispatch_out[index] = uint3(uint(groups), instances, 1);
 }
-/* GS strip draws the mesh GS cannot assemble natively: an indexed strip with an active IBStripCutValue (every strip
- * restarts winding parity and continues SV_PrimitiveID from the previous strip) and any triangle strip with
- * adjacency (its end-of-strip adjacency rules are position dependent). One thread rewrites the draw as the equivalent
- * list (D3D11.3 8.10 primitive order, winding and adjacency) of 32-bit index values, writes
- * its D3D12_DRAW_INDEXED_ARGUMENTS and object grid, and moves IAVertices from list to strip accounting. */
+/* Ordered block summaries for strip assembly and TS+GS compaction. Only one summary per 256 inputs is stored;
+ * the final pass repeats the local scan and prepends the summaries of preceding blocks. Higher levels contain
+ * locally inclusive scans of the previous level's block totals, so no inter-threadgroup polling is needed. */
+struct D3DalloyPrimitiveSummary {
+  uint head, tail, primitives, vertices, cut;
+};
+struct D3DalloyPrimitiveScanLevel {
+  uint count, offset, next_offset, topology;
+};
+inline uint d3dalloy_primitive_groups(uint count) { return count ? (count - 1) / 256 + 1 : 0; }
+inline uint d3dalloy_strip_primitives(uint topology, uint length) {
+  if (topology == 13) return length >= 6 ? (length - 4) / 2 : 0;
+  const uint skip = topology == 3 ? 1 : topology == 11 ? 3 : 2;
+  return length > skip ? length - skip : 0;
+}
+inline uint d3dalloy_strip_vertices(uint topology, uint length) {
+  const uint n = d3dalloy_strip_primitives(topology, length);
+  return !n ? 0 : topology == 13 ? 2 * n + 4 : length;
+}
+inline D3DalloyPrimitiveSummary d3dalloy_primitive_join(
+    D3DalloyPrimitiveSummary a, D3DalloyPrimitiveSummary b, uint topology) {
+  if (!topology) return {0, 0, a.primitives + b.primitives, 0, 0};
+  const uint joined = a.tail + b.head;
+  const uint primitives = d3dalloy_strip_primitives(topology, joined) -
+      d3dalloy_strip_primitives(topology, a.tail) - d3dalloy_strip_primitives(topology, b.head);
+  const uint vertices = d3dalloy_strip_vertices(topology, joined) -
+      d3dalloy_strip_vertices(topology, a.tail) - d3dalloy_strip_vertices(topology, b.head);
+  return {a.cut ? a.head : a.head + b.head, b.cut ? b.tail : a.tail + b.tail,
+          a.primitives + b.primitives + primitives, a.vertices + b.vertices + vertices, a.cut | b.cut};
+}
+inline D3DalloyPrimitiveSummary d3dalloy_primitive_local_scan(
+    threadgroup D3DalloyPrimitiveSummary *partial, D3DalloyPrimitiveSummary value, uint tid, uint topology) {
+  partial[tid] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint offset = 1; offset < 256; offset <<= 1) {
+    const D3DalloyPrimitiveSummary before = tid >= offset ? partial[tid - offset] : D3DalloyPrimitiveSummary{};
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= offset) partial[tid] = d3dalloy_primitive_join(before, partial[tid], topology);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  return partial[tid];
+}
+inline D3DalloyPrimitiveSummary d3dalloy_primitive_block_prefix(
+    device const D3DalloyPrimitiveSummary *summaries, uint count, uint block, uint topology) {
+  D3DalloyPrimitiveSummary prefix{};
+  uint offset = 0;
+  for (uint groups = d3dalloy_primitive_groups(count); groups > 1; groups = d3dalloy_primitive_groups(groups)) {
+    if (block % 256) prefix = d3dalloy_primitive_join(summaries[offset + block - 1], prefix, topology);
+    if (groups <= 256) break;
+    offset += groups;
+    block /= 256;
+  }
+  return prefix;
+}
+kernel void d3dalloy_primitive_scan(constant D3DalloyPrimitiveScanLevel &control [[buffer(0)]],
+                                  device D3DalloyPrimitiveSummary *summaries [[buffer(1)]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint3 group [[threadgroup_position_in_grid]]) {
+  const uint index = group.x * 256 + tid;
+  const D3DalloyPrimitiveSummary value = index < control.count ? summaries[control.offset + index]
+                                                            : D3DalloyPrimitiveSummary{};
+  threadgroup D3DalloyPrimitiveSummary partial[256];
+  const auto prefix = d3dalloy_primitive_local_scan(partial, value, tid, control.topology);
+  if (index < control.count) summaries[control.offset + index] = prefix;
+  if (tid == 255 && control.next_offset) summaries[control.next_offset + group.x] = prefix;
+}
+/* GS strips become equivalent lists (D3D11.3 8.10). The segmented prefix preserves primitive order and resets
+ * winding at each restart; triangle adjacency needs only two-index lookahead to identify the last primitive. */
 struct D3DalloyMeshStripCutControl {
   ulong max_threadgroups;
   uint topology;  // D3D_PRIMITIVE_TOPOLOGY: 3 line strip, 5 triangle strip, 11 line strip adj, 13 triangle strip adj
@@ -883,88 +975,116 @@ struct D3DalloyMeshStripCutControl {
 };
 // Index size 0: a non-indexed draw, whose IA position k is its own value.
 inline uint d3dalloy_mesh_read_index(device const uchar *indices, uint size, uint k) {
-  return size == 0 ? k : size == 4 ? uint(indices[4 * k]) | uint(indices[4 * k + 1]) << 8 | uint(indices[4 * k + 2]) << 16 |
-                         uint(indices[4 * k + 3]) << 24
-                   : uint(indices[2 * k]) | uint(indices[2 * k + 1]) << 8;
+  if (!size) return k;
+  if (size == 8) {
+    device const uint *view = reinterpret_cast<device const uint *>(indices);
+    const ulong address = ulong(view[0]) | ulong(view[1]) << 32;
+    const uint width = view[3] == 42 ? 4 : 2;
+    const uint offset = (view[4] + k) * width;
+    if (!address || (view[3] != 42 && view[3] != 57) || view[2] < width || offset > view[2] - width)
+      return 0;
+    device const uchar *at = reinterpret_cast<device const uchar *>(address + ulong(offset));
+    const uint low = uint(at[0]) | uint(at[1]) << 8;
+    return width == 4 ? low | uint(at[2]) << 16 | uint(at[3]) << 24 : low;
+  }
+  const ulong offset = ulong(size) * k;
+  const uint low = uint(indices[offset]) | uint(indices[offset + 1]) << 8;
+  return size == 4 ? low | uint(indices[offset + 2]) << 16 | uint(indices[offset + 3]) << 24 : low;
+}
+inline bool d3dalloy_strip_suppressed(constant D3DalloyMeshStripCutControl &control, device const ulong *predicate) {
+  return control.predicate_enabled && (control.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0);
+}
+inline D3DalloyPrimitiveSummary d3dalloy_strip_element(
+    constant D3DalloyMeshStripCutControl &control, device const uchar *indices, uint index) {
+  if (index >= control.count) return {};
+  if (control.cut_enabled && d3dalloy_mesh_read_index(indices, control.index_size, index) == control.cut_value)
+    return {0, 0, 0, 0, 1};
+  return {1, 1, 0, 0, 0};
+}
+kernel void d3dalloy_mesh_strip_reduce(constant D3DalloyMeshStripCutControl &control [[buffer(0)]],
+                                     device const uchar *indices [[buffer(1)]],
+                                     device const ulong *predicate [[buffer(5)]],
+                                     device D3DalloyPrimitiveSummary *summaries [[buffer(6)]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint3 group [[threadgroup_position_in_grid]]) {
+  const auto value = d3dalloy_strip_suppressed(control, predicate) ? D3DalloyPrimitiveSummary{}
+      : d3dalloy_strip_element(control, indices + control.index_skip, group.x * 256 + tid);
+  threadgroup D3DalloyPrimitiveSummary partial[256];
+  const auto prefix = d3dalloy_primitive_local_scan(partial, value, tid, control.topology);
+  if (tid == 255) summaries[group.x] = prefix;
 }
 kernel void d3dalloy_mesh_strip_cut(constant D3DalloyMeshStripCutControl &control [[buffer(0)]],
-                                device const uchar *indices [[buffer(1)]],
-                                device uint *list [[buffer(2)]],
-                                device uint *arguments [[buffer(3)]],
-                                device ulong *statistics [[buffer(4)]],
-                                device const ulong *predicate [[buffer(5)]]) {
-  for (uint i = 0; i < 11; i++)
-    arguments[i] = 0;
-  if (control.predicate_enabled && (control.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
+                                  device const uchar *indices [[buffer(1)]],
+                                  device uint *list [[buffer(2)]],
+                                  device uint *arguments [[buffer(3)]],
+                                  device ulong *statistics [[buffer(4)]],
+                                  device const ulong *predicate [[buffer(5)]],
+                                  device const D3DalloyPrimitiveSummary *summaries [[buffer(6)]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint3 group [[threadgroup_position_in_grid]]) {
+  const uint k = group.x * 256 + tid;
+  if (d3dalloy_strip_suppressed(control, predicate)) {
+    if (k == 0) for (uint i = 0; i < 11; i++) arguments[i] = 0;
     return;
+  }
   indices += control.index_skip;
-  if (control.index_size == 0)
-    indices = nullptr;
   const uint topology = control.topology;
   const uint vpp = topology == 3 ? 2 : topology == 5 || topology == 6 ? 3 : topology == 11 ? 4 : 6;
-  uint emitted = 0;
-  ulong strip_vertices = 0;
-  uint start = 0;
-  for (uint k = 0; k <= control.count; k++) {
-    if (k < control.count && (!control.cut_enabled || d3dalloy_mesh_read_index(indices, control.index_size, k) != control.cut_value))
-      continue;
-    const uint length = k - start;
-    const uint s = start;
-    start = k + 1;
-    uint n = 0;
-    if (topology == 3 && length >= 2) n = length - 1;
-    if ((topology == 5 || topology == 6) && length >= 3) n = length - 2;
-    if (topology == 11 && length >= 4) n = length - 3;
-    if (topology == 13 && length >= 6) n = (length - 4) / 2;
-    if (!n) continue;
-    strip_vertices += topology == 13 ? 2 * n + 4 : n + vpp - 1;
-    for (uint i = 0; i < n; i++) {
-      uint v[6];
-      if (topology == 3) {
-        v[0] = i; v[1] = i + 1;
-      } else if (topology == 5) {
-        v[0] = i; v[1] = (i & 1) ? i + 2 : i + 1; v[2] = (i & 1) ? i + 1 : i + 2;
-      } else if (topology == 6) {
-        // D3D9 fan order: moving rim is the leading/provoking vertex.
-        v[0] = i + 1; v[1] = i + 2; v[2] = 0;
-      } else if (topology == 11) {
-        for (uint j = 0; j < 4; j++) v[j] = i + j;
-      } else {
-        const uint t = 2 * i;
-        const bool last = i + 1 == n;
-        if (n == 1) {
-          v[0] = 0; v[1] = 1; v[2] = 2; v[3] = 5; v[4] = 4; v[5] = 3;
-        } else if (i == 0) {
-          v[0] = 0; v[1] = 1; v[2] = 2; v[3] = 6; v[4] = 4; v[5] = 3;
-        } else if (i & 1) {
-          v[0] = t; v[1] = t + 3; v[2] = t + 4; v[3] = last ? t + 5 : t + 6; v[4] = t + 2; v[5] = t - 2;
-        } else {
-          v[0] = t; v[1] = t - 2; v[2] = t + 2; v[3] = last ? t + 5 : t + 6; v[4] = t + 4; v[5] = t + 3;
-        }
-      }
-      for (uint j = 0; j < vpp; j++)
-        list[emitted + j] = d3dalloy_mesh_read_index(indices, control.index_size, s + v[j]);
-      emitted += vpp;
+  threadgroup D3DalloyPrimitiveSummary partial[256], before;
+  if (tid == 0) before = d3dalloy_primitive_block_prefix(summaries, control.count, group.x, topology);
+  const auto local = d3dalloy_primitive_local_scan(partial, d3dalloy_strip_element(control, indices, k), tid, topology);
+  const auto prefix = d3dalloy_primitive_join(before, local, topology);
+  if (k == control.count - 1) {
+    const uint emitted = prefix.primitives * vpp;
+    for (uint j = 0; j < 11; j++) arguments[j] = 0;
+    arguments[0] = emitted;
+    arguments[1] = control.instances;
+    arguments[3] = uint(control.base_vertex);
+    arguments[4] = control.start_instance;
+    const ulong groups = emitted ? (emitted - 1) / control.per_group + 1 : 0;
+    if (emitted && control.instances && groups * control.instances <= control.max_threadgroups) {
+      arguments[8] = uint(groups);
+      arguments[9] = control.instances;
+      arguments[10] = 1;
+    }
+    // The list variant counts vpp vertices per primitive; IAVertices counts each strip vertex once (FS 20.4).
+    if (control.statistics_enabled)
+      statistics[0] -= (ulong(emitted) - prefix.vertices) * control.instances;
+  }
+  if (k >= control.count) return;
+  const uint length = prefix.tail;
+  if (length < vpp || (topology == 13 && (length & 1))) return;
+  const uint i = d3dalloy_strip_primitives(topology, length) - 1, s = k + 1 - length;
+  uint v[6];
+  if (topology == 3) {
+    v[0] = i; v[1] = i + 1;
+  } else if (topology == 5) {
+    v[0] = i; v[1] = (i & 1) ? i + 2 : i + 1; v[2] = (i & 1) ? i + 1 : i + 2;
+  } else if (topology == 6) {
+    // D3D9 fan order: moving rim is the leading/provoking vertex.
+    v[0] = i + 1; v[1] = i + 2; v[2] = 0;
+  } else if (topology == 11) {
+    for (uint j = 0; j < 4; j++) v[j] = i + j;
+  } else {
+    const uint t = 2 * i;
+    const bool last = control.count - k <= 2 || (control.cut_enabled &&
+        (d3dalloy_mesh_read_index(indices, control.index_size, k + 1) == control.cut_value ||
+         d3dalloy_mesh_read_index(indices, control.index_size, k + 2) == control.cut_value));
+    if (i == 0 && last) {
+      v[0] = 0; v[1] = 1; v[2] = 2; v[3] = 5; v[4] = 4; v[5] = 3;
+    } else if (i == 0) {
+      v[0] = 0; v[1] = 1; v[2] = 2; v[3] = 6; v[4] = 4; v[5] = 3;
+    } else if (i & 1) {
+      v[0] = t; v[1] = t + 3; v[2] = t + 4; v[3] = last ? t + 5 : t + 6; v[4] = t + 2; v[5] = t - 2;
+    } else {
+      v[0] = t; v[1] = t - 2; v[2] = t + 2; v[3] = last ? t + 5 : t + 6; v[4] = t + 4; v[5] = t + 3;
     }
   }
-  arguments[0] = emitted;
-  arguments[1] = control.instances;
-  arguments[3] = uint(control.base_vertex);
-  arguments[4] = control.start_instance;
-  const ulong groups = emitted ? (emitted - 1) / control.per_group + 1 : 0;
-  if (emitted && control.instances && groups * control.instances <= control.max_threadgroups) {
-    arguments[8] = uint(groups);
-    arguments[9] = control.instances;
-    arguments[10] = 1;
-  }
-  // The list variant counts vpp vertices per primitive; IAVertices counts each strip vertex once (FS 20.4).
-  if (control.statistics_enabled)
-    statistics[0] -= (ulong(emitted) - strip_vertices) * control.instances;
+  const uint emitted = (prefix.primitives - 1) * vpp;
+  for (uint j = 0; j < vpp; j++) list[emitted + j] = d3dalloy_mesh_read_index(indices, control.index_size, s + v[j]);
 }
-/* TS+GS (VS+HS+DS+GS) between the DS capture pass and the GS pass. d3dalloy_tess_capture_clear zeroes the per-slot
- * primitive counts before the capture; d3dalloy_tess_capture_compact (one 1024-thread group) prefix-sums them in slot
- * order (instance, patch, workload rank: the D3D primitive order), writes the flat list (entry = slot * P + p) after
- * the total at list[0] and the GS object grid (ceil(total / per_group), 1, 1). See SM50_TESS_CAPTURE_LAYOUT. */
+/* TS+GS: scan clamped slot counts in parallel, then scatter in (instance, patch, workload rank) order. The flat
+ * list stores slot * P + p after its four-word header; list[0] and the GS object grid use the same total. */
 struct D3DalloyTessCompactControl {
   uint slot_count;
   uint max_primitives;  // P
@@ -977,34 +1097,50 @@ kernel void d3dalloy_tess_capture_clear(constant D3DalloyTessCompactControl &con
   if (index < control.slot_count)
     counts[index] = 0;
 }
-kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &control [[buffer(0)]],
-                                      device const uint *counts [[buffer(1)]],
-                                      device uint *list [[buffer(2)]],
-                                      device uint *dispatch [[buffer(3)]],
-                                      uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup uint partial[1024];
-  uint base = 0;
-  for (uint chunk = 0; chunk < control.slot_count; chunk += 1024) {
-    const uint slot = chunk + tid;
-    const uint n = slot < control.slot_count ? min(counts[slot], control.max_primitives) : 0;
-    partial[tid] = n;
+inline uint d3dalloy_tess_local_scan(threadgroup uint *partial, uint value, uint tid, uint width) {
+  partial[tid] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint offset = 1; offset < width; offset <<= 1) {
+    const uint before = tid >= offset ? partial[tid - offset] : 0;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = 1; offset < 1024; offset <<= 1) {
-      const uint value = tid >= offset ? partial[tid - offset] : 0;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      partial[tid] += value;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const uint start = base + partial[tid] - n;
-    for (uint p = 0; p < n; p++)
-      list[4 + start + p] = slot * control.max_primitives + p;
-    base += partial[1023];
+    partial[tid] += before;
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  if (tid == 0) {
-    list[0] = base;
+  return partial[tid];
+}
+kernel void d3dalloy_tess_capture_reduce(constant D3DalloyTessCompactControl &control [[buffer(0)]],
+                                       device const uint *counts [[buffer(1)]],
+                                       device D3DalloyPrimitiveSummary *summaries [[buffer(4)]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint3 group [[threadgroup_position_in_grid]]) {
+  const uint slot = group.x * 256 + tid;
+  const uint n = slot < control.slot_count ? min(counts[slot], control.max_primitives) : 0;
+  threadgroup uint partial[256];
+  const uint prefix = d3dalloy_tess_local_scan(partial, n, tid, 256);
+  if (tid == 255) summaries[group.x] = {0, 0, prefix, 0, 0};
+}
+kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &control [[buffer(0)]],
+                                        device const uint *counts [[buffer(1)]],
+                                        device uint *list [[buffer(2)]],
+                                        device uint *dispatch [[buffer(3)]],
+                                        device const D3DalloyPrimitiveSummary *summaries [[buffer(4)]],
+                                        uint tid [[thread_index_in_threadgroup]],
+                                        uint3 group [[threadgroup_position_in_grid]],
+                                        uint3 threads [[threads_per_threadgroup]]) {
+  // Up to 1024 slots fit in one group; larger captures use 256-slot blocks and the hierarchy.
+  const uint slot = group.x * threads.x + tid;
+  const uint n = slot < control.slot_count ? min(counts[slot], control.max_primitives) : 0;
+  threadgroup uint partial[1024], before;
+  if (tid == 0) before = threads.x == 1024 ? 0
+      : d3dalloy_primitive_block_prefix(summaries, control.slot_count, group.x, 0).primitives;
+  const uint local = threads.x == 1024 ? d3dalloy_tess_local_scan(partial, n, tid, 1024)
+                                     : d3dalloy_tess_local_scan(partial, n, tid, 256);
+  const uint end = before + local;
+  for (uint p = 0; p < n; p++) list[4ul + end - n + p] = slot * control.max_primitives + p;
+  if (slot + 1 == control.slot_count || (!control.slot_count && slot == 0)) {
+    list[0] = end;
     list[1] = list[2] = list[3] = 0;
-    dispatch[0] = (base + control.per_group - 1) / control.per_group;
+    dispatch[0] = end ? (end - 1) / control.per_group + 1 : 0;
     dispatch[1] = 1;
     dispatch[2] = 1;
   }
@@ -1020,7 +1156,8 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
         "d3dalloy_snapshot_predicate", "d3dalloy_predicate_arguments",
         "d3dalloy_predicate_copy_bytes", "d3dalloy_predicate_copy_rows",
         "d3dalloy_mesh_indirect_arguments", "d3dalloy_mesh_strip_cut",
-        "d3dalloy_tess_capture_clear", "d3dalloy_tess_capture_compact"};
+        "d3dalloy_tess_capture_clear", "d3dalloy_tess_capture_compact",
+        "d3dalloy_mesh_strip_reduce", "d3dalloy_tess_capture_reduce", "d3dalloy_primitive_scan"};
     auto &pipelines = device_->owned_predication_pipelines;
     for (size_t i = 0; i < pipelines.size(); ++i) {
       if (pipelines[i]) continue;
@@ -1038,6 +1175,9 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
     mesh_strip_cut_pipeline_ = pipelines[5];
     tess_capture_clear_pipeline_ = pipelines[6];
     tess_capture_compact_pipeline_ = pipelines[7];
+    mesh_strip_reduce_pipeline_ = pipelines[8];
+    tess_capture_reduce_pipeline_ = pipelines[9];
+    primitive_scan_pipeline_ = pipelines[10];
     return true;
   }
 
@@ -1070,11 +1210,28 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
     binding.index = index;
   }
 
-  void DispatchPredicationKernel() {
+  void DispatchPredicationKernel(uint32_t groups = 1) {
     auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
     dispatch.type = WMTComputeCommandDispatch;
-    dispatch.size = {1, 1, 1};
+    dispatch.size = {groups, 1, 1};
     allocator_->InvalidateCurrentPass();
+  }
+
+  bool RecordPrimitiveScan(const PrimitiveScanPlan &plan, WMT::Buffer summaries, uint64_t offset) {
+    // PreDraw may have consumed the capture setup's earlier reservation before this scan is recorded.
+    if (!allocator_->ReserveGPUHeap(plan.level_count * sizeof(PrimitiveScanLevel), 16)) {
+      RecordError(E_OUTOFMEMORY);
+      return false;
+    }
+    for (uint32_t i = 0; i < plan.level_count; i++) {
+      auto [memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(PrimitiveScanLevel), 16);
+      new (memory) PrimitiveScanLevel(plan.levels[i]);
+      BeginPredicationComputePass(primitive_scan_pipeline_, kPrimitiveScanWidth);
+      BindGPUHeapPredicationBuffer(control_offset, 0);
+      BindPredicationBuffer(summaries, offset, 1);
+      DispatchPredicationKernel(PrimitiveScanThreadgroups(plan.levels[i].count));
+    }
+    return true;
   }
 
   /* ClearUnorderedAccessViewUint on a feedback UAV: zero every cell (values and rects are ignored). */
@@ -1486,6 +1643,8 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
       for (UINT parameter = 0; parameter < rootsig->ParameterSlots && parameter < 64; parameter++) {
         if (!(sig->RootParameterMask & (uint64_t(1) << parameter)))
           continue;
+        if (rootsig->ParameterTypes[parameter] == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+          continue;
         const UINT begin = rootsig->SlotQwordOffsets[parameter];
         // The last parameter ends at the parameter qwords: the heap/status/view-id qwords after it are not root
         // arguments and keep their values.
@@ -1493,6 +1652,16 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
                                                                  : rootsig->ParameterQwords;
         if (begin < end && end <= 64)
           memset(root_staging + begin, 0, sizeof(uint64_t) * (end - begin));
+      }
+      // A signature may update only part of a root constant array. Reset the
+      // targeted DWORDs, preserving constants inherited by later commands.
+      for (const auto &range : sig->root_constant_ranges) {
+        if (range.parameter >= rootsig->ParameterSlots ||
+            rootsig->ParameterTypes[range.parameter] != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS)
+          continue;
+        const uint64_t first = uint64_t(rootsig->SlotQwordOffsets[range.parameter]) * 2 + range.first;
+        if (first <= 128 && range.count <= 128 - first)
+          memset(reinterpret_cast<uint32_t *>(root_staging) + first, 0, uint64_t(range.count) * sizeof(uint32_t));
       }
       dirty_state_.set(compute ? DirtyState::ComputeRootArguments : DirtyState::GraphicsRootArguments);
     }
@@ -1504,6 +1673,7 @@ kernel void d3dalloy_tess_capture_compact(constant D3DalloyTessCompactControl &c
     }
     if (!compute && sig->UpdateIndexBuffer) {
       index_buffer_address = 0;
+      index_buffer_size = 0;
       index_buffer = {};
       index_type = {};
       index_offset = 0;
@@ -1598,6 +1768,7 @@ public:
     so_bound_.reset();
 
     index_buffer_address = 0;
+    index_buffer_size = 0;
     index_buffer = {};
     index_type = {};
     index_offset = 0;
@@ -2096,6 +2267,7 @@ public:
     uint64_t captured_encoder = 0, captured_generation = 0;
     ID3D12DescriptorHeap *captured_heap = nullptr;
     std::array<uint64_t, 64> captured_arguments{};
+    RecordedDispatchAccess captured_dispatch;
   };
   // Per kind (graphics, compute): a few recently bound pipelines, replaced round-robin.
   std::array<std::array<SubmissionCapturePlan, 4>, 2> submission_capture_plans_;
@@ -2106,7 +2278,7 @@ public:
   bool CaptureSubmissionAccess(std::vector<RecordedBufferAccess> &buffers,
       std::unique_ptr<std::vector<StandardSwizzleTableUse>> &tables, MTLD3D12RootSignature *signature,
       const uint64_t *arguments, const MTLD3D12PipelineState &pipeline, uint64_t allowed_stages, bool &budget_exceeded,
-      bool &root_srv_opaque, bool current_encoder = false) {
+      bool &root_srv_opaque, bool current_encoder = false, RecordedDispatchAccess *dispatch = nullptr) {
     if (!signature || (signature->Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                                            D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))) return false;
     if (pipeline.resource_bindings.size() > kRecordedSubmissionBufferBudget) { budget_exceeded = true; return false; }
@@ -2195,8 +2367,11 @@ public:
         return true;
       };
       if (encoder && plan.captured_encoder == encoder && plan.captured_generation == generation &&
-          plan.captured_heap == descriptor_heaps_[0] && same_arguments())
+          plan.captured_heap == descriptor_heaps_[0] && same_arguments() &&
+          (!dispatch || plan.captured_dispatch.complete)) {
+        if (dispatch) *dispatch = plan.captured_dispatch;
         return true;
+      }
 
       bool complete = true;
       using Step = SubmissionCapturePlan::Step;
@@ -2211,9 +2386,11 @@ public:
           const auto address = allocation->gpuAddress(); // unknown root-view length covers this whole backing
           const bool writes = entry.writes;
           const uint64_t stages = entry.stages;
-          if (std::none_of(buffers.begin(), buffers.end(), [&](const auto &use) {
+          const auto existing = std::find_if(buffers.begin(), buffers.end(), [&](const auto &use) {
             return use.address == address && use.length == UINT64_MAX && use.writes == writes && use.stages == stages;
-          }) && std::none_of(pending_buffers.begin(), pending_buffers.end(), [&](const auto &use) {
+          });
+          const size_t index = existing - buffers.begin();
+          if (existing == buffers.end() && std::none_of(pending_buffers.begin(), pending_buffers.end(), [&](const auto &use) {
             return use.address == address && use.length == UINT64_MAX && use.writes == writes && use.stages == stages;
           })) {
             if (buffers.size() + pending_buffers.size() >= kRecordedSubmissionBufferBudget) {
@@ -2222,22 +2399,32 @@ public:
             if constexpr (CheckOnly) pending_buffers.push_back({address, UINT64_MAX, writes, stages});
             else buffers.push_back({address, UINT64_MAX, writes, stages});
           }
+          if constexpr (!CheckOnly) if (dispatch &&
+              std::find(dispatch->buffers.begin(), dispatch->buffers.end(), uint8_t(index)) == dispatch->buffers.end())
+            dispatch->buffers.push_back(uint8_t(index));
           break;
         }
-        case Step::Table:
+        case Step::Table: {
+          uint8_t index = 0;
           if (!CaptureSubmissionTable<CheckOnly>(tables, pending_tables, signature, arguments, pipeline,
-                                                 entry.parameter, budget_exceeded))
+                                                 entry.parameter, budget_exceeded, dispatch ? &index : nullptr))
             return false;
+          if constexpr (!CheckOnly) if (dispatch &&
+              std::find(dispatch->tables.begin(), dispatch->tables.end(), index) == dispatch->tables.end())
+            dispatch->tables.push_back(index);
           break;
+        }
         }
       }
       if constexpr (!CheckOnly) {
+        if (dispatch) dispatch->complete = true;
         if (encoder) {
           plan.captured_encoder = encoder;
           plan.captured_generation = generation;
           plan.captured_heap = descriptor_heaps_[0];
           for (size_t i = 0; i < plan.argument_offsets.size(); ++i)
             plan.captured_arguments[i] = arguments[plan.argument_offsets[i]];
+          plan.captured_dispatch = dispatch ? *dispatch : RecordedDispatchAccess{};
         }
       }
     } catch (const std::bad_alloc &) { RecordError(E_OUTOFMEMORY); return false; }
@@ -2247,20 +2434,27 @@ public:
   template <bool CheckOnly>
   bool CaptureSubmissionTable(std::unique_ptr<std::vector<StandardSwizzleTableUse>> &tables, size_t &pending_tables,
       MTLD3D12RootSignature *signature, const uint64_t *arguments, const MTLD3D12PipelineState &pipeline,
-      uint32_t parameter, bool &budget_exceeded) {
+      uint32_t parameter, bool &budget_exceeded, uint8_t *captured_index = nullptr) {
     if (!descriptor_heaps_[0] || !arguments[signature->SlotQwordOffsets[parameter]]) return false;
-    if (tables && std::any_of(tables->begin(), tables->end(), [&](const auto &use) {
+    if (tables) {
+      const auto found = std::find_if(tables->begin(), tables->end(), [&](const auto &use) {
       return use.rootsig == signature && use.heap == descriptor_heaps_[0] && use.parameter == parameter &&
           use.base == arguments[signature->SlotQwordOffsets[parameter]] &&
           use.submission_bindings.size() == pipeline.resource_bindings.size() &&
           !std::memcmp(use.submission_bindings.data(), pipeline.resource_bindings.data(),
               pipeline.resource_bindings.size() * sizeof(MTL_SM50_SHADER_ARGUMENT));
-    })) return true;
+      });
+      if (found != tables->end()) {
+        if (captured_index) *captured_index = uint8_t(found - tables->begin());
+        return true;
+      }
+    }
     if ((tables ? tables->size() : 0) + pending_tables >= kRecordedSubmissionBufferBudget) {
       budget_exceeded = true; return false;
     }
     if constexpr (CheckOnly) { ++pending_tables; return true; }
     if (!tables) tables = std::make_unique<std::vector<StandardSwizzleTableUse>>();
+    if (captured_index) *captured_index = uint8_t(tables->size());
     StandardSwizzleTableUse use{signature, static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]),
         arguments[signature->SlotQwordOffsets[parameter]], parameter};
     use.submission_bindings = pipeline.resource_bindings;
@@ -3265,16 +3459,14 @@ public:
     return DrawCallStatus::Ordinary;
   }
 
-  bool EnsureStreamOutputPipelines(bool indirect = false) {
-    if (so_assemble_pipeline_ && so_positions_pipeline_ && (!indirect || so_indirect_preflight_pipeline_))
+  bool EnsureStreamOutputPipelines() {
+    if (so_assemble_pipeline_ && so_positions_pipeline_)
       return true;
     if (!so_assemble_pipeline_)
       so_assemble_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputAssemble, "so_assemble");
     if (!so_positions_pipeline_)
       so_positions_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputPositions, "so_index_positions");
-    if (indirect && !so_indirect_preflight_pipeline_)
-      so_indirect_preflight_pipeline_ = SharedCommandHelper(CommandHelper::StreamOutputIndirect, "so_indirect_preflight");
-    return so_assemble_pipeline_ && so_positions_pipeline_ && (!indirect || so_indirect_preflight_pipeline_);
+    return so_assemble_pipeline_ && so_positions_pipeline_;
   }
 
   /*
@@ -3318,9 +3510,7 @@ public:
       RecordError();
       return false;
     }
-    // Indirect preflight still uses the SO count/materialization compute PSO,
-    // even when the draw does not need stream-output scratch or assembly.
-    if (!EnsureStreamOutputPipelines(Indirect)) {
+    if (!EnsureStreamOutputPipelines()) {
       RecordError(E_FAIL);
       return false;
     }
@@ -3398,6 +3588,7 @@ public:
       params->depth_clip_enabled = pso_graphics_->depth_clip_mode == WMTDepthClipModeClip;
       draw->statistics_heap = statistics_buffer;
       draw->statistics_offset = statistics_offset;
+      draw->statistics_address = allocator_->GPUHeapAddress(pipeline_statistics_counters_offset_);
     }
     params->element_count = uint32_t(layout.elements.size());
     params->referenced_mask = layout.streams[0].referenced_slot_mask;
@@ -3420,11 +3611,35 @@ public:
       params->elements[i] = {element.slot, element.byte_offset, element.dword_offset, element.component_count};
     }
     draw->assemble_pipeline = so_assemble_pipeline_;
+    // The list kernel scatters complete primitives in parallel. Different targets
+    // must not overlap, and each declaration must fit in one vertex's stride.
+    const uint32_t vertices_per_primitive = topology == 0 ? 1 : topology == 1 ? 2 : topology == 3 ? 3 : 0;
+    if (!Indirect && !statistics && vertices_per_primitive && params->referenced_mask &&
+        params->bound_mask == params->referenced_mask &&
+        uint64_t(VertexCount / vertices_per_primitive) * InstanceCount >= 32) {
+      bool independent = true;
+      for (const auto &element : layout.elements) {
+        const uint32_t stride = params->stride[element.slot];
+        independent &= stride && uint64_t(element.byte_offset) + uint64_t(element.component_count) * 4 <= stride;
+      }
+      for (unsigned s = 0; independent && s < 4; ++s) {
+        const auto &target = draw->targets[s];
+        if (!target) continue;
+        independent = params->stride[s] && !target->canonicalHeap && !target->reservedResource &&
+            !target->flags().test(BufferAllocationFlag::PlacementSparse) &&
+            !target->flags().test(BufferAllocationFlag::CpuPlaced);
+        for (unsigned t = 0; t < s; ++t)
+          if (draw->targets[t] && draw->targets[t]->buffer() == target->buffer()) independent = false;
+      }
+      draw->parallel_list_assembly = independent;
+    }
     draw->positions_pipeline = so_positions_pipeline_;
     allocator_->BindGPUHeap(draw->heap, draw->params_offset, params_offset);
     draw->params_cpu = params;
     draw->counters_heap = counters;
     draw->counters_offset = counters_offset;
+    draw->counters_address = msaa_only_indirect ? 0 : allocator_->GPUHeapAddress(
+        layout.active || !statistics ? so_counters_offset_ : pipeline_statistics_counters_offset_);
     draw->predicate_heap = counters;
     draw->predicate_offset = counters_offset;
     if (predication_enabled_)
@@ -3572,6 +3787,8 @@ public:
       draw->predicate_heap = counters;
       draw->control_offset = allocator_->ResolveGPUHeap(control_offset).offset;
       draw->counters_offset = counters_offset + uint64_t(s) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
+      draw->counters_address = allocator_->GPUHeapAddress(
+          so_counters_offset_ + uint64_t(s) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS));
       draw->predicate_offset = counters_offset;
       if (predication_enabled_)
         allocator_->BindGPUHeap(draw->predicate_heap, draw->predicate_offset, predication_snapshot_offset_);
@@ -3653,11 +3870,12 @@ public:
   bool RecordMSAADraw(UINT vertices, UINT instances, UINT start_vertex, INT base_vertex,
                       UINT start_instance, bool indexed, bool indirect = false,
                       const MeshPipelineVariant *mesh_capture = nullptr,
-                      const SM50_MSAA_MESH_CONTROL *mesh_control = nullptr) {
+                      const SM50_MSAA_MESH_CONTROL *mesh_control = nullptr,
+                      bool frontier = false) {
     auto *render = static_cast<RenderEncoderData *>(allocator_->encoder_current);
     const uint32_t shading_rate = CoarseShadingRateState();
     const auto *variants = pso_graphics_->GetMSAAPipelineVariants(!active_pipeline_statistics_.empty(),
-                                                                  shading_rate != 0);
+                                                                  shading_rate != 0, frontier);
     if (!variants) {
       RecordError(E_FAIL);
       return false;
@@ -3710,6 +3928,16 @@ public:
       return false;
     }
     auto draw = std::make_unique<MSAADrawData>();
+    draw->gpu_tile_tasks = variants->gpu_tile_tasks;
+    if (draw->gpu_tile_tasks) {
+      draw->task_prepare_pipeline = SharedCommandHelper(CommandHelper::MSAATilePrepare, "msaa_tile_task_prepare");
+      draw->task_clear_pipeline = SharedCommandHelper(CommandHelper::MSAATileClear, "msaa_tile_task_clear");
+      draw->task_extent_pipeline = SharedCommandHelper(CommandHelper::MSAATileExtent, "msaa_tile_task_extent");
+      if (!draw->task_prepare_pipeline || !draw->task_clear_pipeline || !draw->task_extent_pipeline) {
+        RecordError(E_FAIL);
+        return false;
+      }
+    }
     if (mesh_capture) {
       draw->mesh_capture = true;
       draw->mesh_layout = mesh_capture->capture_layout;
@@ -3829,7 +4057,8 @@ public:
       bounds.scissors[i][3] = std::clamp<LONG>(rect.bottom, 0, 16384);
     }
     render->msaa_draw = std::move(draw);
-    allocator_->InvalidateCurrentPass();
+    if (!frontier)
+      allocator_->InvalidateCurrentPass();
     return true;
   }
 
@@ -3950,8 +4179,9 @@ public:
    * pixels a draw can rasterize: the bound targets clipped to the scissor rectangles (D3D12 always scissors). It
    * is zeroed by its own blit pass, so this runs before PreDraw opens the draw's render pass.
    */
-  bool PrepareStatisticsClaim(uint32_t slots) {
+  bool PrepareStatisticsClaim(uint32_t slots, SM50_STATISTICS_CLAIM_HEADER *frontier = nullptr) {
     statistics_claim_ = {};
+    if (frontier) *frontier = {};
     if (!pso_graphics_->mesh_statistics_claim || active_pipeline_statistics_.empty() || !slots)
       return true;
     uint32_t width = 0, height = 0, layers = 1;
@@ -3972,6 +4202,17 @@ public:
     if (dsv.ptr)
       clip(dsv);
     const uint32_t samples = pso_graphics_->EffectiveRasterSampleCount();
+    if (frontier) {
+      // The execution owns its claim entries and advances its epoch on the GPU.
+      // Only target dimensions are recorded; no draw/count data is inspected.
+      frontier->width = width;
+      frontier->height = height;
+      frontier->layers = layers;
+      frontier->samples = samples;
+      frontier->epoch = 1;
+      frontier->entries = sizeof(SM50_STATISTICS_CLAIM_HEADER) / 4;
+      return true;
+    }
     const uint64_t header_bytes = uint64_t(slots) * sizeof(SM50_STATISTICS_CLAIM_HEADER);
     const uint64_t entry_bytes = std::max<uint64_t>(uint64_t(width) * height * layers * samples * 16, 16);
     if (header_bytes + entry_bytes > max_buffer_length_ ||
@@ -4059,14 +4300,10 @@ public:
       return;
     }
     max_vertices = uint32_t(list_values);
-    struct Control {
-      uint64_t max_threadgroups;
-      uint32_t topology, index_size, cut_value, count, instances;
-      int32_t base_vertex;
-      uint32_t start_instance, index_skip, predicate_enabled, predicate_not_equal, statistics_enabled, per_group;
-      uint32_t cut_enabled;
-    };
-    if (!allocator_->ReserveGPUHeap(sizeof(Control) + 64 + 16, 16)) {
+    using Control = MeshStripCutControl;
+    const auto scan_plan = MakePrimitiveScanPlan(count, uint32_t(topology_));
+    if (!allocator_->ReserveGPUHeap(sizeof(Control) + 64 + 16 +
+                                    scan_plan.level_count * sizeof(PrimitiveScanLevel), 16)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -4093,6 +4330,14 @@ public:
     control->statistics_enabled = statistics;
     control->per_group = increment;
     const auto control_binding = allocator_->ResolveGPUHeap(control_offset);
+    WMT::Buffer summaries = control_binding.buffer;
+    uint64_t summaries_offset = control_binding.offset;
+    if (scan_plan.scratch_bytes)
+      std::tie(summaries, summaries_offset) = allocator_->AllocateTempBuffer(scan_plan.scratch_bytes, 16);
+    if (!list || !summaries) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
     WMT::Buffer statistics_buffer = control_binding.buffer;
     uint64_t statistics_offset = control_binding.offset;
     if (statistics) {
@@ -4102,14 +4347,23 @@ public:
       statistics_buffer = buffer;
       statistics_offset = offset;
     }
-    BeginPredicationComputePass(mesh_strip_cut_pipeline_, 1);
-    BindGPUHeapPredicationBuffer(control_offset, 0);
-    BindPredicationBuffer(indexed ? index_buffer : control_binding.buffer, indexed ? first & ~uint64_t(3) : 0, 1);
-    BindPredicationBuffer(list, list_offset, 2);
-    BindGPUHeapPredicationBuffer(arguments_offset, 3);
-    BindPredicationBuffer(statistics_buffer, statistics_offset, 4);
-    BindGPUHeapPredicationBuffer(predication_enabled_ ? predication_snapshot_offset_ : control_offset, 5);
-    DispatchPredicationKernel();
+    auto strip_pass = [&](WMT::ComputePipelineState pipeline) {
+      BeginPredicationComputePass(pipeline, kPrimitiveScanWidth);
+      BindGPUHeapPredicationBuffer(control_offset, 0);
+      BindPredicationBuffer(indexed ? index_buffer : control_binding.buffer, indexed ? first & ~uint64_t(3) : 0, 1);
+      BindPredicationBuffer(list, list_offset, 2);
+      BindGPUHeapPredicationBuffer(arguments_offset, 3);
+      BindPredicationBuffer(statistics_buffer, statistics_offset, 4);
+      BindGPUHeapPredicationBuffer(predication_enabled_ ? predication_snapshot_offset_ : control_offset, 5);
+      BindPredicationBuffer(summaries, summaries_offset, 6);
+      DispatchPredicationKernel(PrimitiveScanThreadgroups(count));
+    };
+    if (scan_plan.level_count) {
+      strip_pass(mesh_strip_reduce_pipeline_);
+      if (!RecordPrimitiveScan(scan_plan, summaries, summaries_offset))
+        return;
+    }
+    strip_pass(mesh_strip_cut_pipeline_);
 
     const bool stream_output = pso_graphics_->stream_output.active;
     // Upper bound of the expansion's primitive ids: every strip vertex completes at most one primitive.
@@ -4152,7 +4406,7 @@ public:
                                       const void *argument_data, size_t argument_size) {
     const auto &layout = pso_graphics_->tess_capture_layout;
     const uint32_t patches = count / control_points;
-    if (!patches)
+    if (!patches || !instances)
       return;
     if (!EnsurePredicationPipelines()) {
       RecordError(E_FAIL);
@@ -4172,10 +4426,9 @@ public:
     // D3D10_SB_PRIMITIVE point 1, line 2, triangle 3: GS input primitives per object threadgroup.
     const uint32_t per_group = pso_graphics_->mesh_input_primitive == 1 ? 32
                                : pso_graphics_->mesh_input_primitive == 2 ? 16 : 10;
-    struct CompactControl {
-      uint32_t slot_count, max_primitives, per_group, reserved;
-    };
-    const size_t heap_bytes = sizeof(SM50_TESS_CAPTURE_CONTROL) + sizeof(CompactControl) + 16 + argument_size + 64;
+    const auto scan_plan = MakePrimitiveScanPlan(uint32_t(slots), 0);
+    const size_t heap_bytes = sizeof(SM50_TESS_CAPTURE_CONTROL) + sizeof(TessCompactControl) + 16 + argument_size + 64 +
+                              scan_plan.level_count * sizeof(PrimitiveScanLevel);
     if (!allocator_->ReserveGPUHeap(heap_bytes, 16)) {
       RecordError(E_OUTOFMEMORY);
       return;
@@ -4184,8 +4437,8 @@ public:
     auto *capture = new (capture_memory) SM50_TESS_CAPTURE_CONTROL{};
     capture->slot_count = uint32_t(slots);
     capture->patch_count = patches;
-    auto [compact_memory, compact_offset] = allocator_->AllocateGPUHeap(sizeof(CompactControl), 16);
-    new (compact_memory) CompactControl{uint32_t(slots), layout.max_primitives, per_group, 0};
+    auto [compact_memory, compact_offset] = allocator_->AllocateGPUHeap(sizeof(TessCompactControl), 16);
+    new (compact_memory) TessCompactControl{uint32_t(slots), layout.max_primitives, per_group, 0};
     auto [dispatch_memory, dispatch_offset] = allocator_->AllocateGPUHeap(16, 16);
     memset(dispatch_memory, 0, 16);
     if (argument_offset == UINT64_MAX) {
@@ -4195,6 +4448,14 @@ public:
     }
     auto [scratch, scratch_offset] = allocator_->AllocateTempBuffer(scratch_bytes, 16);
     auto [list, list_offset] = allocator_->AllocateTempBuffer(list_bytes, 16);
+    WMT::Buffer summaries = list;
+    uint64_t summaries_offset = list_offset;
+    if (scan_plan.scratch_bytes)
+      std::tie(summaries, summaries_offset) = allocator_->AllocateTempBuffer(scan_plan.scratch_bytes, 16);
+    if (!scratch || !list || !summaries) {
+      RecordError(E_OUTOFMEMORY);
+      return;
+    }
 
     // Zero the per-slot primitive counts: slots without a workload keep 0.
     BeginPredicationComputePass(tess_capture_clear_pipeline_, 64);
@@ -4245,12 +4506,22 @@ public:
     }
 
     // Compaction: flat primitive list in D3D order and the GS object grid.
-    BeginPredicationComputePass(tess_capture_compact_pipeline_, 1024);
-    BindGPUHeapPredicationBuffer(compact_offset, 0);
-    BindPredicationBuffer(scratch, scratch_offset, 1);
-    BindPredicationBuffer(list, list_offset, 2);
-    BindGPUHeapPredicationBuffer(dispatch_offset, 3);
-    DispatchPredicationKernel();
+    auto compact_pass = [&](WMT::ComputePipelineState pipeline) {
+      const uint32_t width = TessCompactThreadgroupWidth(uint32_t(slots));
+      BeginPredicationComputePass(pipeline, width);
+      BindGPUHeapPredicationBuffer(compact_offset, 0);
+      BindPredicationBuffer(scratch, scratch_offset, 1);
+      BindPredicationBuffer(list, list_offset, 2);
+      BindGPUHeapPredicationBuffer(dispatch_offset, 3);
+      BindPredicationBuffer(summaries, summaries_offset, 4);
+      DispatchPredicationKernel(PrimitiveScanThreadgroups(uint32_t(slots), width));
+    };
+    if (scan_plan.level_count) {
+      compact_pass(tess_capture_reduce_pipeline_);
+      if (!RecordPrimitiveScan(scan_plan, summaries, summaries_offset))
+        return;
+    }
+    compact_pass(tess_capture_compact_pipeline_);
 
     // Pass 2: capture-fetching object, GS mesh. Primitive ids of the flat list bound the stream-output keys.
     const bool stream_output = pso_graphics_->stream_output.active;
@@ -4663,7 +4934,7 @@ public:
   }
 
   bool
-  PreDispatch(bool SkipResourceBinding = false) {
+  PreDispatch(bool SkipResourceBinding = false, RecordedDispatchAccess *dispatch = nullptr) {
     const bool statistics = !active_pipeline_statistics_.empty();
     if (pso_compute_ && pso_compute_->uses_atomic64) allocator_->InvalidateCurrentPass();
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Compute) {
@@ -4686,11 +4957,17 @@ public:
       return false;
     }
     auto *submission_compute = static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+    // The Atomic phase needs the ordinary access summary, but is always an
+    // encoder boundary: it never participates in batched Dispatch replay.
+    if (pso_compute_->uses_atomic64) submission_compute->dispatch_access_complete = false;
     submission_compute->submission_access_complete &= !SkipResourceBinding && !statistics &&
-        !predication_enabled_ && !pso_compute_->uses_atomic64 &&
+        !predication_enabled_ &&
         CaptureSubmissionAccess(submission_compute->submission_buffers, submission_compute->submission_tables,
             rootsig_compute_.ptr(), rootarg_compute_staging_, *pso_compute_.ptr(), WMTMetal4StageDispatch,
-            submission_compute->submission_snapshot_budget, submission_compute->submission_root_srv_opaque, true);
+            submission_compute->submission_snapshot_budget, submission_compute->submission_root_srv_opaque, true,
+            submission_compute->dispatch_access_complete ? dispatch : nullptr);
+    submission_compute->dispatch_access_complete &= dispatch && dispatch->complete &&
+        submission_compute->submission_access_complete;
 
     if (dirty_state_.test(DirtyState::ComputePipelineState)) {
       auto &cmd_setpso = allocator_->EncodeComputeCommand<wmtcmd_compute_setpso>();
@@ -4703,7 +4980,9 @@ public:
       cmd_setpso.threadgroup_size = pso_compute_->threadgroup_size;
       static_cast<ComputeEncoderData *>(allocator_->encoder_current)->RetainPipeline(WMT::ComputePipelineState{cmd_setpso.pso});
       const auto &constants = statistics ? pso_compute_->pipeline_statistics_compute_constants : pso_compute_->compute_constants;
-      if (constants.buffer) {
+      if (pso_compute_->uses_atomic64) {
+        static_cast<ComputeEncoderData *>(allocator_->encoder_current)->atomic64_constants = &constants;
+      } else if (constants.buffer) {
         auto &binding = allocator_->EncodeComputeCommand<wmtcmd_compute_setbuffer>();
         binding.type = WMTComputeCommandSetBuffer;
         binding.buffer = constants.buffer;
@@ -4790,7 +5069,8 @@ public:
         return;
       }
     }
-    if (!PreDispatch())
+    RecordedDispatchAccess dispatch_access;
+    if (!PreDispatch(false, predication_enabled_ ? nullptr : &dispatch_access))
       return;
 
     if (predication_enabled_) {
@@ -4801,6 +5081,16 @@ public:
       auto &cmd_dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
       cmd_dispatch.type = WMTComputeCommandDispatch;
       cmd_dispatch.size = {X, Y, Z};
+      auto &compute = *static_cast<ComputeEncoderData *>(allocator_->encoder_current);
+      if (compute.dispatch_access_complete) {
+        if (compute.dispatch_accesses.size() == kRecordedDispatchBudget) {
+          compute.dispatch_access_complete = false;
+          compute.dispatch_accesses.clear();
+        } else {
+          dispatch_access.command = reinterpret_cast<const wmtcmd_base *>(&cmd_dispatch);
+          compute.dispatch_accesses.push_back(std::move(dispatch_access));
+        }
+      }
     }
     owned_graphics::Trace("dispatch", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"encoder\":", allocator_->encoder_current->id,
@@ -7944,10 +8234,12 @@ public:
     auto index_buffer_allocation = pView ? device_->LookupBufferByVA(pView->BufferLocation, &index_offset) : nullptr;
     if (index_buffer_allocation) {
       index_buffer_address = pView->BufferLocation;
+      index_buffer_size = pView->SizeInBytes;
       index_buffer = index_buffer_allocation->buffer();
       index_type = pView->Format == DXGI_FORMAT_R32_UINT ? WMTIndexTypeUInt32 : WMTIndexTypeUInt16;
     } else {
       index_buffer_address = 0;
+      index_buffer_size = 0;
       index_buffer = {};
       index_type = {};
       index_offset = {};
@@ -9103,6 +9395,51 @@ public:
     RecordError(E_OUTOFMEMORY);
   }
 
+  bool RetainCaptureFrontierInputs(MTLD3D12CommandSignature *sig, uint64_t arguments,
+                                  uint64_t count, bool indexed) {
+    if (sig->UpdateRootArguments && !rootsig_graphics_) {
+      RecordError(E_INVALIDARG);
+      return false;
+    }
+    bool dynamic_addresses = sig->UpdateVertexBuffers || sig->UpdateIndexBuffer;
+    if (sig->UpdateRootArguments)
+      for (uint64_t mask = sig->RootParameterMask; mask; mask &= mask - 1)
+        dynamic_addresses |= rootsig_graphics_->ParameterTypes[__builtin_ctzll(mask)] !=
+                             D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    allocator_->recording_head_->gpu_indirect_buffer_addresses |= dynamic_addresses;
+    LookupRecordedBufferByVA(arguments);
+    LookupRecordedBufferByVA(count);
+    if (indexed && !sig->UpdateIndexBuffer) LookupRecordedBufferByVA(index_buffer_address);
+    for (uint32_t slots = pso_graphics_->slot_mask & ~sig->VertexBufferMask; slots; slots &= slots - 1)
+      LookupRecordedBufferByVA(vertex_buffers_[__builtin_ctz(slots)].BufferLocation);
+    return true;
+  }
+
+  bool RecordCaptureFrontier(RenderEncoderData *producer, RenderEncoderData *consumer) {
+    assert(producer && consumer && !producer->visibility_intervals && !consumer->visibility_intervals);
+    auto prepare = SharedCommandHelper(CommandHelper::CaptureFrontierPrepare, "capture_frontier_prepare");
+    auto clear = SharedCommandHelper(CommandHelper::CaptureFrontierClear, "capture_frontier_clear");
+    auto consume = SharedCommandHelper(CommandHelper::CaptureFrontierConsume, "capture_frontier_consume");
+    auto advance = SharedCommandHelper(CommandHelper::CaptureFrontierAdvance, "capture_frontier_advance");
+    if (!prepare || !clear || !consume || !advance) {
+      RecordError(E_FAIL);
+      return false;
+    }
+    allocator_->EndSchedulingPass();
+    auto *frontier = allocator_->AllocatePass<CaptureFrontierEncoderData>();
+    frontier->type = EncoderType::CaptureFrontier;
+    frontier->producer = producer;
+    frontier->consumer = consumer;
+    frontier->prepare_pipeline = std::move(prepare);
+    frontier->clear_pipeline = std::move(clear);
+    frontier->consume_pipeline = std::move(consume);
+    frontier->advance_pipeline = std::move(advance);
+    owned_graphics::Trace("capture_frontier_record", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
+        ",\"encoder\":", frontier->id, ",\"producer\":", producer->id, ",\"consumer\":", consumer->id);
+    allocator_->InvalidateCurrentPass();
+    return true;
+  }
+
   void RecordStreamOutputIndirect(MTLD3D12CommandSignature *sig, UINT max_count, uint64_t arguments,
                                   uint64_t count_buffer, WMTPrimitiveType primitive_type) {
     const bool indexed = sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
@@ -9112,18 +9449,25 @@ public:
       RecordError();
       return;
     }
+    if (!RetainCaptureFrontierInputs(sig, arguments, count_buffer, indexed))
+      return;
+    IndirectGraphicsBindings bindings;
+    if (!StageSlotGraphicsBindings(sig, max_count, arguments, count_buffer, bindings))
+      return;
+    uint64_t index_views = UINT64_MAX;
+    if (!StageIndirectIndexBufferViews(sig, max_count, arguments, count_buffer, index_views))
+      return;
 
-    // This pass owns one SO ExecuteIndirect. Its GPU sizing pass must see every
-    // prior producer, and its assembly must finish before a later draw/query.
+    // The detached template owns the original state. A logical frontier
+    // executes bounded producer/consumer quanta in API order on the GPU.
     allocator_->InvalidateCurrentPass();
     if (!PrepareStreamOutputDraw(0, 0, indexed, 0, 0, true))
       return;
     const bool statistics = !active_pipeline_statistics_.empty();
-    WMT::RenderPipelineState draw_pipeline{};
+    const CaptureFrontierPipelines *native = nullptr;
     if (!msaa) {
-      draw_pipeline = statistics ? pso_graphics_->GetPipelineStatisticsPipelineState(true)
-                                 : pso_graphics_->GetIndirectCommandBufferPipelineState();
-      if (!draw_pipeline) {
+      native = pso_graphics_->GetCaptureFrontierPipelines(statistics);
+      if (!native) {
         RecordError(E_FAIL);
         return;
       }
@@ -9143,18 +9487,52 @@ public:
       RecordError(E_OUTOFMEMORY);
       return;
     }
-    if (PreDraw(true) == DrawCallStatus::Invalid)
+    if (index_views != UINT64_MAX) {
+      const auto views = allocator_->ResolveGPUHeap(index_views);
+      indirect->index_view_heap = views.buffer;
+      indirect->index_view_offset = views.offset;
+      indirect->index_view_stride = 64;
+      indirect->index_view_address = allocator_->GPUHeapAddress(index_views);
+    }
+    if (bindings.root_stride) {
+      const auto roots = allocator_->ResolveGPUHeap(bindings.roots);
+      indirect->root_heap = roots.buffer;
+      indirect->root_offset = roots.offset;
+      indirect->root_stride = bindings.root_stride;
+      indirect->root_address = allocator_->GPUHeapAddress(bindings.roots);
+    }
+    if (bindings.vertex_stride) {
+      const auto vertices = allocator_->ResolveGPUHeap(bindings.vertices);
+      indirect->vertex_heap = vertices.buffer;
+      indirect->vertex_offset = vertices.offset;
+      indirect->vertex_stride = bindings.vertex_stride;
+      indirect->vertex_address = allocator_->GPUHeapAddress(bindings.vertices);
+    }
+    indirect->index_view_size = index_buffer_size;
+    if (PreDraw(false) == DrawCallStatus::Invalid)
       return;
     indirect->draw_template = std::move(so_pending_);
     indirect->assembly_template = indirect->draw_template->params_cpu;
-    indirect->preflight_pipeline = so_indirect_preflight_pipeline_;
     indirect->resolver_pipeline = sig->render_resolver;
     indirect->argument_resolver = sig->graphics_argument_resolver;
     indirect->msaa = msaa;
-    indirect->shader_view_locations = !msaa && pso_graphics_->view_location_offsets;
-    if (indirect->shader_view_locations)
-      StageIndirectViewBounds();
-    indirect->draw_pipeline = std::move(draw_pipeline);
+    // Native replay retains PreDraw's view amplification mapping.
+    indirect->shader_view_locations = false;
+    if (native) {
+      indirect->frontier_capture_pipeline = native->capture;
+      indirect->frontier_replay_pipeline = native->replay;
+      indirect->frontier_vertex_layout = native->vertex_layout;
+      indirect->frontier_capture_constants = native->capture_constants.buffer;
+      indirect->frontier_capture_constants_offset = native->capture_constants.offset;
+      indirect->frontier_replay_vertex_constants = native->replay_vertex_constants.buffer;
+      indirect->frontier_replay_vertex_constants_offset = native->replay_vertex_constants.offset;
+      indirect->frontier_replay_fragment_constants = native->replay_fragment_constants.buffer;
+      indirect->frontier_replay_fragment_constants_offset = native->replay_fragment_constants.offset;
+      auto &retained = static_cast<RenderEncoderData *>(allocator_->encoder_current)->immutable_constant_buffers;
+      for (const auto *constants : {&native->capture_constants, &native->replay_vertex_constants,
+                                    &native->replay_fragment_constants})
+        if (constants->buffer) retained.push_back(constants->buffer);
+    }
     indirect->strip_cut = ib_strip_cut_value_;
     auto &command = indirect->command;
     command.max_count = max_count;
@@ -9193,14 +9571,16 @@ public:
     preflight.predicate_op = command.predicate_op;
     preflight.indexed = indexed;
     preflight.index_format = command.index_buffer_format;
-    // Keep one immutable root/VB template in the recording. Each execution
-    // clones it per active command before the GPU resolver applies updates.
+    // Keep one immutable root/VB template for unchanged fields. Updated slots
+    // are resolved by the earlier GPU pass and copied into execution-owned tables.
     if (rootsig_graphics_) {
       if (root_bytes) {
         const auto offset = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
         if (offset == UINT64_MAX)
           return;
         indirect->root_arguments = allocator_->ResolveGPUHeap(offset).memory;
+        if (!indirect->root_stride)
+          indirect->root_address = allocator_->GPUHeapAddress(offset);
         command.rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
       }
       if (sampler_bytes) {
@@ -9216,22 +9596,130 @@ public:
       return;
     if (vb_stride) {
       indirect->vertex_buffers = allocator_->ResolveGPUHeap(vb_offset).memory;
+      if (!indirect->vertex_stride)
+        indirect->vertex_address = allocator_->GPUHeapAddress(vb_offset);
       command.vertex_argbuf_stride = vb_stride;
     }
     static_cast<RenderEncoderData *>(allocator_->encoder_current)->so_indirect = std::move(indirect);
-    // Actual draw dimensions and IB bindings are supplied by the execution-owned
-    // GPU preflight, never by stale CPU copies of the argument buffer.
-    if (msaa && !RecordMSAADraw(0, 0, 0, 0, 0, indexed, true))
+    if (msaa && !RecordMSAADraw(0, 0, 0, 0, 0, indexed, true, nullptr, nullptr, true))
+      return;
+    auto *render = allocator_->DetachCurrentRenderTemplate();
+    if (!RecordCaptureFrontier(render, render))
       return;
     ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
+  }
+
+  struct IndirectGraphicsBindings {
+    uint64_t roots = UINT64_MAX, vertices = UINT64_MAX;
+    uint64_t root_stride = 0, vertex_stride = 0;
+  };
+
+  // Retain a GPU-produced view for each slot, shared by object shaders, vertex
+  // SO index pulling and strip/SO assembly. Count/predicate checks precede IBV reads.
+  bool StageIndirectIndexBufferViews(MTLD3D12CommandSignature *sig, UINT max_count, uint64_t arguments,
+                                     uint64_t count, uint64_t &views_offset) {
+    if (!sig->UpdateIndexBuffer)
+      return true;
+    if (!EnsurePredicationPipelines()) {
+      RecordError(E_FAIL);
+      return false;
+    }
+    const uint64_t argument_bytes = uint64_t(max_count) * 64, dispatch_bytes = uint64_t(max_count) * 16;
+    if (!allocator_->ReserveGPUHeap(sizeof(MeshIndirectControl) + argument_bytes + dispatch_bytes + 64, 32)) {
+      RecordError(E_OUTOFMEMORY);
+      return false;
+    }
+    auto [memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(MeshIndirectControl), 16);
+    const auto arguments_offset = std::get<1>(allocator_->AllocateGPUHeap(argument_bytes, 32));
+    const auto dispatch_offset = std::get<1>(allocator_->AllocateGPUHeap(dispatch_bytes, 16));
+    auto *control = new (memory) MeshIndirectControl{};
+    control->arguments = arguments + sig->DrawArgumentOffset;
+    control->count = count;
+    control->max_threadgroups = UINT64_MAX;
+    control->stride = sig->ByteStride;
+    control->max_commands = max_count;
+    control->argument_words = 5;
+    control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+    control->per_group = 1;
+    control->index_arguments = arguments;
+    control->argument_stride_words = 16;
+    control->index_argument_offset = sig->IndexBufferArgumentOffset;
+    BeginPredicationComputePass(mesh_indirect_pipeline_, 64);
+    control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
+    BindGPUHeapPredicationBuffer(control_offset, 0);
+    BindGPUHeapPredicationBuffer(arguments_offset, 1);
+    BindGPUHeapPredicationBuffer(dispatch_offset, 2);
+    auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+    dispatch.type = WMTComputeCommandDispatch;
+    dispatch.size = {(uint64_t(max_count) + 63) / 64, 1, 1};
     allocator_->InvalidateCurrentPass();
+    views_offset = arguments_offset + 32;
+    allocator_->recording_head_->gpu_indirect_buffer_addresses = true;
+    LookupRecordedBufferByVA(arguments);
+    LookupRecordedBufferByVA(count);
+    return true;
+  }
+
+  // Immutable slot templates belong to the recording; the GPU applies this
+  // execution's signature fields only after the count/predicate checks.
+  bool StageSlotGraphicsBindings(MTLD3D12CommandSignature *sig, UINT max_count, uint64_t arguments,
+                                 uint64_t count, IndirectGraphicsBindings &bindings) {
+    if (!sig->UpdateRootArguments && !sig->UpdateVertexBuffers)
+      return true;
+    if (!sig->graphics_argument_resolver || (sig->UpdateRootArguments && !rootsig_graphics_)) {
+      RecordError(E_INVALIDARG);
+      return false;
+    }
+    bindings.root_stride = sig->UpdateRootArguments ? uint64_t(rootsig_graphics_->UploadQwords) * 8 : 0;
+    const uint32_t slots = sig->UpdateVertexBuffers ? pso_graphics_->slot_mask | sig->VertexBufferMask : 0;
+    const uint64_t vertex_stride = slots ? uint64_t(16) * (32 - __builtin_clz(slots)) : 0;
+    if (!allocator_->ReserveGPUHeap((bindings.root_stride + vertex_stride) * max_count +
+                                       sizeof(IndirectRenderCommandData) + 128, 64)) {
+      RecordError(E_OUTOFMEMORY);
+      return false;
+    }
+    if (bindings.root_stride) {
+      bindings.roots = EncodeRootArgument(rootsig_graphics_.ptr(), rootarg_graphics_staging_, max_count);
+      if (bindings.roots == UINT64_MAX)
+        return false;
+    }
+    if (slots) {
+      std::tie(bindings.vertices, bindings.vertex_stride) = PopulateVertexBufferTable(max_count, sig->VertexBufferMask);
+      if (bindings.vertices == UINT64_MAX)
+        return false;
+    }
+    auto [memory, offset] = allocator_->AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
+    if (!memory) {
+      RecordError(E_OUTOFMEMORY);
+      return false;
+    }
+    auto *command = new (memory) IndirectRenderCommandData{};
+    command->max_count = max_count;
+    command->max_count_buffer = count;
+    command->argument_buffer = arguments;
+    command->predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
+    BeginPredicationComputePass(sig->graphics_argument_resolver, 64);
+    command->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
+    if (bindings.root_stride) {
+      command->rootsig_qwords = allocator_->GPUHeapAddress(bindings.roots);
+      command->rootsig_qwords_stride = bindings.root_stride / 8;
+    }
+    if (bindings.vertex_stride) {
+      command->vertex_buffer = allocator_->GPUHeapAddress(bindings.vertices);
+      command->vertex_argbuf_stride = bindings.vertex_stride;
+    }
+    BindGPUHeapPredicationBuffer(offset, 30);
+    auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
+    dispatch.type = WMTComputeCommandDispatch;
+    dispatch.size = {(uint64_t(max_count) + 63) / 64, 1, 1};
+    allocator_->InvalidateCurrentPass();
+    return true;
   }
 
   /*
-   * ExecuteIndirect whose captures depend on the draw arguments (MeshCaptureIndirectData): a VS+HS+DS+GS PSO, or a
-   * VS+GS PSO with stream output. The recording holds the pipeline state of the passes only: the queue runs the GPU
-   * argument preflight, waits for it and then sizes every command's captures from its GPU-written counts, exactly
-   * as a direct draw of the same arguments, so no capture write can overflow and no command is dropped.
+   * ExecuteIndirect whose captures depend on draw arguments: immutable render
+   * templates carry the state, and a GPU frontier visits original commands,
+   * instances and primitive/patch groups using statically bounded scratch.
    */
   void RecordMeshCaptureIndirect(MTLD3D12CommandSignature *sig, UINT MaxCommandCount, uint64_t ArgBufferAddress,
                                  uint64_t CountBufferAddress) {
@@ -9267,9 +9755,10 @@ public:
     const bool statistics = !active_pipeline_statistics_.empty();
     if (!MaxCommandCount)
       return;
-    if (!PrepareStatisticsClaim(MaxCommandCount))
+    SM50_STATISTICS_CLAIM_HEADER frontier_statistics_claim{};
+    if (!PrepareStatisticsClaim(1, &frontier_statistics_claim))
       return;
-    if (!EnsurePredicationPipelines() || !EnsureStreamOutputPipelines(true)) {
+    if (!EnsurePredicationPipelines()) {
       RecordError(E_FAIL);
       return;
     }
@@ -9277,6 +9766,7 @@ public:
     try {
       data = std::make_shared<MeshCaptureIndirectData>();
       data->domain_only = domain_only;
+      data->frontier_statistics_claim = frontier_statistics_claim;
       if (pso_graphics_->stream_output.active) {
         // One recorded SO draw (chained per captured stream) is the template of every command's capture.
         if (!PrepareGeometryStreamOutput(1, 1))
@@ -9302,27 +9792,38 @@ public:
     preflight.predicate_op = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     preflight.indexed = indexed;
     preflight.index_format = index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-    data->preflight_pipeline = so_indirect_preflight_pipeline_;
     data->compact_pipeline = tess_capture_compact_pipeline_;
+    data->compact_reduce_pipeline = tess_capture_reduce_pipeline_;
+    data->primitive_scan_pipeline = primitive_scan_pipeline_;
     data->index_buffer = indexed ? index_buffer : WMT::Buffer{};
     data->index_offset = indexed ? index_offset : 0;
+    data->index_view_size = index_buffer_size;
     data->update_index = sig->UpdateIndexBuffer;
     data->strip_cut_value = ib_strip_cut_value_;
     if (predication_enabled_)
       data->predicate_heap = allocator_->ResolveGPUHeap(predication_snapshot_offset_).buffer;
-    uint64_t root_address = 0, root_virtual_offset = 0;
-    if (sig->UpdateRootArguments) {
-      data->root_offset = StageSlotRootArguments(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_,
-                                               MaxCommandCount, ArgBufferAddress, CountBufferAddress);
-      if (data->root_offset == UINT64_MAX)
-        return;
-      const auto roots = allocator_->ResolveGPUHeap(data->root_offset);
-      root_virtual_offset = data->root_offset;
-      root_address = roots.address;
+    if (!RetainCaptureFrontierInputs(sig, ArgBufferAddress, CountBufferAddress, indexed))
+      return;
+    IndirectGraphicsBindings bindings;
+    if (!StageSlotGraphicsBindings(sig, MaxCommandCount, ArgBufferAddress, CountBufferAddress, bindings))
+      return;
+    uint64_t index_views = UINT64_MAX;
+    if (!StageIndirectIndexBufferViews(sig, MaxCommandCount, ArgBufferAddress, CountBufferAddress, index_views))
+      return;
+    if (index_views != UINT64_MAX) {
+      const auto views = allocator_->ResolveGPUHeap(index_views);
+      data->index_view_heap = views.buffer;
+      data->index_view_offset = views.offset;
+      data->index_view_stride = 64;
+      data->index_view_address = allocator_->GPUHeapAddress(index_views);
+    }
+    if (bindings.root_stride) {
+      const auto roots = allocator_->ResolveGPUHeap(bindings.roots);
       data->root_heap = roots.buffer;
       data->root_memory = static_cast<const uint8_t *>(roots.memory);
       data->root_offset = roots.offset;
-      data->root_stride = uint64_t(rootsig_graphics_->UploadQwords) * 8;
+      data->root_stride = bindings.root_stride;
+      data->root_address = allocator_->GPUHeapAddress(bindings.roots);
       for (uint32_t parameter = 0; parameter < rootsig_graphics_->ParameterSlots; ++parameter) {
         const auto type = rootsig_graphics_->ParameterTypes[parameter];
         if (type == D3D12_ROOT_PARAMETER_TYPE_CBV || type == D3D12_ROOT_PARAMETER_TYPE_SRV ||
@@ -9330,38 +9831,14 @@ public:
           data->root_view_offsets.push_back(rootsig_graphics_->SlotQwordOffsets[parameter]);
       }
     }
-    if (sig->UpdateVertexBuffers) {
-      const uint32_t slots = pso_graphics_->slot_mask | sig->VertexBufferMask;
-      const uint64_t bytes = uint64_t(16) * (32 - __builtin_clz(slots)) * MaxCommandCount;
-      if (!allocator_->ReserveGPUHeap(bytes + sizeof(IndirectRenderCommandData) + 64, 16)) {
-        RecordError(E_OUTOFMEMORY);
-        return;
-      }
-      auto [offset, stride] = PopulateVertexBufferTable(MaxCommandCount, sig->VertexBufferMask);
-      if (offset == UINT64_MAX)
-        return;
-      const auto vertices = allocator_->ResolveGPUHeap(offset);
+    if (bindings.vertex_stride) {
+      const auto vertices = allocator_->ResolveGPUHeap(bindings.vertices);
       data->vertex_heap = vertices.buffer;
       data->vertex_memory = static_cast<const uint8_t *>(vertices.memory);
       data->vertex_offset = vertices.offset;
-      data->vertex_stride = stride;
-      data->vertex_mask = slots;
-      auto [memory, command_offset] = allocator_->AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
-      auto *command = new (memory) IndirectRenderCommandData{};
-      command->max_count = MaxCommandCount;
-      command->argument_buffer = ArgBufferAddress;
-      BeginPredicationComputePass(sig->graphics_argument_resolver, 64);
-      command->vertex_buffer = allocator_->GPUHeapAddress(offset);
-      command->vertex_argbuf_stride = stride;
-      command->rootsig_qwords = root_address;
-      command->rootsig_qwords_stride = data->root_stride / 8;
-      if (root_address)
-        allocator_->GPUHeapAddress(root_virtual_offset);
-      BindGPUHeapPredicationBuffer(command_offset, 30);
-      auto &dispatch = allocator_->EncodeComputeCommand<wmtcmd_compute_dispatch>();
-      dispatch.type = WMTComputeCommandDispatch;
-      dispatch.size = {(uint64_t(MaxCommandCount) + 63) / 64, 1, 1};
-      allocator_->InvalidateCurrentPass();
+      data->vertex_stride = bindings.vertex_stride;
+      data->vertex_address = allocator_->GPUHeapAddress(bindings.vertices);
+      data->vertex_mask = pso_graphics_->slot_mask | sig->VertexBufferMask;
     }
     data->gs_instances = pso_graphics_->gs_instance_count;
     data->indexed = indexed;
@@ -9383,6 +9860,7 @@ public:
 
         data->strip_vertices_per_primitive = vpp;
         data->strip_cut_pipeline = mesh_strip_cut_pipeline_;
+        data->strip_reduce_pipeline = mesh_strip_reduce_pipeline_;
         data->max_threadgroups = device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple7) ? UINT64_MAX : 1024;
         if (statistics) {
           auto [buffer, offset] = PipelineStatisticsCounterBuffer();
@@ -9390,6 +9868,7 @@ public:
             return;
           data->statistics_buffer = buffer;
           data->statistics_offset = offset;
+          data->statistics_address = allocator_->GPUHeapAddress(pipeline_statistics_counters_offset_);
         }
       }
       const auto [vertex_per_warp, increment] = GeometryWarpShape(warp_topology);
@@ -9405,18 +9884,18 @@ public:
                         : pso_graphics_->mesh_input_primitive == 2 ? 16
                                                                    : 10;
     }
-    const auto format = !indexed ? SM50_INDEX_BUFFER_FORMAT_NONE
-                        : index32 ? SM50_INDEX_BUFFER_FORMAT_UINT32
-                                  : SM50_INDEX_BUFFER_FORMAT_UINT16;
-    // GS: one pass. TS+GS: pass 1 (VS+HS / DS capture) and pass 2 (capture fetch / GS) each get their own render
-    // pass; the queue appends the per-command draws after the recorded state and compacts between them.
+    const auto format = indexed ? SM50_INDEX_BUFFER_FORMAT_GPU_VIEW : SM50_INDEX_BUFFER_FORMAT_NONE;
+    RenderEncoderData *producer = nullptr, *consumer = nullptr;
+    // A TS parent remains alive while its bounded children consume its DS
+    // capture. Other pipelines use one template for producer and consumer.
     for (uint8_t pass = 1; pass <= (geometry || domain_only ? 1 : 2); pass++) {
       allocator_->InvalidateCurrentPass();
-      uint32_t key = data->strip_expand ? MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_UINT32, false, statistics)
+      uint32_t key = data->strip_expand ? MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_GPU_VIEW, false, statistics)
                            : geometry       ? MeshVariantKey(format, strip, statistics)
                            : pass == 1      ? MeshVariantKey(format, false, statistics)
                                             : MeshVariantKey(SM50_INDEX_BUFFER_FORMAT_NONE, false, statistics) |
                                              kMeshTessellationGeometryPass;
+      key |= kMeshCaptureFrontier;
       const bool capture_final = capture_pixels && (geometry || domain_only || pass == 2);
       if (capture_final) key |= kMeshMSAACapture;
       // An expanded strip draws the list variant (RecordMeshStripCut swaps the topology the same way).
@@ -9427,20 +9906,6 @@ public:
                     : data->strip_vertices_per_primitive == 4 ? D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ
                                                               : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ;
       const auto status = PreDraw(false, false, key);
-      if (sig->UpdateIndexBuffer && !data->strip_expand && pass == 1) {
-        for (uint32_t format_index = 0; format_index < 2; ++format_index) {
-          const auto *variant = pso_graphics_->GetMeshPipeline(
-              MeshVariantKey(format_index ? SM50_INDEX_BUFFER_FORMAT_UINT32 : SM50_INDEX_BUFFER_FORMAT_UINT16,
-                             geometry && strip, statistics) | (capture_final ? kMeshMSAACapture : 0));
-          if (!variant) { topology_ = strip_topology; RecordError(E_FAIL); return; }
-          auto &saved = data->index_variants[format_index];
-          saved.pipeline = variant->pso;
-          saved.object_constants = variant->object_constants.buffer;
-          saved.object_offset = variant->object_constants.offset;
-          saved.mesh_constants = variant->mesh_constants.buffer;
-          saved.mesh_offset = variant->mesh_constants.offset;
-        }
-      }
       topology_ = strip_topology;
       if (status == DrawCallStatus::Invalid)
         return;
@@ -9452,10 +9917,14 @@ public:
         if (!capture) { RecordError(E_FAIL); return; }
         data->msaa_layout = capture->capture_layout;
         SM50_MSAA_MESH_CONTROL control{};
-        if (!RecordMSAADraw(0, 1, 0, 0, 0, false, true, capture, &control)) return;
+        if (!RecordMSAADraw(0, 1, 0, 0, 0, false, true, capture, &control, true)) return;
       }
+      auto *detached = allocator_->DetachCurrentRenderTemplate();
+      if (!producer) producer = detached;
+      consumer = detached;
     }
-    allocator_->InvalidateCurrentPass();
+    if (!RecordCaptureFrontier(producer, consumer))
+      return;
     ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
     owned_graphics::Trace("draw_mesh_indirect", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
                           ",\"commands\":", MaxCommandCount, ",\"capture\":1,\"geometry\":", geometry ? 1 : 0);
@@ -9468,16 +9937,13 @@ public:
    */
   void RecordMeshIndirect(MTLD3D12CommandSignature *sig, UINT MaxCommandCount, uint64_t ArgBufferAddress,
                           uint64_t CountBufferAddress) {
-    if (sig->UpdateRootArguments || sig->UpdateVertexBuffers || sig->UpdateIndexBuffer) {
-      RecordMeshCaptureIndirect(sig, MaxCommandCount, ArgBufferAddress, CountBufferAddress);
-      return;
-    }
     const bool index32 = index_type == WMTIndexTypeUInt32;
     const bool cut_strip =
         sig->CommandType == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED &&
         (topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || topology_ == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
          topology_ == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ) &&
-        ((ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && !index32) ||
+        ((sig->UpdateIndexBuffer && ib_strip_cut_value_ != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED) ||
+         (ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF && !index32) ||
          (ib_strip_cut_value_ == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF && index32));
     // GS strips the mesh GS cannot assemble natively take the capture path, which expands them per command.
     if (pso_graphics_->owned_conservative || (pso_graphics_->owned_distance_interpolation || pso_graphics_->uses_atomic64 || pso_graphics_->emulated_depth_bounds) ||
@@ -9499,7 +9965,7 @@ public:
     WMTPrimitiveType primitive;
     to_metal_primitive_type(topology_, primitive, control_points);
     const bool tessellation = pso_graphics_->mesh_kind == MeshPipelineKind::Tessellation;
-    if (tessellation != (control_points != 0) || (indexed && !index_buffer)) {
+    if (tessellation != (control_points != 0) || (indexed && !sig->UpdateIndexBuffer && !index_buffer)) {
       RecordError(E_INVALIDARG);
       return;
     }
@@ -9507,12 +9973,26 @@ public:
       RecordError(E_FAIL);
       return;
     }
-    struct Control {
-      uint64_t arguments, count, predicate, max_threadgroups;
-      uint32_t stride, max_commands, argument_words, predicate_not_equal, per_group, control_points;
-    };
-    const uint64_t argument_bytes = uint64_t(MaxCommandCount) * 32, dispatch_bytes = uint64_t(MaxCommandCount) * 16;
-    if (!allocator_->ReserveGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
+    IndirectGraphicsBindings bindings;
+    if (!StageSlotGraphicsBindings(sig, MaxCommandCount, ArgBufferAddress, CountBufferAddress, bindings))
+      return;
+    bool dynamic_addresses = sig->UpdateVertexBuffers || sig->UpdateIndexBuffer;
+    if (sig->UpdateRootArguments)
+      for (uint64_t mask = sig->RootParameterMask; mask; mask &= mask - 1) {
+        const auto type = rootsig_graphics_->ParameterTypes[__builtin_ctzll(mask)];
+        dynamic_addresses |= type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      }
+    allocator_->recording_head_->gpu_indirect_buffer_addresses |= dynamic_addresses;
+    // Argument/count resources and a fixed IB are known without a GPU readback.
+    LookupRecordedBufferByVA(ArgBufferAddress);
+    LookupRecordedBufferByVA(CountBufferAddress);
+    if (indexed && !sig->UpdateIndexBuffer) LookupRecordedBufferByVA(index_buffer_address);
+    for (uint32_t slots = pso_graphics_->slot_mask & ~sig->VertexBufferMask; slots; slots &= slots - 1)
+      LookupRecordedBufferByVA(vertex_buffers_[__builtin_ctz(slots)].BufferLocation);
+    const uint64_t argument_stride = sig->UpdateIndexBuffer ? 64 : 32;
+    const uint64_t argument_bytes = uint64_t(MaxCommandCount) * argument_stride;
+    const uint64_t dispatch_bytes = uint64_t(MaxCommandCount) * 16;
+    if (!allocator_->ReserveGPUHeap(sizeof(MeshIndirectControl) + argument_bytes + dispatch_bytes + 64, 32)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
@@ -9522,11 +10002,11 @@ public:
     const auto [vertex_per_warp, increment] = GeometryWarpShape(topology_);
     const uint32_t threads_per_patch = pso_graphics_->tess_threads_per_patch;
     const uint32_t patch_per_group = tessellation ? 32 / threads_per_patch : 0;
-    auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(Control), 16);
+    auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(MeshIndirectControl), 16);
     const auto arguments_offset = std::get<1>(allocator_->AllocateGPUHeap(argument_bytes, 32));
     const auto dispatch_offset = std::get<1>(allocator_->AllocateGPUHeap(dispatch_bytes, 16));
-    auto *control = new (control_memory) Control{};
-    control->arguments = ArgBufferAddress;
+    auto *control = new (control_memory) MeshIndirectControl{};
+    control->arguments = ArgBufferAddress + sig->DrawArgumentOffset;
     control->count = CountBufferAddress;
     control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
     // M-series GPUs (Apple7+) have no object-threadgroup grid limit; others are capped at 1024.
@@ -9538,6 +10018,9 @@ public:
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     control->per_group = tessellation ? patch_per_group : increment;
     control->control_points = tessellation ? control_points : 0;
+    control->index_arguments = sig->UpdateIndexBuffer ? ArgBufferAddress : 0;
+    control->argument_stride_words = argument_stride / 4;
+    control->index_argument_offset = sig->IndexBufferArgumentOffset;
 
     BeginPredicationComputePass(mesh_indirect_pipeline_, 64);
     if (predication_enabled_)
@@ -9552,21 +10035,47 @@ public:
 
     const bool statistics = !active_pipeline_statistics_.empty();
     const auto format = !indexed ? SM50_INDEX_BUFFER_FORMAT_NONE
+                        : sig->UpdateIndexBuffer ? SM50_INDEX_BUFFER_FORMAT_GPU_VIEW
                         : index_type == WMTIndexTypeUInt32 ? SM50_INDEX_BUFFER_FORMAT_UINT32
                                                            : SM50_INDEX_BUFFER_FORMAT_UINT16;
-    if (PreDraw(false, false, MeshVariantKey(format, strip && !tessellation, statistics)) == DrawCallStatus::Invalid)
-      return;
-    if (indexed) {
-      auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
-      binding.type = WMTRenderCommandSetObjectBuffer;
-      binding.buffer = index_buffer;
-      binding.offset = index_offset;
-      binding.index = SM50_BINDING_INDEX_INDEX_BUFFER;
-    }
     for (UINT i = 0; i < MaxCommandCount; ++i) {
-      auto &arguments = allocator_->EncodeRenderCommand<wmtcmd_render_setbufferoffset>();
-      arguments.type = WMTRenderCommandSetObjectBufferOffset;
-      arguments.offset = arguments_offset + uint64_t(i) * 32;
+      if (!i || sig->UpdateRootArguments || sig->UpdateVertexBuffers || sig->UpdateIndexBuffer) {
+        // As with DISPATCH_MESH, a boundary preserves ordered raster/UAV work
+        // between GPU-resolved slots whose bindings may name the same storage.
+        allocator_->InvalidateCurrentPass();
+        if (PreDraw(false, false, MeshVariantKey(format, strip && !tessellation, statistics)) == DrawCallStatus::Invalid)
+          return;
+        if (indexed && !sig->UpdateIndexBuffer) {
+          auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+          binding.type = WMTRenderCommandSetObjectBuffer;
+          binding.buffer = index_buffer;
+          binding.offset = index_offset;
+          binding.index = SM50_BINDING_INDEX_INDEX_BUFFER;
+        }
+      }
+      if (bindings.root_stride)
+        for (auto type : {WMTRenderCommandSetObjectBuffer, WMTRenderCommandSetMeshBuffer,
+                          WMTRenderCommandSetFragmentBuffer}) {
+          auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+          binding.type = type;
+          allocator_->BindGPUHeap(binding.buffer, binding.offset, bindings.roots + uint64_t(i) * bindings.root_stride);
+          binding.index = SM50_BINDING_INDEX_ROOT_ARGUMENTS;
+        }
+      if (bindings.vertex_stride) {
+        auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        binding.type = WMTRenderCommandSetObjectBuffer;
+        allocator_->BindGPUHeap(binding.buffer, binding.offset, bindings.vertices + uint64_t(i) * bindings.vertex_stride);
+        binding.index = SM50_BINDING_INDEX_VERTEX_BUFFER;
+      }
+      if (indexed && sig->UpdateIndexBuffer) {
+        auto &binding = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+        binding.type = WMTRenderCommandSetObjectBuffer;
+        allocator_->BindGPUHeap(binding.buffer, binding.offset, arguments_offset + uint64_t(i) * argument_stride + 32);
+        binding.index = SM50_BINDING_INDEX_INDEX_BUFFER;
+      }
+      auto &arguments = allocator_->EncodeRenderCommand<wmtcmd_render_setbuffer>();
+      arguments.type = WMTRenderCommandSetObjectBuffer;
+      allocator_->BindGPUHeap(arguments.buffer, arguments.offset, arguments_offset + uint64_t(i) * argument_stride);
       arguments.index = SM50_BINDING_INDEX_DRAW_ARGUMENTS;
       BindStatisticsClaim(i);
       auto &draw = allocator_->EncodeRenderCommand<wmtcmd_render_draw_meshthreadgroups_indirect>();
@@ -9580,8 +10089,13 @@ public:
         draw.mesh_threadgroup_size = {1, 1, 1};
       }
     }
+    allocator_->InvalidateCurrentPass();
+    ResetIndirectState(sig, rootsig_graphics_.ptr(), rootarg_graphics_staging_, false);
     owned_graphics::Trace("draw_mesh_indirect", ",\"list\":", owned_id, ",\"recording\":", owned_recording,
-                          ",\"commands\":", MaxCommandCount, ",\"tessellation\":", tessellation ? 1 : 0);
+                          ",\"commands\":", MaxCommandCount, ",\"tessellation\":", tessellation ? 1 : 0,
+                          ",\"capture\":0,\"root_updates\":", sig->UpdateRootArguments ? 1 : 0,
+                          ",\"vertex_updates\":", sig->UpdateVertexBuffers ? 1 : 0,
+                          ",\"index_updates\":", sig->UpdateIndexBuffer ? 1 : 0, ",\"draw_offset\":", sig->DrawArgumentOffset);
   }
 
   /*
@@ -9654,19 +10168,15 @@ public:
       if (roots_offset == UINT64_MAX)
         return;
     }
-    struct Control {
-      uint64_t arguments, count, predicate, max_threadgroups;
-      uint32_t stride, max_commands, argument_words, predicate_not_equal, per_group, control_points;
-    };
     const uint64_t argument_bytes = uint64_t(MaxCommandCount) * 32, dispatch_bytes = uint64_t(MaxCommandCount) * 16;
-    if (!allocator_->ReserveGPUHeap(sizeof(Control) + argument_bytes + dispatch_bytes + 64, 32)) {
+    if (!allocator_->ReserveGPUHeap(sizeof(MeshIndirectControl) + argument_bytes + dispatch_bytes + 64, 32)) {
       RecordError(E_OUTOFMEMORY);
       return;
     }
-    auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(Control), 16);
+    auto [control_memory, control_offset] = allocator_->AllocateGPUHeap(sizeof(MeshIndirectControl), 16);
     const auto arguments_offset = std::get<1>(allocator_->AllocateGPUHeap(argument_bytes, 32));
     const auto dispatch_offset = std::get<1>(allocator_->AllocateGPUHeap(dispatch_bytes, 16));
-    auto *control = new (control_memory) Control{};
+    auto *control = new (control_memory) MeshIndirectControl{};
     control->arguments = ArgBufferAddress + sig->DrawArgumentOffset;
     control->count = CountBufferAddress;
     control->predicate = predication_enabled_ ? allocator_->GPUHeapAddress(predication_snapshot_offset_) : 0;
@@ -9676,6 +10186,7 @@ public:
     control->argument_words = 3;
     control->predicate_not_equal = predication_op_ == D3D12_PREDICATION_OP_NOT_EQUAL_ZERO;
     control->per_group = 0;
+    control->argument_stride_words = 8;
 
     BeginPredicationComputePass(mesh_indirect_pipeline_, 64);
     if (predication_enabled_)
@@ -10691,7 +11202,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
     raytracing::NativeDescriptor native;
     if (!sidecar ||
         (!update && !ommArray && FAILED(raytracing::CreateNativeDescriptor(
-            device->GetMTLDevice(), inputs, sidecar.instanceBuffer(), native
+            device->GetMTLDevice(), inputs, sidecar.instanceBuffer(), native, &sizes
         )))) {
       RecordError(E_FAIL);
       return;
@@ -10764,7 +11275,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
           RecordError();
           return;
         }
-        record->postbuild.push_back({postbuild[i].InfoType, out.buffer, out.offset, out.address});
+        record->postbuild.push_back({postbuild[i].InfoType, std::move(out), {}, {}});
       }
     } catch (const std::bad_alloc &) {
       RecordError(E_OUTOFMEMORY);
@@ -10791,6 +11302,11 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       RecordError(E_FAIL);
       return;
     }
+    allocator_->InvalidateCurrentPass();
+    auto *record = allocator_->AllocatePass<RTASEncoderData>();
+    record->type = EncoderType::Raytracing;
+    record->operation = RTASOperation::Emit;
+    record->pipelines = pipelines;
     for (UINT i = 0; i < source_count; ++i) {
       raytracing::BufferLocation location, out;
       RTASState source;
@@ -10801,14 +11317,7 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
         RecordError();
         return;
       }
-      allocator_->InvalidateCurrentPass();
-      auto *record = allocator_->AllocatePass<RTASEncoderData>();
-      record->type = EncoderType::Raytracing;
-      record->operation = RTASOperation::Emit;
-      record->pipelines = pipelines;
-      record->sourceLocation = location;
-      record->source = source.sidecar;
-      record->postbuild.push_back({desc->InfoType, out.buffer, out.offset, out.address});
+      record->postbuild.push_back({desc->InfoType, std::move(out), std::move(location), source.sidecar});
     }
     allocator_->InvalidateCurrentPass();
   } catch (const std::bad_alloc &) {
@@ -11351,10 +11860,10 @@ kernel void d3dalloy_atomic_copy_u64(device const ulong *source [[buffer(0)]],
       } else dispatch->gpu_input = desc->Mode == kDispatchModeNodeGPUInput ? desc->NodeGPUInput : desc->MultiNodeGPUInput;
       auto *root = work_graph_->RootSignature(work_graph_index_);
       const bool atomic_phase = std::any_of(graph->nodes.begin(), graph->nodes.end(), [](const auto &node) { return node.atomic64_phase; });
+      CaptureStandardSwizzleTables(dispatch->atomic64_tables, root, rootarg_compute_staging_, atomic_phase);
+      if (descriptor_heaps_[0]) dispatch->atomic64_heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
       if (atomic_phase) {
-        CaptureStandardSwizzleTables(dispatch->atomic64_tables, root, rootarg_compute_staging_, true);
         CaptureAtomic64Roots(dispatch->atomic64_roots, root, rootarg_compute_staging_);
-        if (descriptor_heaps_[0]) dispatch->atomic64_heap = static_cast<MTLD3D12DescriptorHeap *>(descriptor_heaps_[0]);
       }
       const uint64_t bytes = uint64_t(root->UploadQwords) * 8 + uint64_t(root->NumStaticSamplers) * 64 + 128;
       if (!allocator_->ReserveGPUHeap(bytes, 64)) { RecordError(E_OUTOFMEMORY); return; }

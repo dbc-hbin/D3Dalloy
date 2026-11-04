@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <vector>
 #include <thread>
+#include <functional>
 #include <objc/runtime.h>
 
 namespace probe {
@@ -216,6 +217,8 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     p.inputContent = {120,120}; p.colorRect = {4,3,120,120};
     p.depthRect = {3,5,120,120}; p.motionRect = {6,2,120,120};
     p.outputRect = {4,4,256,256}; p.resetHistory = iteration % 2 == 0;
+    require(!publicFeature || (mask == 7 && generation->inputCapacityWidth == 120 &&
+            generation->inputCapacityHeight == 120), "exact-offset-public-reference-descriptor");
     frame.scalerMotionRect = p.motionRect; frame.temporalOutputWidth = frame.temporalOutputHeight = 256;
     frame.needsOutputShadow = true;
     frame.color = texture(gpu,MTLPixelFormatRGBA16Float,128,generation->colorUsage);
@@ -302,18 +305,25 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     require(std::fabs(mean-.5)<.02,"offset-region-value");
     unsigned copies=0; uint64_t bytes=0;
     for (unsigned i=0; i<3; ++i) {
-        // Public prepare pads readable RGBA16F/R32F/RG16F inputs by compute;
-        // depth formats keep the blit copy and edge-replication fallback.
-        const bool blitDepth = i == 1 && depthFormat != MTLPixelFormatR32Float;
-        require(inputCopies[i].load() == (prepared ? unsigned(blitDepth) : unsigned(bool(mask & (1u << i)))),
+        // The public descriptor is exactly 120x120. Each offset 128x128 input
+        // needs one active-region blit, with no padded extent or compute copy.
+        // The manual padded path likewise blits each selected input once.
+        const unsigned expected = unsigned(bool(mask & (1u << i)));
+        if (inputCopies[i].load() != expected)
+            std::fprintf(stderr,"OWNED_METALFX_COPY_DIAGNOSTIC iteration=%u input=%u actual=%u expected=%u\n",
+                iteration,i,inputCopies[i].load(),expected);
+        require(inputCopies[i].load() == expected,
                 "actual-native-input-copy-count");
+        require(inputBytes[i].load() == uint64_t(expected) * 120 * 120 * (i == 0 ? 8 : 4),
+                "actual-native-input-copy-bytes");
         copies+=inputCopies[i]; bytes+=inputBytes[i]; observedInputs[i]=nil;
     }
     // Public prepare writes the offset Private output in place; the manual path forces the shadow.
     const unsigned shadowCopies=outputCopies.load(); observedOutput=nil;
     require(shadowCopies == (prepared ? 0u : 1u), "actual-native-output-shadow-copy-count");
-    std::printf("OWNED_METALFX_OPT_SR iteration=%u staging_mask=%u generation=%llu mean=%.9g outside_pixels=%u primary_input_copies=%u primary_input_copy_bytes=%llu output_shadow_copies=%u public_prepare=%u\n",
-        iteration,mask,(unsigned long long)(prepared ? prepared->generationId() : generation->serial),mean,outside,copies,
+    std::printf("OWNED_METALFX_OPT_SR iteration=%u staging_mask=%u generation=%llu descriptor=%lux%lu mean=%.9g outside_pixels=%u primary_input_copies=%u primary_input_copy_bytes=%llu output_shadow_copies=%u public_prepare=%u\n",
+        iteration,mask,(unsigned long long)(prepared ? prepared->generationId() : generation->serial),
+        (unsigned long)generation->inputCapacityWidth,(unsigned long)generation->inputCapacityHeight,mean,outside,copies,
         (unsigned long long)bytes,shadowCopies,unsigned(bool(prepared)));
     ScalerBindings clear(generation->scaler);
     for(auto c:commands) [c release]; [fence release]; [allocator release];
@@ -605,16 +615,29 @@ std::vector<std::vector<float>> runFG(GPU& gpu, id<MTL4Compiler> compiler, bool 
     [allocator release]; [residency release]; [color release]; [depth release]; [motion release]; [output release];
     [scaler release]; [descriptor release]; return results;
 }
+#include "owned-metalfx-sr-optimization-native.inc"
+#include "owned-metalfx-sr-coverage-native.inc"
+#include "owned-metalfx-sr-mask-crop-native.inc"
 }
 int main(int argc, char** argv) { @autoreleasepool {
     using namespace probe;
     const bool pipelinesOnly = argc == 2 && std::strcmp(argv[1], "--pipelines-only") == 0;
     const bool prepassesOnly = argc == 2 && std::strcmp(argv[1], "--prepasses-only") == 0;
-    require(argc == 1 || pipelinesOnly || prepassesOnly, "arguments");
+    const bool srOnly = argc == 2 && std::strcmp(argv[1], "--sr-only") == 0;
+    const bool coverageOnly = argc == 2 && std::strcmp(argv[1], "--sr-alpha-view") == 0;
+    const bool maskOnly = argc == 2 && std::strcmp(argv[1], "--sr-mask-crop") == 0;
+    require(argc == 1 || pipelinesOnly || prepassesOnly || srOnly || coverageOnly || maskOnly, "arguments");
     GPU gpu;
     if (@available(macOS 27.0,*)) {} else require(false,"macos27-offset-contract");
     pipelineBatchProof(gpu.device);
     if (pipelinesOnly) return 0;
+    if (coverageOnly) { srAlphaViewProof(gpu); return 0; }
+    if (maskOnly) { srMaskCropProof(gpu); return 0; }
+    if (srOnly) {
+        srExtentProof(gpu);
+        std::puts("OWNED_METALFX_SR_OPT_PASS extent_image_pairs=11 rcas_executed=0 fg_rr_executed=0");
+        return 0;
+    }
     fusedColorAlphaProof(gpu);
     if (prepassesOnly) return 0;
     auto core=std::make_shared<Feature::Impl>(); core->device=retainObject(gpu.device);
@@ -633,9 +656,9 @@ int main(int argc, char** argv) { @autoreleasepool {
     auto a=ensureScaler(*core,p,textures,{},&error); require(bool(a),error.message.c_str()); const uint64_t activation=a->activation;
     p.outputRect={0,0,192,192}; auto b=ensureScaler(*core,p,textures,{},&error); require(bool(b),error.message.c_str());
     p.outputRect={0,0,256,256}; auto again=ensureScaler(*core,p,textures,{},&error);
-    require(again==a && a!=b && a->activation==activation+1,"A-B-A-reuse-and-activation");
+    require(again==a && a!=b && a->activation==activation,"A-B-A-preparation-reuses-without-activation");
     again=ensureScaler(*core,p,textures,{},&error);
-    require(again==a && a->activation==activation+1,"unchanged-selection-keeps-activation");
+    require(again==a && a->activation==activation,"unchanged-selection-keeps-activation");
     p.outputRect={0,0,128,128}; auto c=ensureScaler(*core,p,textures,{},&error); require(bool(c),error.message.c_str());
     require(c!=a && c!=b && ScalerGeneration::nextId.load()-start==3,"three-real-generation-creations");
     // Dynamic output keeps only the new and the previously current output extents.
@@ -648,23 +671,27 @@ int main(int argc, char** argv) { @autoreleasepool {
     require(retained==2 && !aCached && a->scaler!=nil,"two-output-eviction-retains-evicted-generation-lease");
     require(ScalerGeneration::nextId.load()-start==12,"nine-additional-native-creations");
     {
-        // Exact-extent preference: a fitting high-water generation yields to a
-        // cached exact one; the activation bumps only when the selection changes.
+        // Reuse exact cached descriptors and create exact uncached extents;
+        // preparation alone cannot reset executed history.
         auto exact=std::make_shared<Feature::Impl>(); exact->device=retainObject(gpu.device);
         exact->compiler=retainObject(core->compiler); exact->create=core->create;
         exact->minScale=core->minScale; exact->maxScale=core->maxScale;
         FrameInfo q{}; q.outputRect={0,0,256,256};
         q.inputContent={112,112}; auto small=ensureScaler(*exact,q,textures,{},&error); require(bool(small),error.message.c_str());
         q.inputContent={128,128}; auto large=ensureScaler(*exact,q,textures,{},&error); require(bool(large),error.message.c_str());
-        require(large!=small && large->inputCapacityWidth==128,"high-water-growth");
-        const uint64_t smallActivation=small->activation, largeActivation=large->activation;
+        require(large!=small && large->inputCapacityWidth==128,"exact-generation-growth");
+        const uint64_t smallActivation=small->activation;
         q.inputContent={112,112}; auto back=ensureScaler(*exact,q,textures,{},&error);
-        require(back==small && small->activation==smallActivation+1,"prefers-cached-exact-generation");
+        require(back==small && small->activation==smallActivation,"prefers-cached-exact-generation");
         back=ensureScaler(*exact,q,textures,{},&error);
-        require(back==small && small->activation==smallActivation+1,"exact-reselection-keeps-activation");
+        require(back==small && small->activation==smallActivation,"exact-reselection-keeps-activation");
         q.inputContent={120,120}; back=ensureScaler(*exact,q,textures,{},&error);
-        require(back==large && large->activation==largeActivation+1,"fitting-high-water-fallback");
-        std::printf("OWNED_METALFX_OPT_EXACT_EXTENT exact_preferred=1 fallback_high_water=1 activation_on_change_only=1\n");
+        require(back && back!=large && back!=small && back->inputCapacityWidth==120 &&
+                back->inputCapacityHeight==120,"uncached-transition-exact-generation");
+        const uint64_t exactActivation=back->activation;
+        require(ensureScaler(*exact,q,textures,{},&error)==back && back->activation==exactActivation,
+                "steady-exact-generation-no-new-activation");
+        std::printf("OWNED_METALFX_OPT_EXACT_EXTENT exact_preferred=1 uncached_transition_exact=1 prepare_only_no_activation=1\n");
     }
     auto publicFeature=Feature::create({(void*)gpu.device,(void*)core->compiler},core->create,&error);
     require(bool(publicFeature),error.message.c_str());
@@ -672,16 +699,37 @@ int main(int argc, char** argv) { @autoreleasepool {
     p.outputRect={0,0,256,256}; p.color=(void*)color; p.depth=(void*)depth;
     p.motionVectors=(void*)motion; p.output=(void*)output;
     auto prime=publicFeature->prepare(p,textures,&error); require(bool(prime),error.message.c_str());
-    auto direct=runSR(gpu,core,a,6,0,publicFeature); auto warm=runSR(gpu,core,a,6,1,publicFeature);
-    auto staged=runSR(gpu,core,a,7,2); auto stagedWarm=runSR(gpu,core,a,7,3);
+    // Public prepare creates an exact descriptor for the 120x120 active input.
+    // Its forced-staging reference must use the same native descriptor: a
+    // capacity-128 scaler has different reconstruction/history behavior.
+    auto referenceCore=srCore(gpu);
+    p.inputContent={120,120};
+    auto exact=ensureScaler(*referenceCore,p,textures,{},&error);
+    require(exact && exact->inputCapacityWidth==120 && exact->inputCapacityHeight==120,
+            "offset-reference-exact-descriptor");
+    auto direct=runSR(gpu,referenceCore,exact,7,0,publicFeature);
+    auto warm=runSR(gpu,referenceCore,exact,7,1,publicFeature);
+    auto staged=runSR(gpu,referenceCore,exact,7,2);
+    auto stagedWarm=runSR(gpu,referenceCore,exact,7,3);
     bool parity=compare(direct,staged,"cold-offset-forced-staging");
     parity &= compare(warm,stagedWarm,"warm-offset-forced-staging");
-    auto repeatCold=runSR(gpu,core,a,6,4,publicFeature), repeatWarm=runSR(gpu,core,a,6,5,publicFeature);
+    auto repeatCold=runSR(gpu,referenceCore,exact,7,4,publicFeature);
+    auto repeatWarm=runSR(gpu,referenceCore,exact,7,5,publicFeature);
     parity &= compare(repeatCold,staged,"repeat-offset-cold");
     parity &= compare(repeatWarm,stagedWarm,"repeat-offset-history");
-    auto depthBlit=runSR(gpu,core,a,6,6,publicFeature,MTLPixelFormatDepth32Float);
-    parity &= compare(depthBlit,staged,"depth32-blit-fallback-cold");
+    auto depth32=texture(gpu,MTLPixelFormatDepth32Float,128,exact->depthUsage);
+    TextureSet depthTextures=textures; depthTextures.depth=(void*)depth32;
+    auto depthExact=ensureScaler(*referenceCore,p,depthTextures,{},&error);
+    require(depthExact && depthExact->inputCapacityWidth==120 && depthExact->inputCapacityHeight==120,
+            "depth32-reference-exact-descriptor");
+    [depth32 release];
+    auto depthBlit=runSR(gpu,referenceCore,depthExact,7,6,publicFeature,MTLPixelFormatDepth32Float);
+    auto depthStaged=runSR(gpu,referenceCore,depthExact,7,8,{},MTLPixelFormatDepth32Float);
+    parity &= compare(depthBlit,depthStaged,"depth32-blit-fallback-cold");
     require(parity,"direct-staged-numeric-parity");
+    // Keep the retained capacity-128 generation as a separate padded native
+    // oracle. Its image is compared only with the same descriptor after dormant.
+    auto padded=runSR(gpu,core,a,7,10);
     {
         FsrPipelineNeeds needs; needs.linearize = needs.combineMasks = needs.padding = true;
         require(ensureFsrPipelines(*core,needs,&error) &&
@@ -705,15 +753,15 @@ int main(int argc, char** argv) { @autoreleasepool {
         core->markDormant();
         unsigned live=0; for(const auto& entry:core->generations) live+=bool(entry);
         require(live==0 && !core->currentGeneration && cached.expired(),"dormant-releases-cached-generations");
-        auto afterDormant=runSR(gpu,core,a,7,8);
-        require(compare(afterDormant,staged,"dormant-retained-generation-executes"),"dormant-retained-generation-output");
+        auto afterDormant=runSR(gpu,core,a,7,12);
+        require(compare(afterDormant,padded,"dormant-retained-generation-executes"),"dormant-retained-generation-output");
         std::printf("OWNED_METALFX_OPT_DORMANT cached_released=1 retained_generation_executed=1\n");
     }
-    std::printf("OWNED_METALFX_OPT_CACHE sequence=A,B,A,C creations=3 reused=1 activation_reset=1\n");
+    std::printf("OWNED_METALFX_OPT_CACHE sequence=A,B,A,C creations=3 reused=1 prepare_only_no_activation=1\n");
     std::printf("OWNED_METALFX_OPT_EVICTION retained=%u additional_creations=9 evicted_generation_executed=1\n",retained);
     auto fgDirect=runFG(gpu,(id<MTL4Compiler>)core->compiler,false);
     auto fgStaged=runFG(gpu,(id<MTL4Compiler>)core->compiler,true);
     for(unsigned frame=0;frame<3;++frame) require(compare(fgDirect[frame],fgStaged[frame],"fg-offset-staging"),"fg-direct-staged-numeric-parity");
     [color release]; [depth release]; [motion release]; [output release];
-    std::puts("OWNED_METALFX_OPT_PASS sr_offset_cases=6 fg_offset_cases=6 async_valid_outputs=1");
+    std::puts("OWNED_METALFX_OPT_PASS sr_offset_cases=10 fg_offset_cases=6 async_valid_outputs=1");
 } }

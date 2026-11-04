@@ -453,7 +453,10 @@ Error RayQueryLowerer::lowerCall(CallInst &call, uint32_t opcode) {
       g.SetInsertPoint(next);
       g.CreateCondBr(g.CreateCall(intrinsic("next", i1, {query_ptr}, false), {q.object}), candidate, done);
       g.SetInsertPoint(candidate);
-      Value *isTriangle = g.CreateICmpEQ(getter(g, "get_candidate_intersection_type", i32, q), g.getInt32(1));
+      // Template flags contribute to every reset of this query, including dynamic ray flags.
+      Value *isTriangle = (q.template_flags & 0x100) ? g.getFalse() :
+          (q.template_flags & 0x200) ? g.getTrue() :
+          g.CreateICmpEQ(getter(g, "get_candidate_intersection_type", i32, q), g.getInt32(1));
       g.CreateCondBr(isTriangle, triangle, classify);
       g.SetInsertPoint(triangle);
       Value *bary = getter(g, "get_candidate_triangle_barycentric_coord", f32x2, q);
@@ -501,7 +504,8 @@ Error RayQueryLowerer::lowerCall(CallInst &call, uint32_t opcode) {
     value = b.CreateSelect(traced, getter(b, "get_committed_intersection_type", i32, q), b.getInt32(0));
     break;
   case kCandidateType:
-    value = b.CreateSelect(
+    value = (q.template_flags & 0x100) ? b.getInt32(kCandidateProcedural) :
+      (q.template_flags & 0x200) ? b.getInt32(kCandidateNonOpaqueTriangle) : b.CreateSelect(
       b.CreateICmpEQ(getter(b, "get_candidate_intersection_type", i32, q), b.getInt32(kMetalBoundingBox)),
       b.getInt32(kCandidateProcedural), b.getInt32(kCandidateNonOpaqueTriangle)
     );

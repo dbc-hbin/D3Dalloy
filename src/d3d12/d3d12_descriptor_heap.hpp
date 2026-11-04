@@ -76,6 +76,8 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
 
 static_assert(sizeof(EMBEDDED_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
 constexpr uint32_t kSamplerDescriptorStride = 64;
+// Coarse invalidation avoids making an unrelated part of a large heap cold.
+constexpr uint32_t kDescriptorVersionGranularity = 64;
 
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 /*
@@ -237,6 +239,7 @@ public:
                                          uint64_t LayoutWord) = 0;
 
   virtual ShaderVisibleDescriptorCPUStorage const &GetDescriptor(UINT Index) = 0;
+  virtual uint64_t GetDescriptorVersion(UINT Index) const = 0;
   // Shader-visible view identity, which may be a pooled slot rather than an
   // ordinary native texture view. The caller retains this heap while using it.
   virtual uint64_t GetTextureResourceId(UINT Index) const = 0;

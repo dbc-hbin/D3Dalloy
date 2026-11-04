@@ -260,8 +260,11 @@ struct VOutRows {
 };
 [outputtopology("triangle")]
 [numthreads(4, 1, 1)]
-void ms_partial(uint tid : SV_GroupThreadID, out vertices VOutRows verts[4], out indices uint3 tris[2]) {
-  SetMeshOutputCounts(4, 2);
+void ms_partial(uint tid : SV_GroupThreadID, out vertices VOutRows verts[256], out indices uint3 tris[256]) {
+  if (k.y == 2) return;
+  // Only thread zero supplies the group counts. The other lanes still write outputs.
+  SetMeshOutputCounts(tid == 0 && !k.y ? 4 : 0, tid == 0 && !k.y ? 2 : 0);
+  if (k.y) return;
   const float2 corner = float2(tid & 1, tid >> 1);
   verts[tid].pos = float4(corner.x * 2 - 1, 1 - corner.y * 2, 0.5, 1);
   // x == 0 clips at pixel column 32 (clip = 1 - 2 * corner.x, interpolated).

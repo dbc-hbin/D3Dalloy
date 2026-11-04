@@ -1465,4 +1465,82 @@ void runVolumeCases(Context &c, int shaderCount, const char *const *paths) {
     for (UINT y = 0; y < 32; ++y) for (UINT x = 0; x < 32; ++x) std::memcpy(mappings.bytes.data() + mappings.address(1, x, y, 3), &pixel, 4);
   }
   volumeCheckPhysicalBytes(c, mappings, "volume-mip1-partialW-RTV-clear-dxbc-dxil-draw-64KB-alias");
+
+  // A pipeline-statistics query selects the VS capture frontier without a
+  // shader change. Sixty-five instances require resumed native submissions
+  // which keep the same sparse partial-W render view and its backing heaps.
+  D3D12_QUERY_HEAP_DESC queryDesc{};
+  queryDesc.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+  queryDesc.Count = 1;
+  ComPtr<ID3D12QueryHeap> queryHeap;
+  check(device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&queryHeap)), "volume frontier query heap");
+  const auto queryReadback = c.buffer(D3D12_HEAP_TYPE_READBACK,
+      sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS), "volume frontier query readback");
+  D3D12_INDIRECT_ARGUMENT_DESC argumentDesc{};
+  argumentDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+  D3D12_COMMAND_SIGNATURE_DESC signatureDesc{};
+  signatureDesc.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
+  signatureDesc.NumArgumentDescs = 1;
+  signatureDesc.pArgumentDescs = &argumentDesc;
+  ComPtr<ID3D12CommandSignature> signature;
+  check(device->CreateCommandSignature(&signatureDesc, nullptr, IID_PPV_ARGS(&signature)),
+        "volume frontier command signature");
+  const D3D12_DRAW_ARGUMENTS arguments{3, 65, 0, 0};
+  const auto argumentUpload = c.buffer(D3D12_HEAP_TYPE_UPLOAD, sizeof(arguments), "volume frontier argument upload");
+  const auto argumentBuffer = c.committed(D3D12_HEAP_TYPE_DEFAULT, bufferDesc(sizeof(arguments)),
+      D3D12_RESOURCE_STATE_COPY_DEST, "volume frontier GPU arguments");
+  void *argumentBytes = nullptr;
+  check(argumentUpload->Map(0, nullptr, &argumentBytes), "volume frontier argument map");
+  std::memcpy(argumentBytes, &arguments, sizeof(arguments));
+  argumentUpload->Unmap(0, nullptr);
+  c.reset();
+  c.list->CopyBufferRegion(argumentBuffer.Get(), 0, argumentUpload.Get(), 0, sizeof(arguments));
+  transition(c.list.Get(), argumentBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  c.execute("volume frontier argument copy close"); c.finish("volume frontier argument copy");
+  for (UINT api = 0; api < 2; ++api) {
+    const char *shader = api ? "dxbc" : "dxil";
+    const auto vs = readFile(paths[api * 5 + 2]), ps = readFile(paths[api * 5 + 4]);
+    const auto pso = graphics(vs, ps, DXGI_FORMAT_R8G8B8A8_UNORM);
+    const float color[4] = {(160.0f + api * 16) / 255, 64.0f / 255, 192.0f / 255, 1};
+    UINT constants[16]{};
+    std::memcpy(constants, color, sizeof(color));
+    std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=tiled shader=%s "
+        "case=volume-frontier-partial-w-residency begin\n", shader);
+    std::fflush(stderr);
+    c.reset(); transition(c.list.Get(), mappings.texture.Get(), anyShader, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    c.list->SetDescriptorHeaps(2, heaps); c.list->SetGraphicsRootSignature(root.Get()); c.list->SetPipelineState(pso.Get());
+    c.list->SetGraphicsRoot32BitConstants(0, 16, constants, 0); c.list->OMSetRenderTargets(1, &volumeRTV, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport{0, 0, 32, 32, 0, 1}; const D3D12_RECT scissor{0, 0, 32, 32};
+    c.list->RSSetViewports(1, &viewport); c.list->RSSetScissorRects(1, &scissor);
+    c.list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c.list->BeginQuery(queryHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+    c.list->ExecuteIndirect(signature.Get(), 1, argumentBuffer.Get(), 0, nullptr, 0);
+    c.list->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+    c.list->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, queryReadback.Get(), 0);
+    transition(c.list.Get(), mappings.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, anyShader);
+    c.execute("volume frontier partial-W RTV close"); c.finish("volume frontier partial-W RTV");
+    void *queryBytes = nullptr;
+    const D3D12_RANGE queryRange{0, sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)};
+    check(queryReadback->Map(0, &queryRange, &queryBytes), "volume frontier query map");
+    D3D12_QUERY_DATA_PIPELINE_STATISTICS statistics{};
+    std::memcpy(&statistics, queryBytes, sizeof(statistics));
+    const D3D12_RANGE noWrites{0, 0};
+    queryReadback->Unmap(0, &noWrites);
+    std::printf("OWNED_D3D12_TILED_FRONTIER_STATS shader=%s ia_vertices=%llu ia_primitives=%llu "
+        "vs_invocations=%llu instances=65\n", shader,
+        static_cast<unsigned long long>(statistics.IAVertices),
+        static_cast<unsigned long long>(statistics.IAPrimitives),
+        static_cast<unsigned long long>(statistics.VSInvocations));
+    std::fflush(stdout);
+    require(statistics.IAVertices == 195 && statistics.IAPrimitives == 65 && statistics.VSInvocations == 195,
+        "volume frontier exact IA/VS invocations");
+    std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=tiled shader=%s "
+        "case=volume-frontier-partial-w-residency end\n", shader);
+    std::fflush(stderr);
+    const UINT pixel = (160u + api * 16) | (64u << 8) | (192u << 16) | 0xff000000u;
+    for (UINT y = 0; y < 32; ++y) for (UINT x = 0; x < 32; ++x)
+      std::memcpy(mappings.bytes.data() + mappings.address(1, x, y, 3), &pixel, sizeof(pixel));
+    volumeCheckPhysicalBytes(c, mappings, api ? "volume-dxbc-frontier-partial-w-RTV-residency"
+                                            : "volume-dxil-frontier-partial-w-RTV-residency");
+  }
 }

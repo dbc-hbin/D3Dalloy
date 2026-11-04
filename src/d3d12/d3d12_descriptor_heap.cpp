@@ -23,6 +23,7 @@
 #include "com/com_pointer.hpp"
 #include "d3dalloy_sampler.hpp"
 #include "log/log.hpp"
+#include <atomic>
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 #include <map>
 #include <shared_mutex>
@@ -212,6 +213,7 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   D3D12_DESCRIPTOR_HEAP_DESC desc_;
 
   std::vector<ShaderVisibleDescriptorCPUStorage> descriptors_;
+  std::unique_ptr<std::atomic<uint64_t>[]> descriptor_versions_;
   Rc<Buffer> buffer_;
   ShaderVisibleDescriptorGPUStorage *mapped_argument_buffer_ = nullptr;
   uint64_t argument_buffer_gpu_address_ = 0;
@@ -222,6 +224,20 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   std::vector<PoolSlot> pool_slots_;
   WMT::Reference<WMT::TextureViewPool> view_pool_;
   bool pool_supported_ = false;
+
+  void InvalidateDescriptors(UINT first, UINT count) {
+    if (!count) return;
+    const uint64_t last = (uint64_t(first) + count - 1) / kDescriptorVersionGranularity;
+    for (uint64_t block = first / kDescriptorVersionGranularity; block <= last; ++block)
+      descriptor_versions_[block].fetch_add(1, std::memory_order_release);
+  }
+
+  ShaderVisibleDescriptorCPUStorage &WritableDescriptor(UINT index) {
+    // Also invalidate partial/failed replacements. As with GetDescriptor,
+    // callers must not race writes to a slot with a submitted use of that slot.
+    InvalidateDescriptors(index, 1);
+    return descriptors_[index];
+  }
 
   void ResetPoolSlot(UINT index) {
     if (pool_slots_[index].texture) view_pool_.clear(index);
@@ -255,10 +271,15 @@ public:
     return buffer_ ? buffer_->current()->buffer() : WMT::Buffer{};
   }
 
+  uint64_t GetDescriptorVersion(UINT index) const override {
+    return descriptor_versions_[index / kDescriptorVersionGranularity].load(std::memory_order_acquire);
+  }
+
   void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id) override {
     if (index >= descriptors_.size()) return;
-    descriptors_[index].owner_id = owner_id;
-    descriptors_[index].counter_owner_id = counter_owner_id;
+    auto &descriptor = WritableDescriptor(index);
+    descriptor.owner_id = owner_id;
+    descriptor.counter_owner_id = counter_owner_id;
   }
 
   HRESULT
@@ -274,6 +295,8 @@ public:
       return E_INVALIDARG;
     }
     descriptors_.resize(pDesc->NumDescriptors);
+    descriptor_versions_ = std::make_unique<std::atomic<uint64_t>[]>(
+        (uint64_t(pDesc->NumDescriptors) + kDescriptorVersionGranularity - 1) / kDescriptorVersionGranularity);
     pool_slots_.resize(pDesc->NumDescriptors);
     pool_supported_ = device_->GetMTLDevice().supportsMetal4();
 
@@ -371,7 +394,7 @@ public:
                         bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
     cpu_storage.SRVTexture.view = View;
@@ -414,7 +437,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::ConstantBuffer;
     cpu_storage.ConstantBuffer.address = VA;
     cpu_storage.ConstantBuffer.size = SizeInBytes;
@@ -429,7 +452,7 @@ public:
   AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture;
     cpu_storage.UAVTexture.view = View;
@@ -464,7 +487,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexelBuffer;
     cpu_storage.UAVTexelBuffer.buffer = UAVBuffer;
     cpu_storage.UAVTexelBuffer.slice = Slice;
@@ -487,7 +510,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVBuffer;
     cpu_storage.UAVBuffer.buffer = UAVBuffer;
     cpu_storage.UAVBuffer.slice = Slice;
@@ -511,7 +534,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexelBuffer;
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
     cpu_storage.SRVTexelBuffer.slice = Slice;
@@ -534,7 +557,7 @@ public:
     if (Index >= descriptors_.size() || !Buffer)
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVRGB32Buffer;
     cpu_storage.SRVRGB32Buffer.buffer = Buffer;
     cpu_storage.SRVRGB32Buffer.slice = Slice;
@@ -552,7 +575,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
     cpu_storage.SRVBuffer.slice = Slice;
@@ -574,7 +597,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     auto &gpu_storage = mapped_argument_buffer_[Index];
     gpu_storage.ZeroFilled = {{}};
@@ -595,7 +618,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.AccelerationStructure.address = Address;
     cpu_storage.type =
         Address ? ShaderVisibleDescriptorType::AccelerationStructure : ShaderVisibleDescriptorType::Null;
@@ -612,7 +635,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::SamplerFeedback;
     cpu_storage.SamplerFeedback.buffer = Cells;
     cpu_storage.SamplerFeedback.slice = {0, CellBytes, 0, uint32_t(CellBytes / 4)};
@@ -629,7 +652,7 @@ public:
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = descriptors_[Index];
+    auto &cpu_storage = WritableDescriptor(Index);
     cpu_storage.type = ShaderVisibleDescriptorType::Null;
     auto &gpu_storage = mapped_argument_buffer_[Index];
     gpu_storage.ZeroFilled = {{}};
@@ -645,6 +668,7 @@ public:
   CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
     auto *destination = static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo);
     if (destination == this && From == DescriptorTo) return;
+    destination->InvalidateDescriptors(DescriptorTo, CopyCount);
     const bool overlap = destination == this && DescriptorTo < From + CopyCount && From < DescriptorTo + CopyCount;
     const bool reverse = overlap && DescriptorTo > From;
     for (unsigned n = 0; n < CopyCount;) {

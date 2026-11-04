@@ -1846,6 +1846,8 @@ void submissionOverlappingViewClears(UINT order) {
   pass(order ? "graph-overlap-sRGB-first-linear-last" : "graph-overlap-linear-first-sRGB-last");
 }
 
+#include "owned-d3d12-placed-render-groups.inc"
+
 }  // namespace
 
 int main() {
@@ -1869,6 +1871,9 @@ int main() {
   submissionAttachmentUnion(false);
   submissionAttachmentUnion(true);
   submissionAttachmentUnion(true, true);
+  for (UINT control = 0; control < 3; ++control) placedRenderGroups(control);
+  placedRenderAlias(false);
+  placedRenderAlias(true);
   submissionPendingClears(false);
   submissionPendingClears(true);
   submissionOverlappingViewClears(0);

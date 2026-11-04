@@ -24,7 +24,7 @@ done
 for entry in vs_gs gs_multi; do
   compile stream-output-gs "$entry"
 done
-for entry in vs_pass ps_color ps_early ps_tsgs_early ds_tri ds_quad ds_isoline ds_patch gs_tsgs \
+for entry in vs_pass vs_frontier ps_color ps_early ps_tsgs_early ds_tri ds_quad ds_isoline ds_patch gs_tsgs \
   hs_patch1 hs_patch2 hs_patch5 hs_patch8 hs_patch11 hs_patch16 hs_patch17 hs_patch32; do
   compile tessellation "$entry"
 done

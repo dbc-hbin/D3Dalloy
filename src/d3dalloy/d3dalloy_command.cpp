@@ -1,5 +1,6 @@
 #include "d3dalloy_command.hpp"
 #include "Metal.hpp"
+#include "Metal4Pipeline.hpp"
 #include "d3dalloy_context.hpp"
 #include "d3dalloy_format.hpp"
 
@@ -20,6 +21,17 @@ InternalCommandLibrary::InternalCommandLibrary(WMT::Device device) {
     abort();
   }
 };
+
+WMT::ComputePipelineState
+InternalCommandLibrary::getWorkGraphSchedulerPipeline(WMT4::Compiler compiler, WMT::Error &error) {
+  std::lock_guard lock(work_graph_pipeline_mutex_);
+  if (!work_graph_pipeline_) {
+    auto function = WMT4::Library(library_).newFunction("d3d12_work_graph_prepare");
+    if (!function) return {};
+    work_graph_pipeline_ = compiler.newComputePipelineState(function, error);
+  }
+  return work_graph_pipeline_;
+}
 
 EmulatedCommandContext::EmulatedCommandContext(WMT::Device device, InternalCommandLibrary &lib, ArgumentEncodingContext &ctx): ctx(ctx) {
   auto pool = WMT::MakeAutoreleasePool();

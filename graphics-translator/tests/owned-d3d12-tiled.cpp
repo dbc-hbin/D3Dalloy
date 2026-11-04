@@ -189,6 +189,7 @@ ComPtr<ID3D12RootSignature> rootSignature(ID3D12Device *device, const D3D12_ROOT
   return root;
 }
 #include "owned-d3d12-tiled-volume.inc"
+#include "owned-d3d12-tiled-timeline.inc"
 } // namespace
 
 int
@@ -422,6 +423,13 @@ main(int argc, char **argv) {
     queue->UpdateTileMappings(R.Get(), 1, &tile3, &one, heapB.Get(), 1, nullptr, &zero, nullptr,
                               D3D12_TILE_MAPPING_FLAG_NONE);
     queue->CopyTileMappings(R2.Get(), &start, R.Get(), &start, &whole, D3D12_TILE_MAPPING_FLAG_NONE);
+    // Repeating unchanged mapped/NULL targets must not republish residency or
+    // disturb later GPU data. Exercise both ordering flags and copied mappings.
+    queue->UpdateTileMappings(R.Get(), 1, &start, &first3, heapA.Get(), 2, flags, offsets, counts,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    queue->UpdateTileMappings(R.Get(), 1, &start, &first3, heapA.Get(), 2, flags, offsets, counts,
+                              D3D12_TILE_MAPPING_FLAG_NO_HAZARD);
+    queue->CopyTileMappings(R2.Get(), &start, R.Get(), &start, &whole, D3D12_TILE_MAPPING_FLAG_NONE);
   }
   const auto output = c.buffer(D3D12_HEAP_TYPE_DEFAULT, 8192, "output");
   const auto outputReadback = c.buffer(D3D12_HEAP_TYPE_READBACK, 8192, "output readback");
@@ -499,6 +507,10 @@ main(int argc, char **argv) {
     const UINT offsets[2] = {1, 0}, counts[2] = {1, 1};
     queue->UpdateTileMappings(R.Get(), 2, starts, sizes, heapA.Get(), 2, nullptr, offsets, counts,
                               D3D12_TILE_MAPPING_FLAG_NONE);
+    // This no-op still follows the preceding Execute/remap in queue order. Its
+    // lack of a new native mapping must not bypass retirement of prior users.
+    queue->UpdateTileMappings(R.Get(), 2, starts, sizes, heapA.Get(), 2, nullptr, offsets, counts,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
     // Invalid: region outside the resource, and a range outside the heap. Both are dropped.
     const D3D12_TILED_RESOURCE_COORDINATE outside{4, 0, 0, 0};
     const D3D12_TILE_REGION_SIZE one{1, FALSE, 0, 0, 0};
@@ -532,6 +544,7 @@ main(int argc, char **argv) {
     expect("tile 3 unchanged by invalid updates +48", word(3, 48), 0x303);
   }
   pass("mapping-update-at-execute-boundary");
+  std::puts("OWNED_D3D12_TILED_MAPPING_IDEMPOTENT_PASS update=3 copy=1 no_hazard=1 gpu_bytes=exact");
   pass("invalid-update-dropped");
   pass("evict-make-resident");
 
@@ -1439,6 +1452,9 @@ main(int argc, char **argv) {
   }
   pass("reserved-creation-validation");
   runVolumeCases(c, argc - 11, argv + 11);
+  runMappingTimeline(c);
+  runMappingBursts(c, false);
+  runMappingBursts(c, true);
   check(device->GetDeviceRemovedReason(), "device removed at end");
   /* The reported capability is checked last so a functional failure is reported first. */
   require(unsigned(options.TiledResourcesTier) == 4, "TiledResourcesTier 4");

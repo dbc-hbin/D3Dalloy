@@ -35,10 +35,14 @@ with tempfile.TemporaryDirectory(prefix="command-recording-cpu-", dir=root / "bu
         "ARENA_METHODS": "\n".join((
             "void *\n" + declaration(header, "AllocateCPUHeap(size_t"),
             "template <typename T> T *\n" + declaration(header, "AllocatePass()"),
+            "RenderEncoderData *\n" + declaration(header, "DetachCurrentRenderTemplate()"),
             "template <typename cmd_struct> cmd_struct &\n" + declaration(header, "EncodeComputeCommand()"),
             "HRESULT\n" + declaration(header, "EndRecord(size_t"),
             "HRESULT\n" + declaration(allocator, "MTLD3D12CommandAllocatorImpl::Initialize()")
                 .replace("MTLD3D12CommandAllocatorImpl::", "", 1))),
+        "RENDER_OWNERS": "\n".join((
+            declaration(allocator, "static void DestroyRecordedRenderEncoder("),
+            declaration(allocator, "RecordingHead::~RecordingHead()"))),
         "RECORDING_METHODS": "\n".join(prefix + declaration(recording, marker) for prefix, marker in (
             ("bool ", "IsRecording() const"), ("void ", "RecordError(HRESULT"),
             ("HRESULT STDMETHODCALLTYPE ", "ValidateRecording()"),

@@ -1,6 +1,7 @@
 #include "metallib_writer.hpp"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Instructions.h"
 #include <cstring>
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/DenseSet.h"
@@ -23,6 +24,78 @@ struct InputAttribute {
   uint8_t type;
   // TODO: extend patch/control point here
 };
+
+// Find definitions before cloning: GlobalDCE can then clean declarations without
+// first copying every unrelated helper body for every AIR export. Other exports
+// remain link boundaries, exactly as in the full-clone path.
+static bool CollectExportDefinitions(const Module &module, const Function *entry,
+    const SmallPtrSetImpl<const GlobalValue *> &exports, ArrayRef<const char *> entryKinds,
+    SmallPtrSetImpl<const GlobalValue *> &definitions) {
+  if (!module.alias_empty() || !module.ifunc_empty() || !module.getModuleInlineAsm().empty()) return false;
+  SmallPtrSet<const Value *, 32> visited;
+  SmallPtrSet<const Metadata *, 32> visitedMetadata;
+  SmallVector<const Value *, 64> values{entry};
+  SmallVector<const Metadata *, 32> metadata;
+  for (const auto &global : module.globals())
+    if (global.hasAppendingLinkage() || global.getName() == "llvm.used" || global.getName() == "llvm.compiler.used")
+      values.push_back(&global);
+  for (const auto &named : module.named_metadata()) {
+    bool entries = false;
+    for (auto kind : entryKinds) entries |= named.getName() == kind;
+    for (auto *node : named.operands()) {
+      if (entries) {
+        auto *reference = node->getNumOperands() ? dyn_cast_or_null<ValueAsMetadata>(node->getOperand(0)) : nullptr;
+        if (!reference || reference->getValue() != entry) continue;
+      }
+      metadata.push_back(node);
+    }
+  }
+  while (!values.empty() || !metadata.empty()) {
+    if (!metadata.empty()) {
+      auto *item = metadata.pop_back_val();
+      if (!item || !visitedMetadata.insert(item).second) continue;
+      if (auto *reference = dyn_cast<ValueAsMetadata>(item)) values.push_back(reference->getValue());
+      if (auto *node = dyn_cast<MDNode>(item))
+        for (const auto &operand : node->operands()) metadata.push_back(operand.get());
+      continue;
+    }
+    auto *item = values.pop_back_val();
+    if (!visited.insert(item).second) continue;
+    if (isa<BlockAddress>(item) || isa<InlineAsm>(item)) return false;
+    const Function *owner = nullptr;
+    if (auto *instruction = dyn_cast<Instruction>(item)) owner = instruction->getFunction();
+    else if (auto *argument = dyn_cast<Argument>(item)) owner = argument->getParent();
+    else if (auto *block = dyn_cast<BasicBlock>(item)) owner = block->getParent();
+    if (owner) {
+      if (owner != entry && exports.contains(owner)) continue;
+      values.push_back(owner); // Metadata may be the only reference to a local value.
+    }
+    if (auto *global = dyn_cast<GlobalValue>(item)) {
+      if (global != entry && exports.contains(global)) continue;
+      definitions.insert(global);
+    }
+    SmallVector<std::pair<unsigned, MDNode *>, 4> attached;
+    if (auto *object = dyn_cast<GlobalObject>(item)) {
+      if (object->hasComdat()) return false;
+      object->getAllMetadata(attached);
+    }
+    if (auto *instruction = dyn_cast<Instruction>(item)) {
+      if (auto *call = dyn_cast<CallBase>(instruction);
+          call && !isa<Function>(call->getCalledOperand()->stripPointerCasts())) return false;
+      instruction->getAllMetadata(attached);
+    }
+    for (const auto &attachment : attached) metadata.push_back(attachment.second);
+    if (auto *reference = dyn_cast<MetadataAsValue>(item)) metadata.push_back(reference->getMetadata());
+    if (auto *function = dyn_cast<Function>(item))
+      for (const auto &block : *function)
+        for (const auto &instruction : block) values.push_back(&instruction);
+    // Also visits global initializers, constant expressions/aggregates, operand
+    // bundles, and a function's personality/prefix/prologue references.
+    if (auto *user = dyn_cast<User>(item))
+      for (const auto &operand : user->operands()) values.push_back(operand.get());
+  }
+  return true;
+}
 
 Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
 
@@ -103,10 +176,21 @@ Error MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
     } else {
       // Each export must have its own AIR definition. Reusing the whole module
       // for linked functions defines the same public symbols multiple times.
+      SmallPtrSet<const GlobalValue *, 32> definitions;
+      const bool closed = CollectExportDefinitions(module, function, exports, entryKinds, definitions);
       ValueToValueMapTy values;
       auto isolated = CloneModule(module, values, [&](const GlobalValue *value) {
-        return value == function || !exports.contains(value);
+        return value == function || (!exports.contains(value) && (!closed || definitions.contains(value)));
       });
+      // LLVM 15 copies these attributes without remapping their global operands.
+      // Keep every retained definition local to this clone before running DCE.
+      for (const auto &source : module) {
+        auto *target = cast<Function>(values[&source]);
+        if (source.hasPrefixData())
+          target->setPrefixData(target->isDeclaration() ? nullptr : MapValue(source.getPrefixData(), values));
+        if (source.hasPrologueData())
+          target->setPrologueData(target->isDeclaration() ? nullptr : MapValue(source.getPrologueData(), values));
+      }
       auto entryFunction = cast<Function>(values[function]);
       for (auto kind : entryKinds) {
         auto entries = isolated->getNamedMetadata(kind);

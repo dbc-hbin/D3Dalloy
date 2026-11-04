@@ -92,23 +92,40 @@ struct ClosedDescriptorSpan {
   uint64_t stages;
   bool writable;
 };
-struct ClosedPassShape {
-  const EncoderData *record;
+struct SubmissionDescriptorCache;
+struct ClosedDescriptorShape {
   std::vector<ClosedDescriptorSpan> descriptors;
-  bool descriptors_complete = true, compute_commands_complete = true;
+  bool descriptors_complete = true;
+  mutable std::shared_ptr<const SubmissionDescriptorCache> descriptor_cache;
+};
+struct ClosedDispatchShape : ClosedDescriptorShape {
+  small_vector<uint8_t, 4> buffers;
+};
+struct ClosedPassShape : ClosedDescriptorShape {
+  explicit ClosedPassShape(const EncoderData *record) : record(record) {}
+  const EncoderData *record;
+  bool compute_commands_complete = true, dispatch_access_complete = false;
+  std::vector<ClosedDispatchShape> dispatches;
 };
 struct RecordingHead : EncoderData {
+  ~RecordingHead();
   std::atomic<uint32_t> in_flight{0};
   std::vector<RecordedStateEvent> state_events;
   std::vector<RecordedBoundary> boundaries;
   std::vector<Com<ID3D12DescriptorHeap>> descriptor_heaps;
   std::vector<Rc<BufferAllocation>> root_allocations;
   std::unordered_set<BufferAllocation *> root_allocation_set;
-  // Sealed only by Close. Execution resolves slot contents and current physical
-  // backing every time; no volatile descriptor or GPU value is stored here.
+  // GPU-selected indirect root/VB addresses cannot be resolved while recording.
+  // The Execute task pins the current VA registry once, through GPU retirement.
+  bool gpu_indirect_buffer_addresses = false;
+  // Close seals layout only. Execution may reuse resource-access summaries after
+  // checking descriptor versions and current backing; GPU values are never cached.
   std::vector<ClosedPassShape> pass_shapes;
   std::unordered_map<const EncoderData *, size_t> pass_indices;
   size_t raytracing_passes = 0;
+  // Internal render templates belong to the recording even if a later
+  // allocation fails before its logical frontier node can be published.
+  std::vector<RenderEncoderData *> detached_render_templates;
 };
 
 class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllocator> {
@@ -260,6 +277,18 @@ public:
   void EndSchedulingPass() {
     if (encoder_current) encoder_current->endpoint_reason = RecordedEndpointReason::Scheduling;
     InvalidateCurrentPass();
+  }
+
+  RenderEncoderData *DetachCurrentRenderTemplate() {
+    assert(recording_head_ && encoder_current && encoder_current->type == EncoderType::Render);
+    auto *render = static_cast<RenderEncoderData *>(encoder_current);
+    // Publish the owner first. If vector growth fails, the current pass remains
+    // attached and normal failed-recording cleanup still owns it.
+    recording_head_->detached_render_templates.push_back(render);
+    encoder_current = nullptr;
+    render->next = nullptr;
+    owned_graphics::Trace("capture_template_detached", ",\"encoder\":", render->id);
+    return render;
   }
 
   HRESULT

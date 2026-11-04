@@ -95,11 +95,23 @@ struct ComputeEncoderData : EncoderData {
   wmtcmd_base cmd_head;
   wmtcmd_base *cmd_tail = &cmd_head;
 };
+struct PrivateReference {
+  unsigned releases = 0;
+  void ReleasePrivate() { ++releases; }
+};
+struct TableUse { PrivateReference *rootsig, *heap; };
 struct RenderEncoderData : EncoderData {
   void *visibility_intervals = nullptr;
   uint64_t visibility_interval_count = 0;
   WMT::Buffer visibility_scratch;
+  std::unique_ptr<std::vector<TableUse>> submission_tables, swizzle_tables;
+  std::shared_ptr<int> retained_resource;
 };
+struct RecordingHead : EncoderData {
+  std::vector<RenderEncoderData *> detached_render_templates;
+  ~RecordingHead();
+};
+#include PRODUCTION_RENDER_OWNERS
 struct OwnedTemporalFrame {};
 struct TemporalEncoderData : EncoderData { std::shared_ptr<OwnedTemporalFrame> frame; };
 struct IMTLD3D12TemporalUpscaleState {};
@@ -108,11 +120,14 @@ struct D3D12_DISPATCH_ARGUMENTS { UINT X, Y, Z; };
 
 namespace owned_graphics {
 bool trace_enabled = false, submission_committed = false;
+bool fail_detach_trace = false;
 unsigned signal_traces = 0, committed_traces = 0;
 uint64_t NewObjectId() { static uint64_t id = 0; return ++id; }
 bool TraceEnabled() { return trace_enabled; }
 template <typename... Fields> void Trace(const char *event, Fields &&...) {
   if (!trace_enabled) return;
+  if (!std::strcmp(event, "capture_template_detached") && std::exchange(fail_detach_trace, false))
+    throw std::bad_alloc();
   if (!std::strcmp(event, "signal")) {
     require(!submission_committed, "signal trace before commit");
     ++signal_traces;
@@ -149,8 +164,9 @@ struct Arena {
   struct Chunk { size_t used = 0; };
   std::vector<Chunk> gpu_heap_chunks_;
   size_t gpu_heap_active_ = 0;
-  EncoderData head;
-  EncoderData *encoder_current = nullptr, *encoder_last = nullptr, *recording_head_ = nullptr;
+  RecordingHead head;
+  EncoderData *encoder_current = nullptr, *encoder_last = nullptr;
+  RecordingHead *recording_head_ = nullptr;
   size_t encoder_count_ = 0;
   struct CachedICB {bool used=false;};
   std::vector<CachedICB> icb_;
@@ -171,11 +187,19 @@ struct Arena {
   void releaseRecords() {
     for (auto *pass = head.next; pass;) {
       auto *next = pass->next;
-      pass->~EncoderData();
+      if (pass->type == EncoderType::Render) DestroyRecordedRenderEncoder(static_cast<RenderEncoderData *>(pass));
+      else pass->~EncoderData();
       pass = next;
     }
-    if (encoder_current) encoder_current->~EncoderData();
-    head.next = nullptr;
+    if (encoder_current) {
+      if (encoder_current->type == EncoderType::Render)
+        DestroyRecordedRenderEncoder(static_cast<RenderEncoderData *>(encoder_current));
+      else encoder_current->~EncoderData();
+    }
+    // StableSubmissionStorage destroys each production RecordingHead before
+    // releasing its arena. Reconstruct the probe's in-place empty head here.
+    head.~RecordingHead();
+    new (&head) RecordingHead;
     encoder_current = encoder_last = recording_head_ = nullptr;
     for (auto *pointer : spilled_cpu_heap_) arenaFree(pointer);
     spilled_cpu_heap_.clear();
@@ -403,6 +427,65 @@ void testSignalTrace(bool enabled, bool retireAtCommit) {
   require(lifetime.expired(), "logical retirement releases signal ownership");
   owned_graphics::trace_enabled = false;
 }
+
+void testDetachedRenderLifetime(bool failOwnerGrowth, bool failTrace, bool unfinished) {
+  PrivateReference rootsig, heap;
+  Arena arena;
+  Device device;
+  require(arena.Initialize() == S_OK, "detached initialize");
+  MTLD3D12GraphicsCommandListImpl list(arena, device);
+  auto resource = std::make_shared<int>(7);
+  std::weak_ptr<int> lifetime = resource;
+  auto *render = arena.AllocatePass<RenderEncoderData>();
+  render->type = EncoderType::Render;
+  render->retained_resource = std::move(resource);
+  render->submission_tables = std::make_unique<std::vector<TableUse>>(1, TableUse{&rootsig, &heap});
+  render->swizzle_tables = std::make_unique<std::vector<TableUse>>(1, TableUse{&rootsig, &heap});
+  const auto count = arena.encoder_count_;
+  if (failOwnerGrowth) {
+    fail_new = true;
+    expectAllocationFailure([&] { arena.DetachCurrentRenderTemplate(); });
+    fail_new = false;
+    require(arena.encoder_current == render && arena.head.detached_render_templates.empty() &&
+            arena.encoder_count_ == count && !arena.head.next && !lifetime.expired(),
+            "detach owner allocation failure preserves attached owner and linkage");
+    list.RecordError(E_OUTOFMEMORY);
+  } else {
+    owned_graphics::trace_enabled = failTrace;
+    owned_graphics::fail_detach_trace = failTrace;
+    if (failTrace) {
+      expectAllocationFailure([&] { arena.DetachCurrentRenderTemplate(); });
+      list.RecordError(E_OUTOFMEMORY);
+    } else {
+      require(arena.DetachCurrentRenderTemplate() == render, "detach returns stable template");
+    }
+    owned_graphics::trace_enabled = false;
+    require(!arena.encoder_current && arena.head.detached_render_templates.size() == 1 &&
+            arena.head.detached_render_templates[0] == render && arena.encoder_count_ == count &&
+            !arena.head.next && !render->next && !lifetime.expired(),
+            "detached template has one recording owner and no execution linkage");
+    if (!failTrace) {
+      auto *second = arena.AllocatePass<RenderEncoderData>();
+      second->type = EncoderType::Render;
+      second->retained_resource = render->retained_resource;
+      second->submission_tables = std::make_unique<std::vector<TableUse>>(1, TableUse{&rootsig, &heap});
+      require(arena.DetachCurrentRenderTemplate() == second, "two-pass capture retains both templates");
+      require(arena.head.detached_render_templates[0] == render &&
+              arena.head.detached_render_templates[1] == second, "template vector growth preserves stable pointers");
+    }
+  }
+  if (!unfinished) {
+    const auto result = list.Close();
+    require(result == ((failOwnerGrowth || failTrace) ? E_OUTOFMEMORY : S_OK), "detached Close result");
+  }
+  require(!lifetime.expired() && !rootsig.releases && !heap.releases, "recording retains template resources");
+  arena.releaseRecords();
+  const unsigned releases = (!failOwnerGrowth && !failTrace) ? 3 : 2;
+  require(lifetime.expired() && rootsig.releases == releases && heap.releases == releases,
+          "linked and detached render resources release exactly once");
+  arena.releaseRecords();
+  require(rootsig.releases == releases && heap.releases == releases, "repeated empty cleanup is harmless");
+}
 } // namespace
 
 int main() {
@@ -421,6 +504,10 @@ int main() {
   testSignalTrace(false, false);
   testSignalTrace(true, false);
   testSignalTrace(true, true);
+  testDetachedRenderLifetime(true, false, false);
+  testDetachedRenderLifetime(false, true, false);
+  testDetachedRenderLifetime(false, false, false);
+  testDetachedRenderLifetime(false, false, true);
   require(!live_blocks, "all arena storage released exactly once");
-  std::puts("COMMAND_RECORDING_OOM_PASS arena_failures=4 initial=1 recording=2 first_error=1 hresult=1 close=1 signal_trace=3");
+  std::puts("COMMAND_RECORDING_OOM_PASS arena_failures=4 initial=1 recording=2 first_error=1 hresult=1 close=1 signal_trace=3 detached_render=4");
 }

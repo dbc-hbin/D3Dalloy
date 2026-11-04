@@ -43,7 +43,7 @@ struct ShadowGeometry {
 };
 struct ShadowJob {
   ulong source, destinationOffset, sourceStride;
-  uint elementSize, destinationStride, count, mode, reserved;
+  uint elementSize, destinationStride, count, mode, flags;
 };
 struct ShadowMetadata {
   uint magic, type, flags, descCount;
@@ -57,37 +57,79 @@ struct ShadowParams {
   ShadowMetadata metadata;
 };
 
+// All vector accesses are proved aligned and stay within the source payload.
+// The last partial word and the R16 -> R32 padding never read past an element.
+inline void copy_shadow_linear(device uchar *dst, device const uchar *src,
+    ulong bytes, ulong paddedBytes, uint tid, uint lanes) {
+  const uint width = ((ulong(dst) | ulong(src)) & 15) == 0 ? 16
+      : ((ulong(dst) | ulong(src)) & 3) == 0 ? 4 : 1;
+  for (ulong offset = ulong(tid) * width; offset < paddedBytes; offset += ulong(lanes) * width) {
+    if (src && offset + width <= bytes && width == 16)
+      *((device uint4 *)(dst + offset)) = *((device const uint4 *)(src + offset));
+    else if (src && offset + width <= bytes && width == 4)
+      *((device uint *)(dst + offset)) = *((device const uint *)(src + offset));
+    else
+      for (uint byte = 0; byte < width && offset + byte < paddedBytes; ++byte)
+        dst[offset + byte] = src && offset + byte < bytes ? src[offset + byte] : 0;
+  }
+}
+
+inline void copy_shadow_element(device uchar *dst, device const uchar *src,
+    uint bytes, uint stride) {
+  if (bytes == 2 && stride == 4 && (ulong(dst) & 3) == 0 && (ulong(src) & 1) == 0) {
+    *((device uint *)dst) = src ? *((device const ushort *)src) : 0;
+    return;
+  }
+  uint offset = 0;
+  if (src && ((ulong(dst) | ulong(src)) & 15) == 0)
+    for (; offset + 16 <= bytes; offset += 16)
+      *((device uint4 *)(dst + offset)) = *((device const uint4 *)(src + offset));
+  if (src && ((ulong(dst + offset) | ulong(src + offset)) & 3) == 0)
+    for (; offset + 4 <= bytes; offset += 4)
+      *((device uint *)(dst + offset)) = *((device const uint *)(src + offset));
+  for (; offset < bytes; ++offset) dst[offset] = src ? src[offset] : 0;
+  for (; offset < stride; ++offset) dst[offset] = 0;
+}
+
 kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
     device const ShadowGeometry *geometries [[buffer(1)]], device const ShadowJob *jobs [[buffer(2)]],
-    uint tid [[thread_position_in_grid]]) {
+    uint2 tid [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
   device ASHeader *dst = (device ASHeader *)p.asAddress;
   if (p.metadataMode == 1) {
     device const ASHeader *src = (device const ASHeader *)p.metadataSource;
     // resourceID and contribution pointer belong to the destination sidecar.
-    for (ulong i = 16 + tid; i < 64 + src->shadowSize; i += 4096)
-      ((device uchar *)dst)[i] = ((device const uchar *)src)[i];
+    copy_shadow_linear((device uchar *)dst + 16, (device const uchar *)src + 16,
+        48 + src->shadowSize, 48 + src->shadowSize, tid.x, grid.x);
   } else {
-    if (tid == 0)
+    if (all(tid == 0))
       *((device ShadowMetadata *)((device uchar *)dst + 16)) = p.metadata;
-    for (uint i = tid; i < p.metadata.descCount && p.metadata.type != 0; i += 4096)
+    for (ulong i = ulong(tid.y) * grid.x + tid.x; i < p.metadata.descCount && p.metadata.type != 0;
+         i += ulong(grid.x) * grid.y)
       ((device ShadowGeometry *)((device uchar *)dst + 64))[i] = geometries[i];
-    for (uint j = 0; j < p.jobCount; ++j) {
+    // Each row owns its jobs' disjoint shadow regions; x spans bytes or elements within that job.
+    for (ulong j = tid.y; j < p.jobCount; j += grid.y) {
       const ShadowJob job = jobs[j];
-      for (ulong i = tid; i < (ulong)job.count * job.destinationStride; i += 4096) {
-        uint element = uint(i / job.destinationStride);
-        uint byte = uint(i % job.destinationStride);
+      device uchar *output = (device uchar *)dst + job.destinationOffset;
+      if (job.mode == 0 && (job.destinationStride == job.elementSize || job.count == 1) &&
+          job.sourceStride == job.elementSize) {
+        copy_shadow_linear(output, (device const uchar *)job.source,
+            ulong(job.count) * job.elementSize, ulong(job.count) * job.destinationStride, tid.x, grid.x);
+        continue;
+      }
+      for (ulong element = tid.x; element < job.count; element += grid.x) {
         device const uchar *src = job.mode == 1
           ? (device const uchar *)((device const ulong *)job.source)[element]
           : (device const uchar *)(job.source + (ulong)element * job.sourceStride);
-        ((device uchar *)dst)[job.destinationOffset + i] = byte < job.elementSize && src ? src[byte] : 0;
+        copy_shadow_element(output + element * job.destinationStride, src, job.elementSize, job.destinationStride);
       }
     }
   }
 }
 
-struct PostbuildParams { ulong asAddress, destination; uint operation, reserved; };
-kernel void d3dalloy_as_postbuild(constant PostbuildParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
-  if (tid) return;
+struct PostbuildParams { ulong asAddress, destination; uint operation, batchCount; };
+kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+  if (tid >= max(entries[0].batchCount, 1u)) return;
+  constant PostbuildParams &p = entries[tid];
   device ASHeader *h = (device ASHeader *)p.asAddress;
   device ulong *out = (device ulong *)p.destination;
   const ulong compacted = (ulong(h->nativeCompactedSize) + 64 + h->shadowSize + 255) & ~255ul;
@@ -245,7 +287,13 @@ struct D3DALLOYASPrepassParams
     uint versionToken;
     /* Slot in the shared version-mirror page this token is published into. */
     uint liveMirrorSlot;
+    /* WMTASPrepassWriteShadow in winemetal.h: publish build/refit TLAS shadow and metadata. */
+    uint flags;
+    ShadowMetadata metadata;
 };
+
+constant uint kASPrepassWriteShadow = 1;
+static_assert(sizeof(D3DALLOYASPrepassParams) == 96, "AS prepass ABI");
 
 kernel void
 d3dalloy_as_prepass(
@@ -257,6 +305,8 @@ d3dalloy_as_prepass(
   if (tid == 0) {
     header[0] = params.asResourceID;
     header[1] = params.contributionsAddress;
+    if (params.flags & kASPrepassWriteShadow)
+      *((device ShadowMetadata *)((device uchar *)header + 16)) = params.metadata;
 
     /*
      * The version this build publishes, written beside the header in the same instruction
@@ -281,30 +331,48 @@ d3dalloy_as_prepass(
   }
   const ulong dst = (ulong)tid * (ulong)params.dstInstanceStride;
 
+  // One bit-exact instance snapshot feeds the D3D shadow, Metal descriptor and
+  // contribution array, including GPU-produced arrays and arrays of pointers.
+  uint4 row0 = 0, row1 = 0, row2 = 0, packed = 0;
+  if (instance) {
+    if ((ulong(instance) & 15) == 0) {
+      device const uint4 *words = (device const uint4 *)instance;
+      row0 = words[0]; row1 = words[1]; row2 = words[2]; packed = words[3];
+    } else {
+      device const uint *words = (device const uint *)instance;
+      row0 = uint4(words[0], words[1], words[2], words[3]);
+      row1 = uint4(words[4], words[5], words[6], words[7]);
+      row2 = uint4(words[8], words[9], words[10], words[11]);
+      packed = uint4(words[12], words[13], words[14], words[15]);
+    }
+  }
+  if (params.flags & kASPrepassWriteShadow) {
+    device uint4 *shadow = (device uint4 *)((device uchar *)header + 64 + ulong(tid) * 64);
+    shadow[0] = row0; shadow[1] = row1; shadow[2] = row2; shadow[3] = packed;
+  }
+
   /* D3D12 float Transform[3][4] is row-major 3x4; Metal's PackedFloat4x3 stores FOUR columns
    * of three floats, columns[k] = {T[0][k], T[1][k], T[2][k]} (k = 0..3), so the D3D
    * translation T[*][3] lands in columns[3]. */
-  device const float *tf = (device const float *)(instance);
-  device float *out = (device float *)(dstInstances + dst);
-  out[0] = tf[0];
-  out[1] = tf[4];
-  out[2] = tf[8];
-  out[3] = tf[1];
-  out[4] = tf[5];
-  out[5] = tf[9];
-  out[6] = tf[2];
-  out[7] = tf[6];
-  out[8] = tf[10];
-  out[9] = tf[3];
-  out[10] = tf[7];
-  out[11] = tf[11];
+  device uint *out = (device uint *)(dstInstances + dst);
+  out[0] = row0.x;
+  out[1] = row1.x;
+  out[2] = row2.x;
+  out[3] = row0.y;
+  out[4] = row1.y;
+  out[5] = row2.y;
+  out[6] = row0.z;
+  out[7] = row1.z;
+  out[8] = row2.z;
+  out[9] = row0.w;
+  out[10] = row1.w;
+  out[11] = row2.w;
 
   /* word0: InstanceID:24 | InstanceMask:8 ; word1: Contribution:24 | Flags:8 (little endian). */
-  device const uint *words = (device const uint *)(instance + 48);
-  const uint instance_id = words[0] & 0xFFFFFFu;
-  const uint instance_mask = words[0] >> 24;
-  const uint contribution = words[1] & 0xFFFFFFu;
-  const uint flags = words[1] >> 24;
+  const uint instance_id = packed.x & 0xFFFFFFu;
+  const uint instance_mask = packed.x >> 24;
+  const uint contribution = packed.y & 0xFFFFFFu;
+  const uint flags = packed.y >> 24;
 
   device uint *tail = (device uint *)(dstInstances + dst + 48);
   /* MTLAccelerationStructureInstanceOptions is a straight bit copy of the D3D flags
@@ -319,11 +387,11 @@ d3dalloy_as_prepass(
   /* AccelerationStructure field: D3D12_GPU_VIRTUAL_ADDRESS of the bottom-level structure. Every
    * acceleration-structure address d3dalloy builds into holds the d3dalloy header, whose first 8 bytes
    * are the Metal resource id the TLAS build needs. */
-  device const ulong *as_address = (device const ulong *)(instance + 56);
+  const ulong as_address = ulong(packed.z) | (ulong(packed.w) << 32);
   device ulong *resource_id = (device ulong *)(dstInstances + dst + 64);
   /* A NULL bottom-level address is a legal, inactive instance: resource id 0 is never
    * intersected (and the instance still occupies its InstanceIndex). */
-  resource_id[0] = as_address[0] ? ((device const ulong *)(as_address[0]))[0] : 0ul;
+  resource_id[0] = as_address ? ((device const ulong *)as_address)[0] : 0ul;
 
   contributions[tid] = contribution;
 }

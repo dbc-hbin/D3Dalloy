@@ -751,10 +751,21 @@ void run() {
   CloseHandle(unscaledWaitable);
 }
 
+#include "owned-d3d12-present-history.inc"
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  const bool history_only = argc == 2 && std::strcmp(argv[1], "--history-only") == 0;
+  if (argc != 1 && !history_only)
+    fail("arguments");
   requireOwnedBackend();
+  if (history_only) {
+    std::puts("OWNED_D3D12_PRESENT_HISTORY_BACKEND id=owned-graphics-d3d12");
+    runPresentHistory();
+    return 0;
+  }
   run();
   std::puts("OWNED_D3D12_PRESENT_QUEUES_PASS");
   return 0;

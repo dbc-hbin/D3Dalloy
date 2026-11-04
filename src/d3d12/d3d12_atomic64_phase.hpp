@@ -12,7 +12,9 @@
 namespace d3dalloy {
 class MTLD3D12Device;
 class MTLD3D12Resource;
+class Atomic64PhaseCache;
 struct StandardSwizzleTableUse;
+struct ShaderImmutableConstants;
 
 struct Atomic64PhasePipelines {
   WMT::Reference<WMT::ComputePipelineState> import;
@@ -66,24 +68,40 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device,
     Atomic64PhaseBindings &bindings);
 
 // The queue retains this owner until actual Metal retirement, not commit.
-// Prepare/import/app/export/clear run under one device exclusive phase permit.
+// Prepare/import/app/export run under one SC phase permit. Unknown/aliasing
+// work retains device-wide exclusion; proven private contexts use finite access
+// admission. Legacy stages additionally publish/clear the shared header.
 class Atomic64Phase {
   struct Storage;
 public:
-  explicit Atomic64Phase(std::unique_ptr<Storage> storage);
+  explicit Atomic64Phase(std::shared_ptr<Storage> storage);
   ~Atomic64Phase();
-  HRESULT EncodeImport(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence);
+  // Queue phases can publish the context in an existing texture-import blit.
+  // The default retains the separate publication contract used by work graphs.
+  HRESULT EncodeImport(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence, bool publish_context = false);
   HRESULT EncodeExport(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence);
   HRESULT PublishContext(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence);
   HRESULT ClearContext(WMT::MTL4CommandBuffer command_buffer, WMT::Fence fence);
   uint64_t ContextAddress() const;
+  HRESULT CreatePrivateConstants(const ShaderImmutableConstants &source);
+  WMT::Buffer ConstantsBuffer() const { return constants_; }
+  uint64_t ConstantsOffset() const { return constants_offset_; }
+  // Only successful export/clear retirement returns this context to the cache.
+  // Dropping an unsubmitted or failed lease never makes it reusable.
+  void MarkRetired();
 
 private:
-  std::unique_ptr<Storage> storage_;
+  std::shared_ptr<Storage> storage_;
+  WMT::Reference<WMT::Buffer> constants_;
+  uint64_t constants_offset_ = 0;
+  friend class Atomic64PhaseCache;
   friend HRESULT PrepareAtomic64Phase(MTLD3D12Device *, uint64_t, const Atomic64PhaseBindings &,
-                                      std::shared_ptr<Atomic64Phase> &);
+                                      std::shared_ptr<Atomic64Phase> &, std::shared_ptr<Atomic64PhaseCache> &);
 };
 
+// The cache belongs to one queue, whose device reference outlives its entries.
+// It is created lazily; it must not be owned by the resources' parent device.
 HRESULT PrepareAtomic64Phase(MTLD3D12Device *device, uint64_t participant_bound,
-    const Atomic64PhaseBindings &bindings, std::shared_ptr<Atomic64Phase> &phase);
+    const Atomic64PhaseBindings &bindings, std::shared_ptr<Atomic64Phase> &phase,
+    std::shared_ptr<Atomic64PhaseCache> &cache);
 } // namespace d3dalloy

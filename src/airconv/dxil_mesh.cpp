@@ -380,7 +380,7 @@ llvm::Error define_mesh_outputs(
 /** `for (i = tid; i < count; i += step) body(i)` at the builder; continues after the loop. */
 template <typename Body>
 void emit_strided_loop(
-  llvm::IRBuilder<> &b, llvm::Function *function, llvm::Value *tid, uint32_t count, uint32_t step, Body body
+  llvm::IRBuilder<> &b, llvm::Function *function, llvm::Value *tid, llvm::Value *count, uint32_t step, Body body
 ) {
   auto *pre = b.GetInsertBlock();
   auto *header = llvm::BasicBlock::Create(b.getContext(), "mesh_loop", function);
@@ -390,7 +390,7 @@ void emit_strided_loop(
   b.SetInsertPoint(header);
   auto *i = b.CreatePHI(b.getInt32Ty(), 2);
   i->addIncoming(tid, pre);
-  b.CreateCondBr(b.CreateICmpULT(i, b.getInt32(count)), loop_body, exit);
+  b.CreateCondBr(b.CreateICmpULT(i, count), loop_body, exit);
   b.SetInsertPoint(loop_body);
   body(i);
   auto *next = b.CreateAdd(i, b.getInt32(step));
@@ -654,6 +654,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
               op && op->getZExtValue() >= OP_SET_MESH_OUTPUT_COUNTS && op->getZExtValue() <= OP_DISPATCH_MESH)
             calls.push_back(call);
 
+  llvm::CallInst *set_counts = nullptr;
   bool dispatched = false;
   for (auto *call : calls) {
     const uint32_t op = (uint32_t)llvm::cast<llvm::ConstantInt>(call->getArgOperand(0))->getZExtValue();
@@ -662,12 +663,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
       return createError("dx.op " + llvm::Twine(op) + " is not available in this stage");
     switch (op) {
     case OP_SET_MESH_OUTPUT_COUNTS:
-      builder.SetInsertPoint(call);
-      /* The vertex count is implicit in Metal: vertices past it are never referenced. */
-      air.CreateSetMeshPrimitiveCount(builder.CreateZExtOrTrunc(call->getArgOperand(2), builder.getInt32Ty()));
-      if (stats_count)
-        builder.CreateStore(builder.CreateZExtOrTrunc(call->getArgOperand(2), builder.getInt32Ty()), stats_count);
-      call->eraseFromParent();
+      if (set_counts) return createError("multiple SetMeshOutputCounts calls");
+      set_counts = call;
       break;
     case OP_EMIT_INDICES: {
       builder.SetInsertPoint(call);
@@ -718,7 +715,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
       if (payload) {
         auto *src = builder.CreateBitCast(source, builder.getInt32Ty()->getPointerTo(3));
         auto *dst = builder.CreateBitCast(payload, builder.getInt32Ty()->getPointerTo((uint32_t)air::AddressSpace::object_data));
-        emit_strided_loop(builder, function, thread_index, payload_size / 4, threads, [&](llvm::Value *i) {
+        emit_strided_loop(builder, function, thread_index, builder.getInt32(payload_size / 4), threads, [&](llvm::Value *i) {
           builder.CreateStore(builder.CreateLoad(builder.getInt32Ty(), builder.CreateGEP(builder.getInt32Ty(), src, i)),
                               builder.CreateGEP(builder.getInt32Ty(), dst, i));
         });
@@ -726,7 +723,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
           auto *src8 = builder.CreateBitCast(source, builder.getInt8Ty()->getPointerTo(3));
           auto *dst8 = builder.CreateBitCast(payload, builder.getInt8Ty()->getPointerTo((uint32_t)air::AddressSpace::object_data));
           emit_strided_loop(builder, function, builder.CreateAdd(thread_index, builder.getInt32(payload_size & ~3u)),
-                            payload_size, threads, [&](llvm::Value *i) {
+                            builder.getInt32(payload_size), threads, [&](llvm::Value *i) {
             builder.CreateStore(builder.CreateLoad(builder.getInt8Ty(), builder.CreateGEP(builder.getInt8Ty(), src8, i)),
                                 builder.CreateGEP(builder.getInt8Ty(), dst8, i));
           });
@@ -753,15 +750,55 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
   for (auto &output : primitive_outputs)
     if (auto err = lower_output_stores(ctx, output, std::max(max_primitives, 1u)))
       return std::move(err);
-  llvm::EliminateUnreachableBlocks(*function);
-
+  const auto staged = [](const auto &outputs) {
+    return std::any_of(outputs.begin(), outputs.end(), [](const auto &o) { return o.staging; });
+  };
+  const bool vertex_flush = staged(vertex_outputs), primitive_flush = staged(primitive_outputs);
+  llvm::Value *live[2] = {builder.getInt32(0), builder.getInt32(0)};
+  llvm::GlobalVariable *shared[2]{};
+  if (set_counts) {
+    llvm::IRBuilder<> entry(&*entry_bb->getFirstInsertionPt());
+    for (unsigned k = 0; k < 2; ++k) {
+      if (!(k ? primitive_flush || statistics_key : vertex_flush)) continue;
+      auto *count = set_counts->getArgOperand(k + 1);
+      // Zero on paths that skip SetMeshOutputCounts, including early returns.
+      auto *local = entry.CreateAlloca(entry.getInt32Ty());
+      entry.CreateStore(entry.getInt32(0), local);
+      builder.SetInsertPoint(set_counts);
+      auto *bound = builder.getInt32(k ? max_primitives : max_vertices);
+      builder.CreateStore(builder.CreateSelect(builder.CreateICmpULT(count, bound), count, bound), local);
+      builder.SetInsertPoint(epilogue_bb);
+      live[k] = builder.CreateLoad(builder.getInt32Ty(), local);
+      if (!llvm::isa<llvm::ConstantInt>(count) && threads > 1)
+        shared[k] = new llvm::GlobalVariable(module_ir, entry.getInt32Ty(), false, llvm::GlobalValue::InternalLinkage,
+            llvm::UndefValue::get(entry.getInt32Ty()), "mesh.live_count", nullptr, llvm::GlobalValue::NotThreadLocal, 3);
+    }
+    // Legal calls are in uniform control flow. Only the first thread supplies the counts.
+    builder.SetInsertPoint(set_counts);
+    auto *primitives = set_counts->getArgOperand(2);
+    if (threads > 1 && (!llvm::isa<llvm::ConstantInt>(primitives) || stats_count))
+      builder.SetInsertPoint(llvm::SplitBlockAndInsertIfThen(
+          builder.CreateICmpEQ(thread_index, builder.getInt32(0)), set_counts, false));
+    air.CreateSetMeshPrimitiveCount(primitives);
+    if (stats_count) builder.CreateStore(primitives, stats_count);
+    set_counts->eraseFromParent();
+  }
   builder.SetInsertPoint(epilogue_bb);
-  auto flush = [&](std::vector<OutputElement> &outputs, uint32_t count) {
-    bool staged = std::any_of(outputs.begin(), outputs.end(), [](auto &o) { return o.staging; });
-    if (!staged)
-      return;
+  if (shared[0] || shared[1]) {
+    auto *first = llvm::BasicBlock::Create(llvm_context, "mesh_counts_first", function);
+    auto *done = llvm::BasicBlock::Create(llvm_context, "mesh_counts_ready", function);
+    builder.CreateCondBr(builder.CreateICmpEQ(thread_index, builder.getInt32(0)), first, done);
+    builder.SetInsertPoint(first);
+    for (unsigned k = 0; k < 2; ++k) if (shared[k]) builder.CreateStore(live[k], shared[k]);
+    builder.CreateBr(done);
+    builder.SetInsertPoint(done);
+  }
+  if (vertex_flush || primitive_flush || shared[1]) {
     auto *barrier = air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
     barrier->setMetadata("d3dalloy.mesh.output_barrier", llvm::MDTuple::get(llvm_context, {}));
+    for (unsigned k = 0; k < 2; ++k) if (shared[k]) live[k] = builder.CreateLoad(builder.getInt32Ty(), shared[k]);
+  }
+  auto flush = [&](std::vector<OutputElement> &outputs, llvm::Value *count) {
     emit_strided_loop(builder, function, thread_index, count, threads, [&](llvm::Value *i) {
       for (auto &output : outputs) {
         if (!output.staging)
@@ -779,8 +816,8 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
       }
     });
   };
-  flush(vertex_outputs, std::max(max_vertices, 1u));
-  flush(primitive_outputs, std::max(max_primitives, 1u));
+  if (vertex_flush) flush(vertex_outputs, live[0]);
+  if (primitive_flush) flush(primitive_outputs, live[1]);
   if (statistics_key) {
     auto *i32 = builder.getInt32Ty();
     auto *group = new llvm::GlobalVariable(
@@ -799,7 +836,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
     builder.SetInsertPoint(taken_bb);
     air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
     auto *number = builder.CreateLoad(i32, group);
-    emit_strided_loop(builder, function, thread_index, std::max(max_primitives, 1u), threads, [&](llvm::Value *p) {
+    emit_strided_loop(builder, function, thread_index, live[1], threads, [&](llvm::Value *p) {
       dxbc::set_mesh_statistics_key(builder, air, p, number, builder.CreateAdd(p, builder.getInt32(1)),
                                     builder.getInt32(1), primitive_key_index);
     });
@@ -839,6 +876,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerMeshStage(
     builder.SetInsertPoint(done_bb);
   }
   builder.CreateRetVoid();
+  llvm::EliminateUnreachableBlocks(*function);
 
   module_ir.getOrInsertNamedMetadata(mesh ? "air.mesh" : "air.object")->addOperand(function_metadata);
   return std::move(binding_map);

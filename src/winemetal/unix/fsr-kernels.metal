@@ -455,6 +455,26 @@ kernel void yaagl_fg_normalize_depth_motion(
                                            depthValue.r, params), tid);
 }
 
+// At exact 2x enlargement the four texel centers all map to the same depth
+// sample. Keep reprojection at each output position while sharing its winner.
+kernel void yaagl_fg_normalize_depth_motion_2x(
+    texture2d<float, access::read> source [[texture(0)]],
+    texture2d<half, access::write> destination [[texture(1)]],
+    texture2d<float, access::write> depth [[texture(2)]],
+    texture2d<float, access::read> sourceDepth [[texture(4)]],
+    constant YaaglFgParams& params [[buffer(0)]],
+    uint2 center [[thread_position_in_grid]]) {
+    uint2 winner = fg_nearest_depth(sourceDepth, center, params.depthSourceExtent,
+                                    params.depthInverted != 0u, params.sceneOrigin);
+    float4 depthValue = sourceDepth.read(params.sceneOrigin + winner);
+    uint2 mv = fg_motion_position(center * 2u, winner, params);
+    for (uint y = 0; y < 2; ++y) for (uint x = 0; x < 2; ++x) {
+        uint2 tid = center * 2u + uint2(x, y);
+        depth.write(depthValue, tid);
+        destination.write(fg_normalized_motion(source, tid, mv, depthValue.r, params), tid);
+    }
+}
+
 kernel void yaagl_fg_encode_scatter(
     texture2d<float, access::read> source [[texture(0)]],
     texture2d<float, access::write> destination [[texture(1)]],

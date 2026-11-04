@@ -1,5 +1,6 @@
 // FSR/NGX resource translation to native MetalFX; owned Metal4 transport.
 #include "metalfx_frame_generation.hpp"
+#include "metalfx_texture_access.hpp"
 #include "../winemetal_metal4_fg.h"
 #include "fsr-kernels.inc"
 #import <Foundation/Foundation.h>
@@ -426,6 +427,7 @@ struct Kernels {
     Object depthPipeline;
     Object motionPipeline;
     Object depthMotionPipeline;
+    Object depthMotion2xPipeline;
     Object encodePipeline;
     Object distortionPipeline;
 };
@@ -454,6 +456,7 @@ std::shared_ptr<const Kernels> deviceKernels(id<MTLDevice> device) {
     result->depthPipeline = makePipeline(device, library, @"yaagl_fg_resample_depth");
     result->motionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_motion");
     result->depthMotionPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion");
+    result->depthMotion2xPipeline = makePipeline(device, library, @"yaagl_fg_normalize_depth_motion_2x");
     result->encodePipeline = makePipeline(device, library, @"yaagl_fg_encode_scatter");
     result->distortionPipeline = makePipeline(device, library, @"yaagl_fg_decode_distortion");
     if (!result->decodePipeline || !result->depthPipeline || !result->motionPipeline ||
@@ -970,7 +973,8 @@ bool dispatchPass(id encoderObject, id table, id<MTLComputePipelineState> pipeli
                   id<MTLTexture> source, id<MTLTexture> destination, id<MTLBuffer> parameterBuffer,
                   ParameterSlot slot, const FgParams& params,
                   id<MTLTexture> depth = nil, id<MTLTexture> motion = nil,
-                  id<MTLTexture> ui = nil, id<MTLTexture> scene = nil, id<MTLTexture> present = nil) {
+                  id<MTLTexture> ui = nil, id<MTLTexture> scene = nil, id<MTLTexture> present = nil,
+                  const Kernels* fusedGuides = nullptr) {
     if (!pipeline || !source || !destination || !parameterBuffer || !table || !encoderObject) return false;
     if (@available(macOS 26.0, *)) {
         auto arguments = (id<MTL4ArgumentTable>)table;
@@ -987,9 +991,13 @@ bool dispatchPass(id encoderObject, id table, id<MTLComputePipelineState> pipeli
         [arguments setTexture:(ui ? ui : source).gpuResourceID atIndex:4];
         [arguments setTexture:(scene ? scene : source).gpuResourceID atIndex:5];
         [arguments setTexture:(present ? present : source).gpuResourceID atIndex:6];
-        [encoder setComputePipelineState:pipeline];
+        const bool group2x = fusedGuides && fusedGuides->depthMotion2xPipeline && params.depthDilation &&
+            params.extent[0] == 2ull * params.depthSourceExtent[0] &&
+            params.extent[1] == 2ull * params.depthSourceExtent[1];
+        const auto* grid = group2x ? params.depthSourceExtent : params.extent;
+        [encoder setComputePipelineState:group2x ? (id<MTLComputePipelineState>)fusedGuides->depthMotion2xPipeline.get() : pipeline];
         [encoder setArgumentTable:arguments];
-        [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1)
+        [encoder dispatchThreads:MTLSizeMake(grid[0], grid[1], 1)
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         return true;
     }
@@ -1172,7 +1180,8 @@ bool PreparedFrame::encode(
                                                                              : selected.kernels->motionPipeline.get()),
                             (id<MTLTexture>)impl_->second.get(),(id<MTLTexture>)snapshot.motion.get(),
                             (id<MTLBuffer>)parameterLease->object.get(),MotionSlot,params,
-                            (id<MTLTexture>)snapshot.depth.get(),nil,(id<MTLTexture>)impl_->first.get());
+                            (id<MTLTexture>)snapshot.depth.get(),nil,(id<MTLTexture>)impl_->first.get(),nil,nil,
+                            plan->depthConversion ? selected.kernels.get() : nullptr);
                         else {
                             params.sourceOrigin[0] = params.sceneOrigin[0]; params.sourceOrigin[1] = params.sceneOrigin[1];
                             params.sourceExtent[0] = snapshot.depthWidth; params.sourceExtent[1] = snapshot.depthHeight;
@@ -1430,7 +1439,25 @@ bool PreparedFrame::encode(
                                    toTexture:copy.destination destinationSlice:0 destinationLevel:0
                            destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
                 }
-                if (copyCount)
+                // The copies publish caller outputs (or a distortion crop);
+                // decode/normalization write only execution-owned scratch.
+                // Keep the barrier whenever a copy destination can overlap a
+                // compute input, including different views of placed storage.
+                const std::array<id<MTLTexture>, 5> prepassInputs{{
+                    (id<MTLTexture>)sceneView.get(),
+                    ui && !sharedSceneUi ? (id<MTLTexture>)presentView.get() : nil,
+                    decodeDistortion ? distortionSource : nil,
+                    !directDepth || !directMotion ? (id<MTLTexture>)impl_->snapshot->depth.get() : nil,
+                    !directMotion ? (id<MTLTexture>)impl_->snapshot->motion.get() : nil,
+                }};
+                bool copyDependency = false;
+                for (unsigned i = 0; i != copyCount && !copyDependency; ++i)
+                    for (auto input : prepassInputs)
+                        if (!metalfx::texturesDisjoint(copies[i].destination, input)) {
+                            copyDependency = true;
+                            break;
+                        }
+                if (copyDependency)
                     [prepass barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch
                                      visibilityOptions:MTL4VisibilityOptionDevice];
                 if (!dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
@@ -1451,7 +1478,7 @@ bool PreparedFrame::encode(
                                       (id<MTLComputePipelineState>)configuration.kernels->depthMotionPipeline.get(),
                                       (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
                                       parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
-                                      (id<MTLTexture>)impl_->snapshot->depth.get()))
+                                      (id<MTLTexture>)impl_->snapshot->depth.get(), nil, nil, configuration.kernels.get()))
                         return fail("encode_depth_motion_normalize");
                 } else if (!directDepth) {
                     if (!dispatchPass(prepass, table,

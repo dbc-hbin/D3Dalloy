@@ -830,6 +830,7 @@ struct TsgsResult {
   std::vector<float> records;
   uint64_t filled = 0;
   D3D12_QUERY_DATA_PIPELINE_STATISTICS statistics{};
+  D3D12_QUERY_DATA_SO_STATISTICS soStatistics{};
   std::array<uint32_t, kSize * kSize> texels{};
 };
 
@@ -912,17 +913,29 @@ enum class TsgsDraw {
 
 TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool quad,
                     const tess_oracle::Factors &factors, bool so, bool statistics, TsgsDraw mode = TsgsDraw::Direct,
-                    UINT instances = 1) {
+                    UINT instances = 1, const char *frontierCase = nullptr) {
   TsgsResult result;
-  const auto vertices = tsgsVertices(quad);
+  auto vertices = tsgsVertices(quad);
+  const UINT vertexCount = UINT(vertices.size() / 2);
+  if (frontierCase) {
+    const auto first = vertices;
+    for (size_t i = 0; i < first.size(); i += 2) {
+      vertices.push_back(first[i] + 1.0f / 32.0f);
+      vertices.push_back(first[i + 1]);
+    }
+  }
   auto vb = buffer(c.device.Get(), vertices.size() * sizeof(float), D3D12_HEAP_TYPE_UPLOAD,
                    D3D12_RESOURCE_STATE_GENERIC_READ);
   void *mapped = nullptr;
   check(vb->Map(0, nullptr, &mapped), "tsgs-map-vertices");
   std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(float));
   vb->Unmap(0, nullptr);
-  const UINT vertexCount = UINT(vertices.size() / 2);
   const bool indirect = mode == TsgsDraw::Indirect || mode == TsgsDraw::IndirectTwice;
+  if (frontierCase && indirect) {
+    std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=tessellation shader=%s case=%s begin\n",
+                 useDxil ? "dxil" : "dxbc", frontierCase);
+    std::fflush(stderr);
+  }
   ComPtr<ID3D12Resource> argsUpload, args;
   ComPtr<ID3D12CommandSignature> signature;
   constexpr UINT kCommands = 4, kArgBytes = kCommands * sizeof(D3D12_DRAW_ARGUMENTS) + 16;
@@ -931,7 +944,7 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
       D3D12_DRAW_ARGUMENTS commands[kCommands];
       UINT count[4];
     } words = {{{vertexCount, instances, 0, 0},
-                {mode == TsgsDraw::IndirectTwice ? vertexCount : 0, instances, 0, 0},
+                {mode == TsgsDraw::IndirectTwice ? vertexCount : 0, instances, frontierCase ? vertexCount : 0, 0},
                 {0x40000000u, 0x10000u, 0, 0},
                 {0x40000000u, 0x10000u, 0, 0}},
                {2, 0, 0, 0}};
@@ -948,6 +961,14 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
     desc.NumArgumentDescs = 1;
     desc.pArgumentDescs = &argument;
     check(c.device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature)), "tsgs-indirect-signature");
+  }
+  ComPtr<ID3D12QueryHeap> soQuery;
+  ComPtr<ID3D12Resource> soQueryReadback;
+  if (frontierCase && so) {
+    D3D12_QUERY_HEAP_DESC queryDesc{D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 1, 0};
+    check(c.device->CreateQueryHeap(&queryDesc, IID_PPV_ARGS(&soQuery)), "frontier-so-query");
+    soQueryReadback = buffer(c.device.Get(), sizeof(result.soStatistics), D3D12_HEAP_TYPE_READBACK,
+                             D3D12_RESOURCE_STATE_COPY_DEST);
   }
   c.begin();
   if (indirect) {
@@ -993,12 +1014,19 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
     c.list->SOSetTargets(0, 1, &target);
   if (statistics)
     c.list->BeginQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+  if (soQuery)
+    c.list->BeginQuery(soQuery.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
   if (indirect)
     c.list->ExecuteIndirect(signature.Get(), kCommands, args.Get(), 0, args.Get(),
                             kCommands * sizeof(D3D12_DRAW_ARGUMENTS));
   else
     for (int i = 0; i < (mode == TsgsDraw::DirectTwice ? 2 : 1); ++i)
-      c.list->DrawInstanced(vertexCount, instances, 0, 0);
+      c.list->DrawInstanced(vertexCount, instances, frontierCase ? UINT(i) * vertexCount : 0, 0);
+  if (soQuery) {
+    c.list->EndQuery(soQuery.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0);
+    c.list->ResolveQueryData(soQuery.Get(), D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0, 0, 1,
+                            soQueryReadback.Get(), 0);
+  }
   if (statistics) {
     c.list->EndQuery(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
     c.list->ResolveQueryData(c.statistics.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1,
@@ -1062,7 +1090,18 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
   std::memcpy(&result.filled, static_cast<uint8_t *>(mapped) + kSoBytes, sizeof(result.filled));
   const auto *floats = static_cast<const float *>(mapped);
   result.records.assign(floats, floats + std::min<uint64_t>(result.filled, kSoBytes) / 4);
+  if (frontierCase) {
+    const auto *bytes = static_cast<const uint8_t *>(mapped);
+    require(std::all_of(bytes + kSoBytes + 8, bytes + kSoBytes + 256,
+                        [](uint8_t value) { return value == 0; }), "frontier-ts-so-tail-guard");
+  }
   t.soReadback->Unmap(0, &none);
+  if (soQuery) {
+    range = {0, sizeof(result.soStatistics)};
+    check(soQueryReadback->Map(0, &range, &mapped), "frontier-so-query-map");
+    std::memcpy(&result.soStatistics, mapped, sizeof(result.soStatistics));
+    soQueryReadback->Unmap(0, &none);
+  }
   if (statistics) {
     range = {0, sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS)};
     check(c.statisticsReadback->Map(0, &range, &mapped), "tsgs-map-statistics");
@@ -1074,6 +1113,11 @@ TsgsResult drawTsgs(Context &c, TsgsContext &t, ID3D12PipelineState *pso, bool q
   for (UINT y = 0; y < kSize; ++y)
     std::memcpy(result.texels.data() + y * kSize, static_cast<uint8_t *>(mapped) + y * kPitch, kSize * 4);
   c.readback->Unmap(0, &none);
+  if (frontierCase && indirect) {
+    std::fprintf(stderr, "OWNED_D3D12_CAPTURE_FRONTIER_PHASE suite=tessellation shader=%s case=%s end\n",
+                 useDxil ? "dxil" : "dxbc", frontierCase);
+    std::fflush(stderr);
+  }
   return result;
 }
 
@@ -1173,13 +1217,15 @@ int runTsgsCase(Context &c, TsgsContext &t, const char *name, const std::vector<
 int runTsgsIndirectCase(Context &c, TsgsContext &t, const char *name, const std::vector<uint8_t> &vs,
                         const std::vector<uint8_t> &hs, const std::vector<uint8_t> &ds, const std::vector<uint8_t> &gs,
                         const std::vector<uint8_t> &ps, bool quad, const tess_oracle::Factors &factors, bool so,
-                        bool twice) {
+                        bool twice, UINT instances = 1, bool frontier = false) {
   ComPtr<ID3D12PipelineState> pso;
   check(tsgsPipeline(c, t, vs, hs, ds, &gs, ps, so, pso), "tsgs-indirect-pso");
   const TsgsResult direct =
-      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::DirectTwice : TsgsDraw::Direct);
+      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::DirectTwice : TsgsDraw::Direct,
+               instances, frontier ? name : nullptr);
   const TsgsResult got =
-      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::IndirectTwice : TsgsDraw::Indirect);
+      drawTsgs(c, t, pso.Get(), quad, factors, so, true, twice ? TsgsDraw::IndirectTwice : TsgsDraw::Indirect,
+               instances, frontier ? name : nullptr);
   auto sorted = [](std::vector<uint32_t> v) {
     std::sort(v.begin(), v.end());
     return v;
@@ -1189,7 +1235,7 @@ int runTsgsIndirectCase(Context &c, TsgsContext &t, const char *name, const std:
                      std::any_of(got.texels.begin(), got.texels.end(), [](uint32_t t) { return t == 0xff00ff00u; });
   const bool output = got.filled == direct.filled && got.records == direct.records && (!so || got.filled > 0);
   const bool stats = std::memcmp(&r, &s, sizeof(r)) == 0 && s.GSInvocations > 0 &&
-                     s.HSInvocations == (twice ? 4u : 2u);
+                     s.HSInvocations == (twice ? 4u : 2u) * instances;
   const bool shaders = got.points == direct.points && got.dsInvocations == direct.dsInvocations &&
                        got.gsInvocations == direct.gsInvocations && sorted(got.ids) == sorted(direct.ids);
   if (!(image && output && stats && shaders)) {
@@ -1203,9 +1249,26 @@ int runTsgsIndirectCase(Context &c, TsgsContext &t, const char *name, const std:
                  s.IAVertices, r.IAVertices);
     fail(name);
   }
-  std::printf("%s_CASE_PASS shader=%s case=%s domain=%s samples=%u commands=%u gs=%u so_vertices=%llu ps=%llu\n",
+  if (frontier) {
+    require(got.filled == 93312 && got.gsInvocations == 648 && got.statistics.HSInvocations == 36 &&
+            got.soStatistics.NumPrimitivesWritten == 1296 && got.soStatistics.PrimitivesStorageNeeded == 1296 &&
+            std::memcmp(&got.soStatistics, &direct.soStatistics, sizeof(got.soStatistics)) == 0,
+            "frontier-tsgs-complete-shader-and-so-counts");
+    // Every child record retains its original draw instance, even when its parent survives
+    // several scheduler slots/quanta. Command 1 has a different VB position, checked above.
+    constexpr size_t verticesPerInstance = 2 * 18 * 2 * 3;
+    for (size_t record = 0; record < got.records.size() / kSoRecordFloats; ++record) {
+      const UINT instance = UINT(record / verticesPerInstance) % instances;
+      require(got.records[record * kSoRecordFloats + 2] == float(instance) / 64.0f,
+              "frontier-tsgs-global-instance-order");
+    }
+    std::printf("%s_CAPTURE_FRONTIER_PASS shader=%s case=%s parent_once=1 ordered_so=1 "
+                "commands=2 instances=9 gs=648 written=1296 needed=1296 bytes=93312\n",
+                kPrefix, useDxil ? "dxil" : "dxbc", name);
+  }
+  std::printf("%s_CASE_PASS shader=%s case=%s domain=%s samples=%u commands=%u instances=%u gs=%u so_vertices=%llu ps=%llu\n",
               kPrefix, useDxil ? "dxil" : "dxbc", name, quad ? "quad" : "tri", c.samples, twice ? 2u : 1u,
-              got.gsInvocations, (unsigned long long)(got.filled / (kSoRecordFloats * 4)),
+              instances, got.gsInvocations, (unsigned long long)(got.filled / (kSoRecordFloats * 4)),
               (unsigned long long)s.PSInvocations);
   return 1;
 }
@@ -1254,6 +1317,102 @@ int runTsgsCases(Context &c, const std::vector<uint8_t> &vs, const std::vector<u
   cases += runTsgsIndirectCase(c, t, "tsgs-indirect-so", vs, hs_tri, ds_tri, gs, ps, false, integral, true, true);
   cases += runTsgsIndirectCase(c, t, "tsgs-indirect-so-fractional", vs, hs_quad_odd, ds_quad, gs, ps, true, fractional,
                                true, false);
+  // Nine instances of two quad patches reserve 1152 workload slots, exceeding the single-group compact path.
+  cases += runTsgsIndirectCase(c, t, "tsgs-indirect-scan", vs, hs_quad, ds_quad, gs, ps, true, integral, true, true, 9);
+  const auto frontier_vs = shader("vs_frontier", "vs_5_0");
+  cases += runTsgsIndirectCase(c, t, "tsgs-frontier-parent-child-order", frontier_vs, hs_quad, ds_quad, gs, ps,
+                               true, integral, true, true, 9, true);
+  {
+    // Reflection's 16 KiB object-payload bound selects 4 patches per HS group:
+    // W67 needs 268 static slots. The final workload holds the last point; only two patches are active.
+    const auto point_hs = shader("hs_quad_integer_point", "hs_5_0");
+    ComPtr<ID3D12PipelineState> point_pipeline;
+    check(tsgsPipeline(c, t, frontier_vs, point_hs, ds_quad, nullptr, ps, true, point_pipeline),
+          "frontier-point67-pso");
+    const tess_oracle::Factors maximum{{64, 64, 64, 64}, {64, 64}};
+    const char *name = "ds-frontier-point67-overflow";
+    const auto direct = drawTsgs(c, t, point_pipeline.Get(), true, maximum, true, true,
+                                 TsgsDraw::Direct, 1, name);
+    const auto got = drawTsgs(c, t, point_pipeline.Get(), true, maximum, true, true,
+                              TsgsDraw::Indirect, 1, name);
+    PointSet points;
+    // PointSet is a multiset: each of the two patches contributes the complete
+    // 65-by-65 domain grid, including a second copy of every identical UV pair.
+    for (UINT patch = 0; patch < 2; ++patch)
+      for (UINT y = 0; y <= 64; ++y)
+        for (UINT x = 0; x <= 64; ++x)
+          points.insert({long(x * 1024), long(y * 1024)});
+    struct PointLatticeResult {
+      long maxDelta;
+      UINT wrongMultiplicity;
+    };
+    auto inspectPoints = [&](const char *source, const PointSet &observed) {
+      std::map<std::pair<long, long>, UINT> multiplicities;
+      long worst = 0;
+      UINT shown = 0;
+      for (const auto &[u, v] : observed) {
+        const long gridU = std::clamp(std::lround(double(u) / 1024.0), 0L, 64L) * 1024;
+        const long gridV = std::clamp(std::lround(double(v) / 1024.0), 0L, 64L) * 1024;
+        const long delta = std::max(std::abs(u - gridU), std::abs(v - gridV));
+        worst = std::max(worst, delta);
+        ++multiplicities[{gridU, gridV}];
+        if (delta && shown++ < 16)
+          std::fprintf(stderr, "%s_FRONTIER_POINT67_DELTA shader=%s source=%s observed=%ld,%ld "
+                       "lattice=%ld,%ld delta=%ld\n", kPrefix, useDxil ? "dxil" : "dxbc",
+                       source, u, v, gridU, gridV, delta);
+      }
+      UINT wrongMultiplicity = 0;
+      for (UINT y = 0; y <= 64; ++y)
+        for (UINT x = 0; x <= 64; ++x)
+          wrongMultiplicity += multiplicities[{long(x * 1024), long(y * 1024)}] != 2;
+      std::fprintf(stderr, "%s_FRONTIER_POINT67_COORDINATES shader=%s source=%s max_delta=%ld "
+                   "wrong_multiplicity=%u lattice_points=%zu tolerance=%ld\n",
+                   kPrefix, useDxil ? "dxil" : "dxbc", source, worst, wrongMultiplicity,
+                   multiplicities.size(), kTolerance);
+      return PointLatticeResult{worst, wrongMultiplicity};
+    };
+    const auto candidateLattice = inspectPoints("indirect", got.points);
+    const auto directLattice = inspectPoints("direct", direct.points);
+    std::fprintf(stderr, "%s_FRONTIER_POINT67_EQUAL shader=%s candidate_direct=%u candidate_lattice=%u "
+                 "direct_lattice=%u candidate_delta=%ld direct_delta=%ld\n", kPrefix,
+                 useDxil ? "dxil" : "dxbc", UINT(got.points == direct.points), UINT(got.points == points),
+                 UINT(direct.points == points), candidateLattice.maxDelta, directLattice.maxDelta);
+    std::fprintf(stderr, "%s_FRONTIER_POINT67_OBSERVED shader=%s points=%zu/%zu expected=%zu "
+                 "ds=%u/%u hs=%llu/%llu stats_ds=%llu/%llu gs=%llu/%llu filled=%llu/%llu "
+                 "written=%llu/%llu needed=%llu/%llu\n",
+                 kPrefix, useDxil ? "dxil" : "dxbc", got.points.size(), direct.points.size(), points.size(),
+                 got.dsInvocations, direct.dsInvocations,
+                 (unsigned long long)got.statistics.HSInvocations, (unsigned long long)direct.statistics.HSInvocations,
+                 (unsigned long long)got.statistics.DSInvocations, (unsigned long long)direct.statistics.DSInvocations,
+                 (unsigned long long)got.statistics.GSInvocations, (unsigned long long)direct.statistics.GSInvocations,
+                 (unsigned long long)got.filled, (unsigned long long)direct.filled,
+                 (unsigned long long)got.soStatistics.NumPrimitivesWritten,
+                 (unsigned long long)direct.soStatistics.NumPrimitivesWritten,
+                 (unsigned long long)got.soStatistics.PrimitivesStorageNeeded,
+                 (unsigned long long)direct.soStatistics.PrimitivesStorageNeeded);
+    std::fflush(stderr);
+    // Native tessellation uses the same 2^-15 coordinate precision as the existing
+    // oracle cases. Keep exact candidate/direct coordinates and two visits to every
+    // lattice point; apply kTolerance only when comparing with the independent grid.
+    require(got.points == direct.points && got.points.size() == points.size() &&
+            candidateLattice.maxDelta <= kTolerance && directLattice.maxDelta <= kTolerance &&
+            candidateLattice.wrongMultiplicity == 0 && directLattice.wrongMultiplicity == 0 &&
+            got.dsInvocations == 8450 &&
+            direct.dsInvocations == 8450 && got.statistics.HSInvocations == 2 &&
+            got.statistics.DSInvocations == 8450 && got.statistics.GSInvocations == 0,
+            "frontier-point67-all-domain-invocations");
+    require(got.records == direct.records && got.filled == kSoBytes && direct.filled == kSoBytes &&
+            got.texels == direct.texels &&
+            std::memcmp(&got.statistics, &direct.statistics, sizeof(got.statistics)) == 0 &&
+            got.soStatistics.NumPrimitivesWritten == 4096 && got.soStatistics.PrimitivesStorageNeeded == 8450 &&
+            std::memcmp(&got.soStatistics, &direct.soStatistics, sizeof(got.soStatistics)) == 0,
+            "frontier-point67-overflow-still-progresses");
+    std::printf("%s_CAPTURE_FRONTIER_PASS shader=%s case=%s parent_slots=268 workloads=67 "
+                "points=8450 patches=2 per_patch=4225 ds=8450 written=4096 needed=8450 bytes=98304\n",
+                kPrefix, useDxil ? "dxil" : "dxbc", name);
+    casePass(name);
+    ++cases;
+  }
   createTarget(c, 4);
   cases += runTsgsIndirectCase(c, t, "tsgs-indirect-msaa4", vs, hs_quad, ds_quad, gs, ps, true, integral, true, true);
   createTarget(c, 1);

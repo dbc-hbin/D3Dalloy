@@ -199,6 +199,9 @@ public:
   Texture *descriptor;
   WMT::Reference<WMT::Heap> canonicalHeap;
   uint64_t canonicalHeapOffset = 0;
+  // D3D12 publishes the actual native placement extent once at creation.
+  // Zero leaves unknown/shared allocation paths conservatively whole-heap.
+  uint64_t canonicalHeapSize = 0;
   void *mappedMemory;
   uint64_t gpuResourceID;
   mach_port_t machPort;

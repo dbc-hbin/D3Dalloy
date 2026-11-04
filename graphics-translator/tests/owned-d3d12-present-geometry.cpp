@@ -119,7 +119,8 @@ struct Probe {
     require(command, "command-buffer");
     require(allocator, "Metal4 command allocator");
     command.begin(allocator);
-    auto drawable = presenter.encodeCommandsMetal4(command, input, state.metadata, [](auto) {}, [](auto) {});
+    d3dalloy::Presenter::PresentWork work;
+    auto drawable = presenter.encodeCommandsMetal4(command, input, state.metadata, {}, work);
     require(drawable && drawable.texture() && drawable.texture().width() == width &&
             drawable.texture().height() == height, "drawable-size");
     wmtcmd_blit_copy_from_texture_to_buffer copy{};

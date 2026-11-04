@@ -4,6 +4,18 @@
 
 namespace {
 
+void readbackPhaseMarker(const char *name, const char *action) {
+  char line[160];
+  const int length = std::snprintf(line, sizeof(line),
+      "OWNED_D3D12_ATOMIC64_READBACK_PHASE suite=compute case=%s %s\n", name, action);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+    die("atomic64 readback marker length", E_FAIL);
+  DWORD written = 0;
+  if (!WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(length), &written, nullptr))
+    die("atomic64 readback marker write", HRESULT_FROM_WIN32(GetLastError()));
+  if (written != static_cast<DWORD>(length)) die("atomic64 readback marker incomplete", E_FAIL);
+}
+
 void bindPhase(Gpu &gpu, ID3D12RootSignature *root, ID3D12PipelineState *pipeline,
                ID3D12Resource *out, ID3D12Resource *cells, ID3D12Resource *arguments, uint32_t mode = 0) {
   gpu.rawUav(0, out);
@@ -64,6 +76,102 @@ void checkPhase(const char *name, bool work, bool mixed, const std::vector<uint8
   end(name);
 }
 
+void sparseMappingCases(ID3D12Device *device, ID3D12RootSignature *root, ID3D12PipelineState *pipeline) {
+  Gpu gpu(device);
+  constexpr UINT64 tile_bytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = tile_bytes;
+  desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  ComPtr<ID3D12Resource> cells;
+  check(device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+      IID_PPV_ARGS(&cells)), "CreateReservedResource(atomic cells)");
+  D3D12_HEAP_DESC heap_desc{};
+  heap_desc.SizeInBytes = 2 * tile_bytes;
+  heap_desc.Alignment = tile_bytes;
+  heap_desc.Properties = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+  heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+  ComPtr<ID3D12Heap> memory;
+  check(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&memory)), "CreateHeap(atomic tiles)");
+  desc.Width = 64;
+  std::array<ComPtr<ID3D12Resource>, 2> physical;
+  std::array<uint64_t, 16> seed{};
+  seed[0] = 0x1111111100000001ULL;
+  seed[8] = 0x2222222200000002ULL;
+  seed[1] = 0xa11a11a11a11a11aULL;
+  seed[9] = 0xb22b22b22b22b22bULL;
+  auto upload = gpu.constants(seed.data(), sizeof(seed));
+  for (uint32_t tile = 0; tile < physical.size(); ++tile) {
+    check(device->CreatePlacedResource(memory.Get(), tile * tile_bytes, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr, IID_PPV_ARGS(&physical[tile])), "CreatePlacedResource(physical atomic tile)");
+    gpu.list->CopyBufferRegion(physical[tile].Get(), 0, upload.Get(), tile * 64, 64);
+    gpu.transition(physical[tile].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  auto output = gpu.uavBuffer(filled(64));
+  auto input = gpu.buffer(64, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+  uint64_t *mapped_input = nullptr;
+  check(input->Map(0, nullptr, reinterpret_cast<void **>(&mapped_input)), "Map(sparse atomic input)");
+  std::memset(mapped_input, 0, 64);
+  gpu.rawUav(0, output.Get());
+  D3D12_UNORDERED_ACCESS_VIEW_DESC structured{};
+  structured.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  structured.Buffer.NumElements = 8;
+  structured.Buffer.StructureByteStride = 8;
+  device->CreateUnorderedAccessView(cells.Get(), nullptr, &structured, gpu.cpu(1));
+  gpu.rawUav(2, physical[0].Get());
+  std::array<uint64_t, 2> expected_physical{seed[0], seed[8]};
+  for (uint32_t iteration = 0; iteration != 4; ++iteration) {
+    const UINT tile = iteration == 1 ? 1 : 0;
+    const D3D12_TILED_RESOURCE_COORDINATE coordinate{};
+    const D3D12_TILE_REGION_SIZE region{1, FALSE, 0, 0, 0};
+    const UINT count = 1;
+    // Keep the last A mapping unchanged to require a reserved topology hit.
+    if (iteration < 3)
+      gpu.queue->UpdateTileMappings(cells.Get(), 1, &coordinate, &region, memory.Get(), 1,
+          nullptr, &tile, &count, D3D12_TILE_MAPPING_FLAG_NONE);
+    if (iteration) {
+      gpu.transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      for (auto &resource : physical)
+        gpu.transition(resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    gpu.list->SetPipelineState(pipeline);
+    gpu.list->SetComputeRootSignature(root);
+    ID3D12DescriptorHeap *heaps[] = {gpu.heap.Get()};
+    gpu.list->SetDescriptorHeaps(1, heaps);
+    gpu.list->SetComputeRootDescriptorTable(0, gpu.gpu(0));
+    gpu.list->SetComputeRootShaderResourceView(1, input->GetGPUVirtualAddress());
+    gpu.list->Dispatch(1, 1, 1);
+    const uint64_t initial = 0x5555555500000000ULL + iteration * 3;
+    mapped_input[0] = initial;
+    // The structured view moves A -> B -> A; the raw view always names A.
+    // This changes actual alias equivalence while every binding stays fixed.
+    const uint64_t added = initial + 0x100000001ULL;
+    const uint64_t alias_before = tile ? expected_physical[0] : added;
+    const uint64_t alias_modified = 0x8765432100000000ULL | uint32_t(alias_before);
+    const uint64_t cell_before_cas = tile ? added : alias_modified;
+    expected_physical[0] = tile ? alias_modified : 0x123456789abcdef0ULL;
+    if (tile) expected_physical[1] = added;
+    const std::array<uint64_t, 9> expected{initial, alias_before, cell_before_cas, cell_before_cas,
+        expected_physical[0], expected_physical[0], expected_physical[1], seed[1], seed[9]};
+    const auto result = gpu.finish({output.Get(), physical[0].Get(), physical[1].Get()}, nullptr);
+    const std::array<uint64_t, 9> actual{load<uint64_t>(result[0], 0), load<uint64_t>(result[0], 8),
+        load<uint64_t>(result[0], 16), load<uint64_t>(result[0], 24), load<uint64_t>(result[0], 32),
+        load<uint64_t>(result[1], 0), load<uint64_t>(result[2], 0),
+        load<uint64_t>(result[1], 8), load<uint64_t>(result[2], 8)};
+    begin();
+    for (uint32_t word = 0; word < actual.size(); ++word)
+      EXPECT_EQ("sparse", "alias/remapped physical tile", iteration * actual.size() + word, actual[word], expected[word]);
+    std::printf("OWNED_D3D12_ATOMIC64_PHASE_SPARSE iteration=%u tile=%u words=", iteration, tile);
+    for (uint32_t word = 0; word < actual.size(); ++word)
+      std::printf("%s%016llx", word ? "," : "", static_cast<unsigned long long>(actual[word]));
+    std::printf("\n");
+    end("atomic64_sparse_mapping_aliases");
+  }
+  input->Unmap(0, nullptr);
+}
+
 void indirectCases(ID3D12Device *device, ID3D12RootSignature *root, ID3D12PipelineState *prepare,
                    ID3D12PipelineState *returning, ID3D12PipelineState *observe) {
   Gpu gpu(device);
@@ -91,7 +199,9 @@ void indirectCases(ID3D12Device *device, ID3D12RootSignature *root, ID3D12Pipeli
     gpu.list->SetPipelineState(observe);
     gpu.list->Dispatch(1, 1, 1);
     gpu.transition(arguments.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    readbackPhaseMarker(names[mode], "begin");
     const auto result = gpu.finish({output.Get(), cells.Get(), arguments.Get()}, nullptr);
+    readbackPhaseMarker(names[mode], "end");
     checkPhase(names[mode], mode == 0, true, result[0], result[0], result[1]);
     begin();
     for (uint32_t command = 0; command < 3; ++command) {
@@ -280,15 +390,16 @@ int wmain() {
   check(input->Map(0, nullptr, reinterpret_cast<void **>(&mapped_input)), "Map(persistent input)");
   std::memset(mapped_input, 0, 64);
 
+  auto output = gpu.uavBuffer(filled(64));
+  gpu.rawUav(0, output.Get());
+  gpu.structuredUav(1, cells.Get(), 8);
+  gpu.rawUav(2, alias.Get());
   for (uint32_t iteration = 0; iteration != 2; ++iteration) {
     begin();
-    auto output = gpu.uavBuffer(filled(64));
     if (iteration) {
+      gpu.transition(output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       gpu.transition(alias.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
-    gpu.rawUav(0, output.Get());
-    gpu.structuredUav(1, cells.Get(), 8);
-    gpu.rawUav(2, alias.Get());
     gpu.list->SetPipelineState(pipeline.Get());
     gpu.list->SetComputeRootSignature(root.Get());
     ID3D12DescriptorHeap *heaps[] = {gpu.heap.Get()};
@@ -315,6 +426,7 @@ int wmain() {
     end("atomic64_phase_aliases_and_persistent_map");
   }
   input->Unmap(0, nullptr);
+  sparseMappingCases(device.Get(), root.Get(), pipeline.Get());
   ComPtr<ID3D12PipelineState> prepare, returning, observe;
   check(computePso(device.Get(), root.Get(), readFile(L"atomic64-phase-prepare.dxil"), prepare), "prepare pipeline");
   check(computePso(device.Get(), root.Get(), readFile(L"atomic64-phase-returning.dxil"), returning), "returning pipeline");

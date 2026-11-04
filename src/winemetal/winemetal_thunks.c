@@ -1800,8 +1800,11 @@ WMTComputeEncoder_encodeASPrepass(
       info->convert_instances,
       info->version_token,
       info->live_mirror_slot,
+      info->flags,
+      (uint64_t)(uintptr_t)info->shadow_metadata,
   };
-  UNIX_CALL(190, WMTASPack(&params, args, 21));
+  /* The metadata is copied synchronously by the native handler before returning. */
+  UNIX_CALL(190, WMTASPack(&params, args, 23));
   return params.ret[0];
 }
 

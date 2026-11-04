@@ -547,7 +547,7 @@ struct unixcall_mtlintersectiontable_setbuffer {
 /* Acceleration-structure calls. Every argument is transported as a 64-bit word so one
  * structure covers all of them; handles and byte sizes are both naturally 64-bit here. */
 struct unixcall_wmt_as {
-  /* The prepass entry carries the most arguments: 21. */
+  /* The prepass entry carries the most arguments: 23. */
   uint64_t args[24];
   uint64_t ret[3];
 };

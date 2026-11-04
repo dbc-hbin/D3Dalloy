@@ -27,6 +27,8 @@
 using namespace metal;
 using namespace d3dalloy;
 
+#include "d3d12_work_graph_scheduler.metal"
+
 // Publish only bytes changed by a cast shadow; inactive descriptor-table
 // aliases must not overwrite an actively written native allocation.
 kernel void d3d12_cast_merge(device const uchar *shadow [[buffer(0)]],
@@ -234,8 +236,52 @@ struct D3DALLOYMSAATile {
   uint programmable_sample_count;
   float programmable_sample_positions[8][2];
   uint depth_bounds_enabled;
+  uint target_layer, render_width, render_height;
+  uint scissor_left, scissor_top, scissor_right, scissor_bottom;
+  uint task_active;
 };
-static_assert(sizeof(D3DALLOYMSAATile) == 35 * sizeof(uint));
+static_assert(sizeof(D3DALLOYMSAATile) == 43 * sizeof(uint));
+
+// GPU tile tasks keep the original viewport and layer while bounding replay
+// geometry. Fragment outputs still need an exact kill: a zero sample mask alone
+// does not suppress every stencil operation.
+inline bool msaa_task_contains(uint2 pixel, constant D3DALLOYMSAATile &tile) {
+  return tile.task_active && pixel.x >= tile.x && pixel.y >= tile.y &&
+      pixel.x - tile.x < 8 && pixel.y - tile.y < 8 &&
+      pixel.x < tile.render_width && pixel.y < tile.render_height &&
+      pixel.x >= tile.scissor_left && pixel.y >= tile.scissor_top &&
+      pixel.x < tile.scissor_right && pixel.y < tile.scissor_bottom;
+}
+
+inline float4 msaa_fullscreen_position_task(uint vertex_id, constant D3DALLOYMSAATile &tile) {
+  if (!tile.task_active || !tile.render_width || !tile.render_height)
+    return float4(2.0f, 2.0f, 0.0f, 1.0f);
+  const float2 corner = float2((vertex_id << 1) & 2, vertex_id & 2);
+  // Keep every application's 2x2 quad inside the triangle. Exact clipping is
+  // performed by the fragment guard, not by an internal diagonal through a tile.
+  const float2 pixel = float2(tile.x, tile.y) - 2.0f + corner * 12.0f;
+  const float2 extent = float2(tile.render_width, tile.render_height);
+  return float4(pixel / extent * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+
+[[vertex]] float4 msaa_fullscreen_vertex_task(
+    uint vertex_id [[vertex_id]], constant D3DALLOYMSAATile &tile [[buffer(23)]]) {
+  return msaa_fullscreen_position_task(vertex_id, tile);
+}
+
+[[vertex]] D3DALLOYMSAAFullscreenLayerVertex msaa_fullscreen_layer_vertex_task(
+    uint vertex_id [[vertex_id]], constant D3DALLOYMSAATile &tile [[buffer(23)]]) {
+  return {msaa_fullscreen_position_task(vertex_id, tile), tile.target_layer};
+}
+
+[[fragment]] uint msaa_clear_coverage_task(
+    float4 position [[position]], constant D3DALLOYMSAATile &tile [[buffer(23)]]) {
+  if (!msaa_task_contains(uint2(position.xy), tile)) {
+    discard_fragment();
+    return 0;
+  }
+  return 0;
+}
 
 struct D3DALLOYMSAAPixelLayout {
   uint input_record_dwords, output_record_dwords;
@@ -288,23 +334,73 @@ struct D3DALLOYMSAAQueryCoverage {
   uint mask [[sample_mask]];
 };
 
-inline uint4 msaa_coverage_read(texture2d_ms<uint, access::read> coverage, uint2 xy, uint sample) {
+// A task's target layer is GPU-written. Keep the full DSV array bound and
+// select that layer here; the host does not read tile coordinates or layers.
+[[kernel]] void msaa_depth_bounds_probe_single_task(
+    depth2d_array<float, access::read> depth [[texture(0)]], device uint *records [[buffer(0)]],
+    constant D3DALLOYMSAADepthBoundsProbe &probe [[buffer(1)]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]], uint2 pixel [[thread_position_in_grid]]) {
+  if (pixel.x >= 8 || pixel.y >= 8) return;
+  const uint2 xy = uint2(tile.x, tile.y) + pixel;
+  uint mask = 0;
+  if (msaa_task_contains(xy, tile) && xy.x < depth.get_width() && xy.y < depth.get_height() &&
+      tile.target_layer < depth.get_array_size()) {
+    const float z = depth.read(xy, tile.target_layer);
+    mask = probe.min_depth <= probe.max_depth && clamp(probe.min_depth, 0.0f, 1.0f) <= z &&
+           z <= clamp(probe.max_depth, 0.0f, 1.0f) ? 1u : 0u;
+  }
+  records[(pixel.y * 8 + pixel.x) * probe.input_record_dwords + probe.mask_dword] = mask;
+}
+
+[[kernel]] void msaa_depth_bounds_probe_task(
+    depth2d_ms_array<float, access::read> depth [[texture(0)]], device uint *records [[buffer(0)]],
+    constant D3DALLOYMSAADepthBoundsProbe &probe [[buffer(1)]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]], uint2 pixel [[thread_position_in_grid]]) {
+  if (pixel.x >= 8 || pixel.y >= 8) return;
+  const uint2 xy = uint2(tile.x, tile.y) + pixel;
+  uint mask = 0;
+  if (msaa_task_contains(xy, tile) && xy.x < depth.get_width() && xy.y < depth.get_height() &&
+      tile.target_layer < depth.get_array_size()) {
+    for (uint sample = 0; sample < depth.get_num_samples(); ++sample) {
+      const float z = depth.read(xy, tile.target_layer, sample);
+      if (probe.min_depth <= probe.max_depth && clamp(probe.min_depth, 0.0f, 1.0f) <= z &&
+          z <= clamp(probe.max_depth, 0.0f, 1.0f)) mask |= 1u << sample;
+    }
+  }
+  records[(pixel.y * 8 + pixel.x) * probe.input_record_dwords + probe.mask_dword] = mask;
+}
+
+inline uint4 msaa_coverage_read(texture2d_ms<uint, access::read> coverage, uint2 xy, uint sample, uint = 0) {
   return coverage.read(xy, sample);
 }
 
-inline uint4 msaa_coverage_read(texture2d<uint, access::read> coverage, uint2 xy, uint) {
+inline uint4 msaa_coverage_read(texture2d<uint, access::read> coverage, uint2 xy, uint, uint = 0) {
   return coverage.read(xy, 0); // mip zero, not a multisample sample index
+}
+
+inline uint4 msaa_coverage_read(texture2d_ms_array<uint, access::read> coverage, uint2 xy, uint sample, uint layer) {
+  return coverage.read(xy, layer, sample);
+}
+
+inline uint4 msaa_coverage_read(texture2d_array<uint, access::read> coverage, uint2 xy, uint, uint layer) {
+  return coverage.read(xy, layer, 0);
 }
 
 // Visibility counts raster samples, not samples in a single-sample RTV.
 // The original PS has already run into the output record; never invoke it a
 // second time just to answer a query.
-template<typename Coverage>
+template<bool Task = false, typename Coverage>
 inline D3DALLOYMSAAQueryCoverage msaa_query_coverage_impl(
     float4 position, uint sample, constant D3DALLOYMSAATile &tile,
     constant D3DALLOYMSAAPixelLayout &layout, device const uint *outputs, Coverage coverage,
     device const uint *inputs) {
   const uint2 xy = uint2(position.xy);
+  if constexpr (Task) {
+    if (!msaa_task_contains(xy, tile) || sample >= min(tile.sample_count, 8u)) {
+      discard_fragment();
+      return {0};
+    }
+  }
   if (xy.x < tile.x || xy.y < tile.y || xy.x >= tile.x + 8 ||
       xy.y >= tile.y + 8 || sample >= min(tile.sample_count, 8u)) return {0};
   const uint2 local = xy - uint2(tile.x, tile.y);
@@ -317,7 +413,7 @@ inline D3DALLOYMSAAQueryCoverage msaa_query_coverage_impl(
   const bool covered = tile.sample_count > 8
       ? ((inputs[(local.y * 8 + local.x) * layout.input_record_dwords + layout.input_coverage_dword] &
           tile.sample_mask) >> (sample + tile.sample_base)) & 1u
-      : msaa_coverage_read(coverage, xy, sample).x != 0;
+      : msaa_coverage_read(coverage, xy, sample, Task ? tile.target_layer : 0u).x != 0;
   return {writes && covered ? 1u << sample : 0u};
 }
 
@@ -410,6 +506,7 @@ inline float d3dalloy_line_alpha_area(float2 start, float2 end, float2 pixel) {
   return clamp(abs(twice_area) * 0.5f, 0.0f, 1.0f);
 }
 
+template<bool Task = false>
 inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
     float4 position, float center, thread const float *sample_depths,
     float2 line_start, float2 line_end, uint native_coverage,
@@ -457,6 +554,14 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
     helper_center_z[lane] = quad_shuffle(published_anchor, lane);
     for (uint sample = 0; sample < native_count; ++sample)
       helper_sample_z[lane][sample] = quad_shuffle(sample_z[sample], lane);
+  }
+  if constexpr (Task) {
+    // Complete derivative and quad exchange before the exact output kill so
+    // live lanes retain the original helper values at tile/scissor edges.
+    if (!msaa_task_contains(uint2(position.xy), tile)) {
+      discard_fragment();
+      return {0, 0};
+    }
   }
   if (xy.x < 8 && xy.y < 8) {
     device uint *record = records + pixel * layout.input_record_dwords;
@@ -515,11 +620,22 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
                                 native_coverage, tile, layout, records);
 }
 
-[[fragment]] D3DALLOYMSAAMarker msaa_gather_line_depth(
-    D3DALLOYMSAALineInput input [[stage_in]], uint native_coverage [[sample_mask]],
+[[fragment]] D3DALLOYMSAAMarker msaa_gather_depth_task(
+    D3DALLOYMSAANoPixelInput input [[stage_in]], uint native_coverage [[sample_mask]],
     constant D3DALLOYMSAATile &tile [[buffer(23)]],
     constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
     device uint *records [[buffer(21)]]) {
+  float depths[8];
+  for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample)
+    depths[sample] = input.ndc_depth.interpolate_at_sample(sample);
+  return msaa_gather_depth_impl<true>(input.position, input.ndc_depth.interpolate_at_center(), depths,
+                                      float2(0), float2(0), native_coverage, tile, layout, records);
+}
+
+template<bool Task>
+inline D3DALLOYMSAAMarker msaa_gather_line_depth_impl(
+    D3DALLOYMSAALineInput input, uint native_coverage,
+    constant D3DALLOYMSAATile &tile, constant D3DALLOYMSAAPixelLayout &layout, device uint *records) {
   const float2 direction = input.end - input.start;
   const float length_squared = dot(direction, direction);
   const float inverse_length_squared = length_squared > 0.0f ? 1.0f / length_squared : 0.0f;
@@ -532,8 +648,22 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
     const float sample_q = dot(screen_sample - input.start, direction) * inverse_length_squared;
     depths[sample] = mix(input.depth_pair.x, input.depth_pair.y, sample_q);
   }
-  return msaa_gather_depth_impl(input.position, center, depths, input.start, input.end,
-                                native_coverage, tile, layout, records);
+  return msaa_gather_depth_impl<Task>(input.position, center, depths, input.start, input.end,
+                                      native_coverage, tile, layout, records);
+}
+
+[[fragment]] D3DALLOYMSAAMarker msaa_gather_line_depth(
+    D3DALLOYMSAALineInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]], device uint *records [[buffer(21)]]) {
+  return msaa_gather_line_depth_impl<false>(input, native_coverage, tile, layout, records);
+}
+
+[[fragment]] D3DALLOYMSAAMarker msaa_gather_line_depth_task(
+    D3DALLOYMSAALineInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]], device uint *records [[buffer(21)]]) {
+  return msaa_gather_line_depth_impl<true>(input, native_coverage, tile, layout, records);
 }
 
 /* Flat replay outputs of a conservative triangle (msaa_vertex.cpp expandedConservative): the primitive's clip
@@ -556,11 +686,10 @@ struct D3DALLOYMSAAConservativeInput {
 
 // Conservative rasterization: a pixel is covered (every sample) when its square overlaps the clipped, snapped
 // primitive (conservative_polygon.h). Depth is the primitive's plane, extrapolated to every sample.
-[[fragment]] D3DALLOYMSAAMarker msaa_gather_conservative_depth(
-    D3DALLOYMSAAConservativeInput input [[stage_in]], uint native_coverage [[sample_mask]],
-    constant D3DALLOYMSAATile &tile [[buffer(23)]],
-    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
-    device uint *records [[buffer(21)]]) {
+template<bool Task>
+inline D3DALLOYMSAAMarker msaa_gather_conservative_depth_impl(
+    D3DALLOYMSAAConservativeInput input, uint native_coverage,
+    constant D3DALLOYMSAATile &tile, constant D3DALLOYMSAAPixelLayout &layout, device uint *records) {
   const float4 clip_vectors[6] = {input.clip0, input.clip1, input.clip2, input.clip3, input.clip4, input.clip5};
   float clip[24];
   for (uint i = 0; i < 24; i++) clip[i] = clip_vectors[i / 4][i % 4];
@@ -604,8 +733,22 @@ struct D3DALLOYMSAAConservativeInput {
     depths[sample] = center + dot(input.carrier_screen.interpolate_at_sample(sample) - carrier_center, gradient);
   float4 position = input.position;
   position.z = fma(center, tile.max_depth - tile.min_depth, tile.min_depth);
-  return msaa_gather_depth_impl(position, center, depths,
-                                float2(0), float2(0), native_coverage, tile, layout, records, true, covered, inner);
+  return msaa_gather_depth_impl<Task>(position, center, depths,
+                                      float2(0), float2(0), native_coverage, tile, layout, records, true, covered, inner);
+}
+
+[[fragment]] D3DALLOYMSAAMarker msaa_gather_conservative_depth(
+    D3DALLOYMSAAConservativeInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]], device uint *records [[buffer(21)]]) {
+  return msaa_gather_conservative_depth_impl<false>(input, native_coverage, tile, layout, records);
+}
+
+[[fragment]] D3DALLOYMSAAMarker msaa_gather_conservative_depth_task(
+    D3DALLOYMSAAConservativeInput input [[stage_in]], uint native_coverage [[sample_mask]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]], device uint *records [[buffer(21)]]) {
+  return msaa_gather_conservative_depth_impl<true>(input, native_coverage, tile, layout, records);
 }
 
 struct D3DALLOYMSAADepthMarker {
@@ -614,12 +757,18 @@ struct D3DALLOYMSAADepthMarker {
   uint mask [[sample_mask]];
 };
 
-template<typename Coverage>
+template<bool Task = false, typename Coverage>
 inline D3DALLOYMSAADepthMarker msaa_explicit_depth_impl(
     float4 position, uint sample, constant D3DALLOYMSAATile &tile,
     constant D3DALLOYMSAAPixelLayout &layout, device const uint *records, Coverage coverage) {
   const uint2 xy = uint2(position.xy);
-  uint mask = msaa_coverage_read(coverage, xy, sample).x ? 1u << sample : 0u;
+  if constexpr (Task) {
+    if (!msaa_task_contains(xy, tile) || sample >= tile.sample_count) {
+      discard_fragment();
+      return {0, 0, 0};
+    }
+  }
+  uint mask = msaa_coverage_read(coverage, xy, sample, Task ? tile.target_layer : 0u).x ? 1u << sample : 0u;
   const uint2 local = xy - uint2(tile.x, tile.y);
   if (local.x >= 8 || local.y >= 8 || sample >= tile.sample_count) return {0, 0, 0};
   const device uint *record = records + (local.y * 8 + local.x) * layout.input_record_dwords;
@@ -674,6 +823,64 @@ struct D3DALLOYMSAADepthOnly {
     texture2d<uint, access::read> coverage [[texture(24)]]) {
   const auto result = msaa_explicit_depth_impl(position, sample, tile, layout, records, coverage);
   return {result.depth, result.mask};
+}
+
+// The task family reads full coverage arrays. Legacy helpers keep their
+// single-layer views and their existing entry points for the fallback path.
+[[fragment]] D3DALLOYMSAADepthMarker msaa_explicit_depth_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_ms_array<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_explicit_depth_impl<true>(position, sample, tile, layout, records, coverage);
+}
+
+[[fragment]] D3DALLOYMSAADepthMarker msaa_explicit_depth_single_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_array<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_explicit_depth_impl<true>(position, sample, tile, layout, records, coverage);
+}
+
+[[fragment]] D3DALLOYMSAADepthOnly msaa_explicit_depth_only_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_ms_array<uint, access::read> coverage [[texture(24)]]) {
+  const auto result = msaa_explicit_depth_impl<true>(position, sample, tile, layout, records, coverage);
+  return {result.depth, result.mask};
+}
+
+[[fragment]] D3DALLOYMSAADepthOnly msaa_explicit_depth_only_single_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *records [[buffer(21)]],
+    texture2d_array<uint, access::read> coverage [[texture(24)]]) {
+  const auto result = msaa_explicit_depth_impl<true>(position, sample, tile, layout, records, coverage);
+  return {result.depth, result.mask};
+}
+
+[[fragment]] D3DALLOYMSAAQueryCoverage msaa_query_coverage_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *outputs [[buffer(22)]], device const uint *inputs [[buffer(21)]],
+    texture2d_ms_array<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_query_coverage_impl<true>(position, sample, tile, layout, outputs, coverage, inputs);
+}
+
+[[fragment]] D3DALLOYMSAAQueryCoverage msaa_query_coverage_single_task(
+    float4 position [[position]], uint sample [[sample_id]],
+    constant D3DALLOYMSAATile &tile [[buffer(23)]],
+    constant D3DALLOYMSAAPixelLayout &layout [[buffer(28)]],
+    device const uint *outputs [[buffer(22)]], device const uint *inputs [[buffer(21)]],
+    texture2d_array<uint, access::read> coverage [[texture(24)]]) {
+  return msaa_query_coverage_impl<true>(position, sample, tile, layout, outputs, coverage, inputs);
 }
 
 [[kernel]] void clear_texture_1d_uint(
@@ -775,73 +982,6 @@ struct D3DalloyClearTextureBufferUInt {
 }
 
 // D3D12 vertex stream output (see d3d12_command_encoder.hpp StreamOutputDrawData).
-struct D3DALLOYSOIndirectPreflightParams {
-  device const uchar *argument_buffer;
-  device const uint *count_buffer;
-  device const ulong *predicate;
-  device const uchar *index_buffer;
-  uint max_count;
-  uint stride;
-  uint draw_offset;
-  uint ib_offset;
-  uint predicate_op;
-  uint indexed;
-  uint index_format;
-  uint count_only;
-};
-
-struct D3DALLOYSOIndirectPreflightResult {
-  uint effective_count;
-  uint padding[3];
-};
-
-struct D3DALLOYSOIndirectPreflightRecord {
-  uint vertex_count;
-  uint instance_count;
-  uint start_location;
-  uint start_instance;
-  int base_vertex;
-  uint index_format;
-  ulong index_address;
-};
-
-// The queue reads these compact draw fields only after the producing segment retires.
-// Each command is allocated exact-size scratch before its VS is run, without replaying the VS.
-[[kernel]] void so_indirect_preflight(
-    constant D3DALLOYSOIndirectPreflightParams &params [[buffer(0)]],
-    device D3DALLOYSOIndirectPreflightResult *output [[buffer(1)]]
-) {
-  uint count = params.count_buffer ? min(params.count_buffer[0], params.max_count) : params.max_count;
-  if (params.predicate && (params.predicate_op ? params.predicate[0] != 0 : params.predicate[0] == 0))
-    count = 0;
-  output->effective_count = count;
-  if (params.count_only)
-    return;
-  device D3DALLOYSOIndirectPreflightRecord *records =
-      reinterpret_cast<device D3DALLOYSOIndirectPreflightRecord *>(output + 1);
-  for (uint i = 0; i < count; i++) {
-    device const uint *draw = reinterpret_cast<device const uint *>(
-        params.argument_buffer + ulong(i) * params.stride + params.draw_offset);
-    D3DALLOYSOIndirectPreflightRecord record;
-    record.vertex_count = draw[0];
-    record.instance_count = draw[1];
-    record.start_location = draw[2];
-    record.base_vertex = params.indexed ? int(draw[3]) : 0;
-    record.start_instance = draw[params.indexed ? 4 : 3];
-    record.index_format = params.index_format;
-    record.index_address = ulong(params.index_buffer);
-    if (params.indexed && params.ib_offset != 0xffffffffu) {
-      // D3D12_INDEX_BUFFER_VIEW is packed and may be only 4-byte aligned after
-      // preceding signature arguments: load its GPU VA as two 32-bit words.
-      device const uint *ib = reinterpret_cast<device const uint *>(
-          params.argument_buffer + ulong(i) * params.stride + params.ib_offset);
-      record.index_address = ulong(ib[0]) | (ulong(ib[1]) << 32);
-      record.index_format = ib[3];
-    }
-    records[i] = record;
-  }
-}
-
 struct D3DALLOYSOElement {
   uint slot;
   uint byte_offset;
@@ -852,7 +992,7 @@ struct D3DALLOYSOElement {
 struct D3DALLOYSOAssembly {
   uint topology; // 0 point, 1/2 line list/strip, 3/4 triangle list/strip, 5 fan, 6/7 line adj, 8/9 triangle adj
   uint indexed;
-  uint index_size; // 2 or 4
+  uint index_size; // 2/4: native index data; 8: GPU-selected bounded index-view control
   uint cut_enabled; // strip topology with a matching D3D12 IBStripCutValue
   uint cut_value;
   uint vertex_count; // per instance: VertexCountPerInstance / IndexCountPerInstance
@@ -890,6 +1030,17 @@ struct D3DALLOYSOControl {
 };
 
 inline uint d3dalloy_so_read_index(device const uchar *indices, uint size, uint k) {
+  if (size == 8) {
+    device const uint *view = reinterpret_cast<device const uint *>(indices);
+    const ulong address = ulong(view[0]) | (ulong(view[1]) << 32);
+    const uint width = view[3] == 42 ? 4 : 2; // DXGI_FORMAT_R32_UINT / R16_UINT
+    const uint offset = (view[4] + k) * width;
+    if (!address || (view[3] != 42 && view[3] != 57) || view[2] < width || offset > view[2] - width)
+      return 0;
+    device const uchar *at = reinterpret_cast<device const uchar *>(address + ulong(offset));
+    const uint low = uint(at[0]) | (uint(at[1]) << 8);
+    return width == 4 ? low | (uint(at[2]) << 16) | (uint(at[3]) << 24) : low;
+  }
   if (size == 2)
     return uint(indices[2 * k]) | (uint(indices[2 * k + 1]) << 8);
   return uint(indices[4 * k]) | (uint(indices[4 * k + 1]) << 8) | (uint(indices[4 * k + 2]) << 16) |
@@ -1076,9 +1227,9 @@ struct D3DALLOYMSAATileBounds {
   uint left, top, right, bottom, viewport_index, target_layer, primitive_id;
 };
 
-// Execute after VS capture and primitive assembly. This buffer is read only by
-// the queue's FIFO worker after the GPU producer has retired, never by the API
-// caller. Ambiguous projection/clipping intentionally falls back to a viewport
+// Execute after VS capture and primitive assembly. GPU tile-task generation
+// consumes private bounds; only the legacy path maps them on the FIFO worker
+// after producer retirement. Ambiguous projection/clipping keeps a viewport
 // bound instead of dropping a sample at an edge.
 [[kernel]] void msaa_primitive_bounds(
     constant D3DALLOYMSAABoundsParams &params [[buffer(0)]],
@@ -1303,8 +1454,8 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
 #pragma METAL fp math_mode(fast)
 
 // Assembles the captured records of one draw into complete list primitives in IA order and appends
-// them to the bound targets (D3D11.3 FS 14.5/14.6). Runs as a single thread so primitive order and
-// the BufferFilledSize dependency between consecutive draws are exactly the API order.
+// them to the bound targets (D3D11.3 FS 14.5/14.6). Fixed-width lists with disjoint outputs
+// use one SIMD group; the scalar path also handles strips, adjacency and missing claims.
 [[kernel]] void so_assemble(
     constant D3DALLOYSOAssembly &params [[buffer(0)]],
     constant D3DALLOYSOControl &control [[buffer(1)]],
@@ -1321,9 +1472,12 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
     device uchar *filled2 [[buffer(12)]],
     device uchar *filled3 [[buffer(13)]],
     device uint *status [[buffer(14)]],
-    device ulong *statistics [[buffer(15)]]
+    device ulong *statistics [[buffer(15)]],
+    uint tid [[thread_position_in_grid]], uint3 group [[threads_per_threadgroup]], uint simd_width [[threads_per_simdgroup]]
 ) {
-  status[0] = 0;
+  const bool parallel = group.x == 32 && simd_width == 32;
+  if (!parallel && tid) return;
+  if (!tid) status[0] = 0;
   if (params.predicate_enabled && (params.predicate_not_equal ? predicate[0] != 0 : predicate[0] == 0))
     return;
   indices += params.index_skip;
@@ -1338,6 +1492,50 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
   const uint topology = params.topology;
   const uint vpp = topology == 0 ? 1 : (topology <= 2 || topology == 6 || topology == 7) ? 2 : 3;
   const uint input_vpp = topology >= 8 ? 6 : topology >= 6 ? 4 : vpp;
+  if (parallel) {
+    // The CPU only enables this grid for complete, non-restarting list topology.
+    // Full primitive capacity is the minimum over the bound target views.
+    const uint per_instance = params.vertex_count / vpp;
+    const ulong needed = ulong(per_instance) * params.instance_count;
+    ulong capacity = needed;
+    for (uint s = 0; s < 4; ++s) if (params.referenced_mask & (1u << s)) {
+      ulong room = params.size[s] - min(params.size[s], filled[s]);
+      capacity = min(capacity, room / (ulong(vpp) * params.stride[s]));
+    }
+    // A missing capture compacts later primitives in the ordered reference.
+    // Validate the writable prefix and its first overflow attempt before scattering.
+    bool valid = true;
+    device const uint *claims = scratch + ulong(control.record_count) * params.record_dwords;
+    ulong checked = capacity + (capacity < needed);
+    for (ulong p = tid; p < checked; p += 32) {
+      ulong first = (p / per_instance) * control.positions_per_instance + (p % per_instance) * vpp;
+      for (uint v = 0; v < vpp; ++v)
+        valid &= first + v < control.record_count && claims[first + v] != 0;
+    }
+    if (simd_all(valid)) {
+      simdgroup_barrier(mem_flags::mem_device);
+      for (ulong p = tid; p < capacity; p += 32) {
+        ulong first = (p / per_instance) * control.positions_per_instance + (p % per_instance) * vpp;
+        for (uint v = 0; v < vpp; ++v) {
+          device const uint *source = scratch + (first + v) * params.record_dwords;
+          for (uint e = 0; e < params.element_count; ++e) {
+            const D3DALLOYSOElement element = params.elements[e];
+            ulong base = filled[element.slot] + (p * vpp + v) * params.stride[element.slot] + element.byte_offset;
+            for (uint c = 0; c < element.component_count; ++c)
+              d3dalloy_so_store_dword(targets[element.slot], base + 4 * c, source[element.dword_offset + c]);
+          }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_device);
+      if (!tid) {
+        for (uint s = 0; s < 4; ++s) if (params.referenced_mask & (1u << s))
+          d3dalloy_so_store_dword(filled_sizes[s], 0, uint(filled[s] + capacity * vpp * params.stride[s]));
+        counters[0] += ulong2(capacity, needed);
+      }
+      return;
+    }
+    if (tid) return;
+  }
   const bool strip = topology == 2 || topology == 4 || topology == 5 || topology == 7 || topology == 9;
   // A slot the declaration writes but no buffer is bound to counts as full (14.6).
   bool stopped = (params.referenced_mask & ~params.bound_mask) != 0;
@@ -1589,6 +1787,8 @@ inline uint d3dalloy_clipped_primitives(constant D3DALLOYSOAssembly &params,
       d3dalloy_so_store_dword(filled_sizes[s], 0, uint(filled[s]));
   counters[0] += ulong2(written, needed);
 }
+
+#include "d3d12_capture_frontier.metal"
 
 // D3D12_QUERY_DATA_PIPELINE_STATISTICS is eleven consecutive 64-bit counters.
 [[kernel]] void query_pipeline_statistics_end(
@@ -2839,3 +3039,5 @@ kernel void d3d12_feedback_encode(device const uchar *decoded [[buffer(0)]],
   const uint value = decoded[(p.src_y + y) * p.row_pitch + p.src_x + x];
   cells[p.cell_base + (p.dst_y + y) * p.grid_w + p.dst_x + x] = p.min_mip ? 255u - value : uint(value != 0);
 }
+
+#include "d3d12_msaa_tile_tasks.metal"

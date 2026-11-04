@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Imported from zzz-wine-yaagl-pr-runtime e9d0e50db84 d3dmetal-sidecar/fsr-rr.mm.
 #include "metalfx_amd_rr.hpp"
+#include "metalfx_texture_access.hpp"
 #include "fsr-rr-kernels.inc"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -121,7 +122,7 @@ struct KernelLibrary {
     id<MTLDevice> device = nil;
     Object library;
     mutable std::mutex pipelineMutex;
-    mutable std::array<std::pair<Object,Object>,11> pipelines;
+    mutable std::array<std::pair<Object,Object>,12> pipelines;
     Object getPipeline(NSString* name) const;
     ~KernelLibrary() { [device release]; }
 };
@@ -169,7 +170,7 @@ Object KernelLibrary::getPipeline(NSString* name) const {
 }
 
 struct Feature::Impl {
-    Object device, compiler, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline;
+    Object device, compiler, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline, filterWritePipeline;
     Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline, zeroPipeline;
     Object resolvePipeline, resolveWritePipeline, historyFence;
     // Keeps the device cache entry alive while this feature exists.
@@ -316,9 +317,10 @@ struct PreparedFrame::Impl {
     WMTRRSettings settings{};
     std::array<Object,WMTRR_RESOURCE_COUNT> textures;
     uint32_t snapshotMask = 0;
-    // Private albedo guides read by the fused neural resolve that share a root
-    // with a caller output; these are staged like CPU-visible guides.
-    bool aliasedAlbedo[WMTRR_RESOURCE_COUNT]{};
+    uint32_t scalarOutputMask = 0;
+    // Guides read after an earlier signal writes a caller output. Texture
+    // views and buffer-backed aliases must preserve the original input.
+    bool aliasedGuide[WMTRR_RESOURCE_COUNT]{};
     Params parameters{};
 };
 struct ExecutionLease::Impl {
@@ -403,6 +405,8 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             state->geometryPipeline = kernels.getPipeline(@"rr_geometry");
             state->unpackPipeline = kernels.getPipeline(@"rr_unpack");
             state->filterPipeline = kernels.getPipeline(@"rr_filter");
+            const bool needsScalar = (info.signals & ((1u<<0) | (1u<<3) | (1u<<6))) != 0;
+            if (needsScalar) state->filterWritePipeline = kernels.getPipeline(@"rr_filter_write");
             if (needsNeural) {
                 state->zeroPipeline = kernels.getPipeline(@"rr_zero_albedo");
                 state->neuralCommonPipeline = kernels.getPipeline(@"rr_neural_common");
@@ -420,6 +424,7 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             };
             if (!state->snapshotPipeline || !state->geometryPipeline || !state->unpackPipeline ||
                 !tileFits(state->filterPipeline) ||
+                (needsScalar && !tileFits(state->filterWritePipeline)) ||
                 (needsNeural && (!state->zeroPipeline || !state->neuralCommonPipeline || !tileFits(state->neuralPreparePipeline) ||
                                  !state->neuralResolvePipeline || !state->neuralResolveWritePipeline)) ||
                 !state->resolvePipeline || !state->resolveWritePipeline || !state->historyFence) {
@@ -514,8 +519,24 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(const WMTRRFrame& frame,
                 fail(error,ErrorCode::InvalidFrame,"Invalid RR checkerboard origin"); return {};
             }
         }
-        // All filters finish before any caller output is written. Only inputs
-        // needed by resolve need alias protection; texture views share a root.
+        // A scalar output may be published with its filter only if it cannot
+        // overlap any input or another output. Unknown/shared/sparse storage
+        // retains the original ordered resolve even when snapshots exist.
+        for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if ((impl_->info.signals&(1u<<s)) && !radiance(s)) {
+            const unsigned outputSlot = 6+2*s;
+            auto output = (id<MTLTexture>)prepared->textures[outputSlot].get();
+            bool independent = true;
+            for (unsigned i=0;i<prepared->textures.size();++i) {
+                if (i == outputSlot) continue;
+                if (!metalfx::texturesDisjoint(output,(id<MTLTexture>)prepared->textures[i].get())) {
+                    independent = false;
+                    break;
+                }
+            }
+            if (independent) prepared->scalarOutputMask |= 1u<<s;
+        }
+        // Radiance signals prepare, denoise and resolve in sequence. Snapshot
+        // inputs before the first output write; texture views share a root.
         auto root = [](id<MTLTexture> texture) {
             while (texture.parentTexture) texture = texture.parentTexture;
             return texture;
@@ -538,13 +559,13 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(const WMTRRFrame& frame,
             }
             if (snapshot) prepared->snapshotMask |= 1u<<s;
         }
-        // Fused neural resolve writes one signal's output before a later
-        // signal's finish reads the albedo guides; alias-protect them.
-        for (unsigned i : {3u,4u,unsigned(WMTRR_FUSED_ALBEDO)}) {
+        // A later prepare still reads motion and albedos after an earlier
+        // signal's resolve. Depth/normals always have private snapshots.
+        for (unsigned i : {1u,3u,4u,unsigned(WMTRR_FUSED_ALBEDO)}) {
             auto guide = (id<MTLTexture>)textures[i];
             if (!guide) continue;
             auto guideRoot = root(guide);
-            prepared->aliasedAlbedo[i] = guideRoot.buffer ||
+            prepared->aliasedGuide[i] = guideRoot.buffer ||
                 std::find(outputRoots.begin(),outputRoots.end(),guideRoot) != outputRoots.end();
         }
         auto& c = prepared->parameters;
@@ -644,16 +665,18 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             // Depth, pixel motion, roughness and diffuse/specular albedo. The
             // world normal is the decoded guide; the zero albedo is per generation.
             std::array<Storage,6> neuralCommon;
-            struct NeuralFrame { Storage color, reactive, strength, lower, upper, output, hit; };
-            std::array<NeuralFrame,WMTRR_SIGNAL_COUNT> neuralFrames;
-            execution->allocations.reserve(22); execution->objects.reserve(4);
+            // One GPU-ordered working set serves every radiance signal. Only
+            // current signal history and reconstructed checkerboard alpha
+            // survive the signal's resolve; they must never share this set.
+            struct NeuralFrame { Storage color, reactive, strength, lower, upper, output, hit; } neuralFrame;
+            execution->allocations.reserve(36); execution->objects.reserve(5);
             // Depth and normals outlive this execution as temporal history.
-            // Motion and private albedos are read only before resolve. Stage
-            // CPU-visible albedos for repeated neighborhood reads.
+            // Preserve motion/albedo aliases across signal resolves, and
+            // stage CPU-visible albedos for repeated neighborhood reads.
             for (unsigned i=0;i<5;++i) {
                 auto source = (id<MTLTexture>)impl_->textures[i].get();
-                if (!source || i == 1 ||
-                    (i > 2 && source.storageMode == MTLStorageModePrivate && !impl_->aliasedAlbedo[i])) continue;
+                if (!source || (i == 1 && !impl_->aliasedGuide[i]) ||
+                    (i > 2 && source.storageMode == MTLStorageModePrivate && !impl_->aliasedGuide[i])) continue;
                 common[i] = feature->texture(frame.width,frame.height,
                     i == 0 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float);
                 if (!common[i]) return fail(error,ErrorCode::ResourceCreationFailed,"RR common snapshot allocation failed");
@@ -672,7 +695,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             execution->allocations.push_back(guide); execution->allocations.push_back(decoded);
             if (frame.legacy_mode == 3 &&
                 (((id<MTLTexture>)impl_->textures[WMTRR_FUSED_ALBEDO].get()).storageMode != MTLStorageModePrivate ||
-                 impl_->aliasedAlbedo[WMTRR_FUSED_ALBEDO])) {
+                 impl_->aliasedGuide[WMTRR_FUSED_ALBEDO])) {
                 fused = feature->texture(frame.width,frame.height);
                 if (!fused) return fail(error,ErrorCode::ResourceCreationFailed,"RR fused albedo staging allocation failed");
                 execution->allocations.push_back(fused);
@@ -690,6 +713,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 execution->allocations.push_back(current->signals[s]);
             }
             std::array<MTLTextureUsage,6> commonUsage{};
+            struct { MTLTextureUsage color{}, reactive{}, strength{}, output{}, hit{}; } neuralUsage;
+            bool transientUpper = false;
             for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s]) {
                 auto scaler = (id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get();
                 commonUsage[0] |= scaler.depthTextureUsage;
@@ -698,14 +723,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 commonUsage[3] |= scaler.roughnessTextureUsage;
                 commonUsage[4] |= scaler.diffuseAlbedoTextureUsage;
                 commonUsage[5] |= scaler.specularAlbedoTextureUsage;
-                auto allocate = [&](MTLPixelFormat format, MTLTextureUsage usage) {
-                    auto value = feature->texture(frame.width,frame.height,format,
-                        usage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-                    if (value) execution->allocations.push_back(value);
-                    return value;
-                };
-                auto& n = neuralFrames[s];
-                n.color = allocate(MTLPixelFormatRGBA32Float,scaler.colorTextureUsage);
+                neuralUsage.color |= scaler.colorTextureUsage;
                 MTLTextureUsage reactiveUsage;
                 if (@available(macOS 27.0,*)) reactiveUsage = scaler.reactiveMaskTextureUsage;
                 else {
@@ -713,18 +731,37 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     // property name; the 27 SDK renamed its typed accessor.
                     reactiveUsage = [[(id)scaler valueForKey:@"reactiveTextureUsage"] unsignedIntegerValue];
                 }
-                n.reactive = allocate(MTLPixelFormatR32Float,reactiveUsage);
-                n.strength = allocate(MTLPixelFormatR32Float,scaler.denoiseStrengthMaskTextureUsage);
-                n.lower = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
-                n.upper = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
-                n.output = allocate(MTLPixelFormatRGBA32Float,scaler.outputTextureUsage);
-                if (s == 5) n.hit = allocate(MTLPixelFormatR32Float,scaler.specularHitDistanceTextureUsage);
-                if (!n.color || !n.reactive || !n.strength || !n.lower || !n.upper || !n.output || (s == 5 && !n.hit))
-                    return fail(error,ErrorCode::ResourceCreationFailed,"RR neural signal resource allocation failed");
+                neuralUsage.reactive |= reactiveUsage;
+                neuralUsage.strength |= scaler.denoiseStrengthMaskTextureUsage;
+                neuralUsage.output |= scaler.outputTextureUsage;
+                if (s == 5) neuralUsage.hit |= scaler.specularHitDistanceTextureUsage;
                 // Direct alpha is undefined for filtering but still belongs to
                 // the caller. Retain it separately for history-only holes.
-                if ((s == 1 || s == 2) && (feature->info.checkerboard&(1u<<s)))
-                    current->reconstructedAlpha[s] = n.upper;
+                if ((s == 1 || s == 2) && (feature->info.checkerboard&(1u<<s))) {
+                    current->reconstructedAlpha[s] = feature->texture(frame.width,frame.height);
+                    if (!current->reconstructedAlpha[s])
+                        return fail(error,ErrorCode::ResourceCreationFailed,"RR checkerboard alpha history allocation failed");
+                    execution->allocations.push_back(current->reconstructedAlpha[s]);
+                } else transientUpper = true;
+            }
+            if (generation) {
+                auto allocate = [&](MTLPixelFormat format, MTLTextureUsage usage) {
+                    auto value = feature->texture(frame.width,frame.height,format,
+                        usage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+                    if (value) execution->allocations.push_back(value);
+                    return value;
+                };
+                auto& n = neuralFrame;
+                n.color = allocate(MTLPixelFormatRGBA32Float,neuralUsage.color);
+                n.reactive = allocate(MTLPixelFormatR32Float,neuralUsage.reactive);
+                n.strength = allocate(MTLPixelFormatR32Float,neuralUsage.strength);
+                n.lower = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
+                if (transientUpper) n.upper = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
+                n.output = allocate(MTLPixelFormatRGBA32Float,neuralUsage.output);
+                if (feature->info.signals&(1u<<5)) n.hit = allocate(MTLPixelFormatR32Float,neuralUsage.hit);
+                if (!n.color || !n.reactive || !n.strength || !n.lower || (transientUpper && !n.upper) || !n.output ||
+                    ((feature->info.signals&(1u<<5)) && !n.hit))
+                    return fail(error,ErrorCode::ResourceCreationFailed,"RR neural working-set allocation failed");
             }
             for (unsigned i=0;generation && i<neuralCommon.size();++i) {
                 if (i == 2) continue;
@@ -855,10 +892,21 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 auto tex = [](const Storage& a) -> id<MTLTexture> { return a ? (id<MTLTexture>)a->object.get() : nil; };
                 if (generation && !generation->zeroInitialized)
                     dispatch((id<MTLComputePipelineState>)feature->zeroPipeline.get(),0,{tex(generation->zero)});
-                dispatch((id<MTLComputePipelineState>)feature->geometryPipeline.get(),0,
-                    {(id<MTLTexture>)impl_->textures[0].get(),(id<MTLTexture>)impl_->textures[2].get(),
-                     tex(common[0]),tex(common[2]),tex(guide),tex(decoded)});
-                for (unsigned i=3;i<5;++i) if (common[i])
+                auto depthSource = (id<MTLTexture>)impl_->textures[0].get();
+                auto normalSource = (id<MTLTexture>)impl_->textures[2].get();
+                if (generation) {
+                    // Read the original guides alongside the alias snapshots, before any caller output is written.
+                    auto spec = (id<MTLTexture>)impl_->textures[3].get();
+                    auto diff = (id<MTLTexture>)impl_->textures[4].get();
+                    dispatch((id<MTLComputePipelineState>)feature->neuralCommonPipeline.get(),0,
+                        {depthSource,(id<MTLTexture>)impl_->textures[1].get(),normalSource,spec ?: normalSource,
+                         diff ?: normalSource,tex(neuralCommon[0]),tex(neuralCommon[1]),nil,tex(neuralCommon[3]),
+                         tex(neuralCommon[4]),tex(neuralCommon[5]),tex(common[0]),tex(common[2]),tex(guide),tex(decoded)});
+                } else {
+                    dispatch((id<MTLComputePipelineState>)feature->geometryPipeline.get(),0,
+                        {depthSource,normalSource,tex(common[0]),tex(common[2]),tex(guide),tex(decoded)});
+                }
+                for (unsigned i : {1u,3u,4u}) if (common[i])
                     dispatch((id<MTLComputePipelineState>)feature->snapshotPipeline.get(),0,
                         {(id<MTLTexture>)impl_->textures[i].get(),tex(common[i])});
                 if (fused)
@@ -874,36 +922,19 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     (id<MTLTexture>)impl_->textures[4].get() : tex(common[2]);
                 auto fusedAlbedo = fused ? tex(fused) : impl_->textures[WMTRR_FUSED_ALBEDO] ?
                     (id<MTLTexture>)impl_->textures[WMTRR_FUSED_ALBEDO].get() : tex(common[2]);
-                if (generation)
-                    dispatch((id<MTLComputePipelineState>)feature->neuralCommonPipeline.get(),0,
-                        {tex(common[0]),(id<MTLTexture>)impl_->textures[1].get(),tex(common[2]),specAlbedo,diffAlbedo,
-                         tex(neuralCommon[0]),tex(neuralCommon[1]),nil,tex(neuralCommon[3]),
-                         tex(neuralCommon[4]),tex(neuralCommon[5])});
-                for (unsigned s=0;s<7;++s) if (inputs[s]) {
-                    if (radiance(s)) {
-                        const auto& n = neuralFrames[s];
-                        dispatch((id<MTLComputePipelineState>)feature->neuralPreparePipeline.get(),s+1,
-                            {inputs[s],tex(common[0]),(id<MTLTexture>)impl_->textures[1].get(),tex(common[2]),
-                             specAlbedo,diffAlbedo,fusedAlbedo,
-                             tex(reuse ? previous->depth : common[0]),tex(reuse ? previous->normals : common[2]),
-                             reuse ? tex(previous->signals[s]) : inputs[s],
-                             tex(n.color),tex(n.reactive),tex(n.strength),tex(n.lower),tex(n.upper),
-                             tex(current->signals[s]),n.hit ? tex(n.hit) : tex(n.color),
-                             reuse && previous->reconstructedAlpha[s] ? tex(previous->reconstructedAlpha[s]) :
-                                 reuse ? tex(previous->signals[s]) : inputs[s],
-                             tex(guide),tex(decoded)},true);
-                        continue;
-                    }
-                    dispatch((id<MTLComputePipelineState>)feature->filterPipeline.get(),s+1,
-                        {inputs[s],tex(current->signals[s]),tex(common[0]),
-                         (id<MTLTexture>)impl_->textures[1].get(),tex(common[2]),
+                auto motion = common[1] ? tex(common[1]) : (id<MTLTexture>)impl_->textures[1].get();
+                for (unsigned s=0;s<7;++s) if (inputs[s] && !radiance(s)) {
+                    const bool writeOutput = (impl_->scalarOutputMask&(1u<<s)) != 0;
+                    dispatch((id<MTLComputePipelineState>)(writeOutput ? feature->filterWritePipeline.get() :
+                                                                       feature->filterPipeline.get()),s+1,
+                        {inputs[s],tex(current->signals[s]),tex(common[0]),motion,tex(common[2]),
                          specAlbedo,diffAlbedo,
                          reuse ? tex(previous->signals[s]) : inputs[s],
                          tex(reuse ? previous->depth : common[0]),tex(reuse ? previous->normals : common[2]),
-                         fusedAlbedo,tex(guide),tex(decoded)},true);
+                         fusedAlbedo,tex(guide),tex(decoded),
+                         writeOutput ? (id<MTLTexture>)impl_->textures[6+2*s].get() : nil},true);
                 }
-                [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
-                [encoder endEncoding]; encoder = nil;
+                [encoder barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
                 simd_float4x4 view, projection, inverseProjection;
                 std::memcpy(&view,frame.view,sizeof(view));
                 std::memcpy(&projection,frame.projection,sizeof(projection));
@@ -931,12 +962,36 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     [boundary endEncoding];
                     return true;
                 };
-                if (generation && !queueBarrier())
-                    return fail(error,ErrorCode::EncodeFailed,"RR neural prefix barrier creation failed");
-                for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s]) {
+                // Preserve caller-output order while completing each neural
+                // signal before the next one overwrites its transient set.
+                // All inputs needed after an output write are already staged
+                // or proven not to alias any output.
+                for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (inputs[s]) {
+                    auto output = (id<MTLTexture>)impl_->textures[6+2*s].get();
+                    if (!radiance(s)) {
+                        if (!(impl_->scalarOutputMask&(1u<<s)))
+                            dispatch((id<MTLComputePipelineState>)feature->resolveWritePipeline.get(),s+1,
+                                {tex(current->signals[s]),output,inputs[s],tex(common[0])});
+                        continue;
+                    }
+                    const auto& n = neuralFrame;
+                    auto upper = current->reconstructedAlpha[s] ? tex(current->reconstructedAlpha[s]) : tex(n.upper);
+                    dispatch((id<MTLComputePipelineState>)feature->neuralPreparePipeline.get(),s+1,
+                        {inputs[s],tex(common[0]),motion,tex(common[2]),
+                         specAlbedo,diffAlbedo,fusedAlbedo,
+                         tex(reuse ? previous->depth : common[0]),tex(reuse ? previous->normals : common[2]),
+                         reuse ? tex(previous->signals[s]) : inputs[s],
+                         tex(n.color),tex(n.reactive),tex(n.strength),tex(n.lower),upper,
+                         tex(current->signals[s]),s == 5 ? tex(n.hit) : tex(n.color),
+                         reuse && previous->reconstructedAlpha[s] ? tex(previous->reconstructedAlpha[s]) :
+                             reuse ? tex(previous->signals[s]) : inputs[s],
+                         tex(guide),tex(decoded)},true);
+                    [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
+                    [encoder endEncoding]; encoder = nil;
+                    if (!queueBarrier())
+                        return fail(error,ErrorCode::EncodeFailed,"RR neural prefix barrier creation failed");
                     if (!nextSegment()) return fail(error,ErrorCode::EncodeFailed,"RR neural segment split failed");
                     auto scaler = (id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get();
-                    const auto& n = neuralFrames[s];
                     @try {
                         scaler.colorTexture = tex(n.color); scaler.outputTexture = tex(n.output);
                         scaler.depthTexture = tex(neuralCommon[0]); scaler.motionTexture = tex(neuralCommon[1]);
@@ -945,7 +1000,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                         scaler.diffuseAlbedoTexture = composite || s == 1 || s == 4 ? tex(neuralCommon[4]) : tex(generation->zero);
                         scaler.specularAlbedoTexture = composite || s == 2 || s == 5 ? tex(neuralCommon[5]) : tex(generation->zero);
                         scaler.reactiveMaskTexture = tex(n.reactive); scaler.denoiseStrengthMaskTexture = tex(n.strength);
-                        scaler.specularHitDistanceTexture = tex(n.hit);
+                        scaler.specularHitDistanceTexture = s == 5 ? tex(n.hit) : nil;
                         scaler.preExposure = 1;
                         scaler.motionVectorScaleX = scaler.motionVectorScaleY = 1;
                         scaler.jitterOffsetX = frame.jitter[0]; scaler.jitterOffsetY = frame.jitter[1];
@@ -963,33 +1018,22 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                         scaler.reactiveMaskTexture = nil; scaler.denoiseStrengthMaskTexture = nil;
                         scaler.specularHitDistanceTexture = nil; scaler.fence = nil;
                     }
-                }
-                if (generation && (!nextSegment() || !queueBarrier()))
-                    return fail(error,ErrorCode::EncodeFailed,"RR neural suffix segment creation failed");
-                encoder = [buffer computeCommandEncoder];
-                if (!encoder) return fail(error,ErrorCode::EncodeFailed,"RR neural correction encoder creation failed");
-                execution->objects.emplace_back(encoder);
-                [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
-                // Each dispatch reads its own signal's working/history texture
-                // at the written pixel only. Every guide a later dispatch reads
-                // is internal or alias-protected, so no barrier is needed.
-                for (unsigned s=0;s<7;++s) if (inputs[s]) {
-                    bool readsDestination = radiance(s) && !frame.legacy_mode && !(feature->info.checkerboard&(1u<<s));
-                    auto output = (id<MTLTexture>)impl_->textures[6+2*s].get();
-                    if (generation && generation->scalers[s]) {
-                        const auto& n = neuralFrames[s];
-                        id pipeline = readsDestination ?
-                            feature->neuralResolvePipeline.get() : feature->neuralResolveWritePipeline.get();
-                        dispatch((id<MTLComputePipelineState>)pipeline,s+1,
-                            {tex(current->signals[s]),tex(n.output),tex(n.lower),tex(n.upper),
-                             specAlbedo,diffAlbedo,fusedAlbedo,output,inputs[s],tex(common[0])});
-                        continue;
-                    }
-                    id pipeline = readsDestination ?
-                        feature->resolvePipeline.get() : feature->resolveWritePipeline.get();
+                    if (!nextSegment() || !queueBarrier())
+                        return fail(error,ErrorCode::EncodeFailed,"RR neural suffix segment creation failed");
+                    encoder = [buffer computeCommandEncoder];
+                    if (!encoder) return fail(error,ErrorCode::EncodeFailed,"RR neural correction encoder creation failed");
+                    execution->objects.emplace_back(encoder);
+                    [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
+                    bool readsDestination = !frame.legacy_mode && !(feature->info.checkerboard&(1u<<s));
+                    id pipeline = readsDestination ? feature->neuralResolvePipeline.get() :
+                        feature->neuralResolveWritePipeline.get();
                     dispatch((id<MTLComputePipelineState>)pipeline,s+1,
-                        {tex(current->signals[s]),output,inputs[s],
-                         !readsDestination && radiance(s) ? tex(neuralFrames[s].upper) : tex(common[0])});
+                        {tex(current->signals[s]),tex(n.output),tex(n.lower),upper,
+                         specAlbedo,diffAlbedo,fusedAlbedo,output,inputs[s],tex(common[0])});
+                    // Resolve reads color/output/bounds before the next
+                    // prepare writes the same GPU allocations. The lease
+                    // still retains the whole set until actual retirement.
+                    [encoder barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
                 }
                 [encoder updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch];
                 [encoder updateFence:(id<MTLFence>)feature->historyFence.get() afterEncoderStages:MTLStageDispatch];

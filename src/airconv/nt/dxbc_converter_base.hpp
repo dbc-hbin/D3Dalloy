@@ -545,11 +545,13 @@ public:
 
   /* Writes the workload's mesh indices and primitive count; returns that count. */
   llvm::Value *
-  DomainGeneratePrimitives(llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive);
+  DomainGeneratePrimitives(llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive,
+                           llvm::Value *Lane);
 
   /* TS->GS pass 1: writes the workload's primitive indices to IndicesPtr (device uint *) and returns the count. */
   llvm::Value *DomainGeneratePrimitivesCapture(
-      llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr
+      llvm::Value *WorkloadIndex, llvm::Value *DataPtr, TessellatorOutputPrimitive Primitive, llvm::Value *IndicesPtr,
+      llvm::Value *Lane
   );
 
   llvm::Value *DomainGetWorkloadRank(llvm::Value *WorkloadIndex, llvm::Value *DataPtr);

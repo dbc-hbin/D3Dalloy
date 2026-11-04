@@ -656,6 +656,7 @@ void gpuCase(Fixture &f, DXGI_FORMAT resourceFormat, DXGI_FORMAT viewFormat,
 
 #include "owned-d3d12-multisample-programmable.inc"
 #include "owned-d3d12-multisample-native.inc"
+#include "owned-d3d12-msaa-tile-tasks.inc"
 } // namespace
 
 int main(int argc, char **argv) {
@@ -670,12 +671,17 @@ int main(int argc, char **argv) {
     nativeSampleFrequencyCases(f);
     return 0;
   }
+  if(argc==2 && std::strcmp(argv[1],"--msaa-tile-tasks")==0) {
+    msaaTileTaskCase(f);
+    return 0;
+  }
   require(argc==1,"fixture arguments");
   nativeOrdinaryCases(f);
   nativeSampleFrequencyCases(f);
   nativeResourceCases(f,false);
   nativeResourceCases(f,true);
   nativeBindingBudgetCase(f);
+  msaaTileTaskCase(f);
   programmableCases(f);
   regionResolveCases(f);
   semanticCase(f);

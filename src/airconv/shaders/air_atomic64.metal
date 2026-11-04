@@ -98,6 +98,17 @@ extern "C" ulong d3dalloy_atomic64_compare_exchange(
     uint index = atomic64_protect(context, root);
     ulong value = ulong(nodes[index].low) | (ulong(nodes[index].high) << 32);
     if (value != comparison) { atomic64_release(context, index); return value; }
+    if (desired == comparison) {
+      // A live reference excludes RETIRED|0 -> RESERVED, so a displaced
+      // index cannot be recycled back into this root while it is protected.
+      // The successful SC root RMW is the linearization/release-sequence
+      // event even when it publishes the same immutable value.
+      uint expected = index;
+      bool committed = atomic64_cas(root, expected, index);
+      atomic64_release(context, index);
+      if (committed) return comparison;
+      continue;
+    }
     uint candidate = atomic64_allocate(context);
     nodes[candidate].low = uint(desired);
     nodes[candidate].high = uint(desired >> 32);

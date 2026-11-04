@@ -316,18 +316,66 @@ Presenter::encodeCommands(
 WMT::MetalDrawable
 Presenter::encodeCommandsMetal4(
     WMT::MTL4CommandBuffer cmdbuf, WMT::Texture backbuffer, D3DalloyPresentMetadata metadata,
-    std::function<void(WMT::MTL4RenderCommandEncoder)> &&wait_fences,
-    std::function<void(WMT::MTL4RenderCommandEncoder)> &&update_fences
+    WMT::Fence fence, PresentWork &work
 ) {
   assert(compiler_ && "Metal4 presentation requires a Metal4 compiler");
+  work = {};
   auto drawable = layer_.nextDrawable();
   if (!drawable) return {};
   if (!cmdbuf.useDrawable(drawable)) return {};
+  auto destination = drawable.texture();
+  const double width = layer_props_.drawable_width;
+  const double height = layer_props_.drawable_height;
+  const uint64_t source_width = backbuffer.width(), source_height = backbuffer.height();
+  const uint64_t destination_width = destination.width(), destination_height = destination.height();
+  work.width = uint32_t(destination_width);
+  work.height = uint32_t(destination_height);
+  const auto &geometry = metadata.geometry;
+  const bool full_source = geometry.source_width == 0 ||
+      (geometry.source_width == source_width && geometry.source_height == source_height);
+  // A top-left source crop is also an exact texel copy if its dimensions
+  // match the drawable. For SCALING_NONE this also proves that the RTL offset
+  // is zero and there are no uncovered background pixels.
+  const bool full_clip = !geometry.restrict_output ||
+      (geometry.output_clip[0] <= 0 && geometry.output_clip[1] <= 0 &&
+       geometry.output_clip[2] >= width && geometry.output_clip[3] >= height);
+  const bool unit_extent = geometry.source_width == 0
+      ? source_width == destination_width && source_height == destination_height
+      : geometry.source_width == width && geometry.source_height == height &&
+        geometry.destination_width == width && geometry.destination_height == height &&
+        source_width >= destination_width && source_height >= destination_height;
+  const bool identity_geometry = width == double(destination_width) && height == double(destination_height) &&
+      unit_extent && geometry.rotation <= 1 && full_clip;
+  // An untonemapped, unit-EDR PQ10 flip has the same ST.2084 input/output
+  // transfer. Its decode/encode round trip preserves all 1024 stored UNORM
+  // codes. No such inference is made for floating-point or transformed color.
+  const auto format = backbuffer.pixelFormat();
+  const bool copy_format = format == WMTPixelFormatRGBA8Unorm || format == WMTPixelFormatBGRA8Unorm ||
+      format == WMTPixelFormatRGB10A2Unorm;
+  if (!composition_ && identity_geometry && copy_format && format == destination.pixelFormat() &&
+      sample_count_ == 1 && metadata.alpha == D3DalloyPresentAlpha::Opaque && metadata.edr_scale == 1.0f &&
+      !metadata.composition_color_space && !pipeline_key_.source_srgb &&
+      (!pipeline_key_.is_pq || format == WMTPixelFormatRGB10A2Unorm) &&
+      !pipeline_key_.with_hdr_metadata && !pipeline_key_.gamma_enable) {
+    wmtcmd_blit_copy_from_texture_to_texture copy{};
+    copy.type = WMTBlitCommandCopyFromTextureToTexture;
+    copy.src = backbuffer;
+    copy.src_size = {uint32_t(width), uint32_t(height), 1};
+    copy.dst = destination;
+    auto encoder = cmdbuf.blitCommandEncoder();
+    if (fence) encoder.waitForFence(fence);
+    encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+    if (fence) encoder.updateFence(fence);
+    encoder.endEncoding();
+    work.identity_copy = true;
+    work.pq_code_copy = pipeline_key_.is_pq;
+    return drawable;
+  }
   WMTRenderPassInfo info;
   WMT::InitializeRenderPassInfo(info);
   info.colors[0].load_action = WMTLoadActionDontCare;
   info.colors[0].store_action = WMTStoreActionStore;
-  info.colors[0].texture = drawable.texture();
+  info.colors[0].texture = destination;
   if (composition_ && alpha_ == D3DalloyPresentAlpha::Premultiplied) {
     WMT::Texture residual{WMTCompositionDrawableResidualTexture(drawable.handle)};
     if (!residual) return {};
@@ -336,23 +384,18 @@ Presenter::encodeCommandsMetal4(
     info.colors[1].texture = residual;
   }
   auto encoder = cmdbuf.renderCommandEncoder(info);
-  wait_fences(encoder);
+  if (fence) encoder.waitForFence(fence, WMTRenderStageFragment);
   encoder.setFragmentTexture(backbuffer, 0);
   encoder.setFragmentTexture(gamma_lut_texture_, 1);
-  const double width = layer_props_.drawable_width;
-  const double height = layer_props_.drawable_height;
   encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
-  const auto &geometry = metadata.geometry;
-  const bool full_source = geometry.source_width == 0 ||
-      (geometry.source_width == backbuffer.width() && geometry.source_height == backbuffer.height());
-  if (backbuffer.width() == uint64_t(width) && backbuffer.height() == uint64_t(height) &&
+  if (source_width == uint64_t(width) && source_height == uint64_t(height) &&
       full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output)
     encoder.setRenderPipelineState(present_blit_);
   else
     encoder.setRenderPipelineState(present_scale_);
   encoder.setViewport({0, 0, width, height, 0, 1});
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
-  update_fences(encoder);
+  if (fence) encoder.updateFence(fence, WMTRenderStageFragment);
   encoder.endEncoding();
   return drawable;
 }

@@ -296,7 +296,7 @@ public:
     add(v->record_dwords, v->position_offset_dwords, v->viewport_index_offset_dwords,
         v->render_target_array_index_offset_dwords, v->clip_distance_offset_dwords,
         v->cull_distance_offset_dwords, v->user_count, v->shading_rate_offset_dwords,
-        v->primitive_id_offset_dwords, v->spill_count);
+        v->primitive_id_offset_dwords, v->spill_count, v->flags, v->clip_distance_count);
     for (uint32_t i = 0; i < v->user_count; ++i)
       add(v->users[i].hash, v->users[i].offset_dwords, v->users[i].size_bytes, v->users[i].flags);
   }
@@ -410,6 +410,7 @@ public:
       }
       case SM50_SHADER_D3D12_INDEX_PULL:
       case SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT:
+      case SM50_SHADER_D3D12_CAPTURE_FRONTIER:
       case SM50_SHADER_D3D12_PIPELINE_STATS:
       case SM50_SHADER_D3D12_PIPELINE_STATS_PER_PIXEL:
       case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM:

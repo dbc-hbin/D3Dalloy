@@ -34,12 +34,37 @@ struct SubmissionAccess {
     return physical.owner ? physical : PhysicalIdentity{PhysicalDomain::Legacy,reinterpret_cast<uintptr_t>(allocation)};
   }
 };
+// Native placement size, never a texel-derived estimate. Unknown extents retain
+// the whole-heap alias domain; both accesses and scoped boundaries use this.
+inline void SetHeapAccessExtent(SubmissionAccess &access, uint64_t offset, uint64_t size) {
+  const bool known = size && size <= UINT64_MAX - offset;
+  access.begin = known ? offset : 0;
+  access.end = known ? offset + size : UINT64_MAX;
+}
 inline bool AccessOverlaps(const SubmissionAccess& a,const SubmissionAccess& b) {
   if (a.Key()!=b.Key()) return false;
   if (a.Key().domain==PhysicalDomain::Heap || !a.aspects || !b.aspects)
     return a.begin < b.end && b.begin < a.end;
   return (a.aspects & b.aspects) && a.mip_begin < b.mip_end && b.mip_begin < a.mip_end &&
       a.slice_begin < b.slice_end && b.slice_begin < a.slice_end;
+}
+// UINT64_MAX is the planner's unknown whole-heap endpoint. Keep it outside
+// the attachment merge family even when an arithmetic extent ends there.
+inline bool HasFiniteHeapExtent(uint64_t offset, uint64_t size) {
+  return size && offset < UINT64_MAX - size;
+}
+// Heap aliases normally require native resource-alias visibility. The narrow
+// exception is the same retained texture/subresource used as an attachment:
+// native primitive ordering already orders it, including the depth/stencil
+// aspect pair that the physical heap frontier deliberately treats as one span.
+// View compatibility and disjoint attachment unions are checked separately.
+inline bool AttachmentDependencyOrdered(const SubmissionAccess &a, const SubmissionAccess &b) {
+  if (!a.attachment || !b.attachment || a.Key() != b.Key()) return false;
+  if (a.Key().domain != PhysicalDomain::Heap) return true;
+  return a.allocation && a.allocation == b.allocation && a.begin < a.end &&
+      HasFiniteHeapExtent(a.begin, a.end - a.begin) && a.begin == b.begin && a.end == b.end &&
+      a.mip_begin == b.mip_begin && a.mip_end == b.mip_end &&
+      a.slice_begin == b.slice_begin && a.slice_end == b.slice_end;
 }
 // Interval subdivision is exact: a partial write removes only covered history;
 // readers of untouched portions remain. Texture aspects/mips are separate lanes

@@ -50,6 +50,7 @@
 #include "owned_rtas_mirror.hpp"
 #include "owned_async_pipeline.hpp"
 #include "owned_native_states.hpp"
+#include "owned_gpu_execution_gate.hpp"
 #include "config/config.hpp"
 #include "thread.hpp"
 #include <algorithm>
@@ -406,6 +407,8 @@ public:
   UINT DrawArgumentOffset = ~0u;
   UINT IndexBufferArgumentOffset = ~0u;
   std::vector<Atomic64IndirectRootField> atomic64_root_fields;
+  struct RootConstantRange { uint32_t parameter, first, count; };
+  std::vector<RootConstantRange> root_constant_ranges;
   uint64_t RootParameterMask;
   uint32_t VertexBufferMask;
   UINT UpdateRootArguments : 1;
@@ -453,10 +456,16 @@ struct ShaderImmutableConstants {
   WMT::Reference<WMT::Buffer> buffer;
   uint64_t offset = 0;
   uint64_t gpu_address = 0;
+  // Only Atomic64 pools retain a relocation recipe. The published PSO pool is
+  // immutable; each execution patches a private copy to its own phase header.
+  uint64_t size = 0, alignment = 0;
+  const uint8_t *mapped = nullptr;
+  std::vector<SM50_CONSTANT_RELOCATION> atomic64_relocations;
 
   /** `bitcode` owns `compiled`'s parts; null only when they are directly addressable (a loaded cache blob).
    * Relocations naming SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE resolve to `device`'s lock table. */
   HRESULT Initialize(MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode);
+  HRESULT CopyForAtomic64(uint64_t context, uint64_t address, void *destination) const;
 };
 
 class DeviceShaderArtifactCache;
@@ -551,6 +560,18 @@ struct MSAAPipelineVariants {
   SM50_MSAA_PIXEL_LAYOUT layout{};
   SM50_MSAA_VERTEX_LAYOUT vertex_layout{};
   bool sample_frequency = false;
+  bool gpu_tile_tasks = false;
+};
+
+/* A native SO frontier executes the application VS once in compute, then
+ * replays its exact native return with the original raster/fragment state. */
+struct CaptureFrontierPipelines {
+  WMT::Reference<WMT::ComputePipelineState> capture;
+  WMT::Reference<WMT::RenderPipelineState> replay;
+  ShaderImmutableConstants capture_constants;
+  ShaderImmutableConstants replay_vertex_constants;
+  ShaderImmutableConstants replay_fragment_constants;
+  SM50_MSAA_VERTEX_LAYOUT vertex_layout{};
 };
 
 /*
@@ -575,6 +596,8 @@ constexpr uint32_t kMeshMSAACapture = 64;
 constexpr uint32_t kMeshMSAAReplay = 128;
 constexpr uint32_t kMeshObjectCapture = 256;
 constexpr uint32_t kMeshObjectReplay = 512;
+constexpr uint32_t kMeshCaptureFrontier = 1024;
+constexpr uint32_t kMeshMSAAGPUTileTasks = 2048;
 
 struct MeshPipelineVariant {
   WMT::Reference<WMT::RenderPipelineState> pso;
@@ -713,7 +736,9 @@ public:
   virtual WMT::RenderPipelineState GetPipelineStatisticsPipelineState(bool indirect) = 0;
   /* `coarse`: variable-rate coarse shading variants (SM50_SHADER_D3D12_COARSE_SHADING); the layout carries
    * SM50_MSAA_PIXEL_COARSE when the PS is eligible, otherwise they shade at fine rate. */
-  virtual const MSAAPipelineVariants *GetMSAAPipelineVariants(bool statistics = false, bool coarse = false) = 0;
+  virtual const MSAAPipelineVariants *GetMSAAPipelineVariants(
+      bool statistics = false, bool coarse = false, bool frontier = false) = 0;
+  virtual const CaptureFrontierPipelines *GetCaptureFrontierPipelines(bool statistics) = 0;
   uint32_t EffectiveRasterSampleCount() const {
     return forced_sample_count ? forced_sample_count : owned_sample_desc.Count;
   }
@@ -769,6 +794,14 @@ struct RTASState {
   uint64_t nativeSize = 0;
   uint32_t instanceCount = 0;
   std::shared_ptr<const raytracing::StructureInfo> info;
+  // Metadata of a proven ordinary build/refit encoding, not CPU publication or
+  // GPU completion. FindEncoded additionally requires the same FIFO queue.
+  struct {
+    raytracing::ShadowMetadata metadata{};
+    uint64_t resourceID = 0;
+    uint64_t nativeSize = 0;
+    uint64_t instanceCount = 0;
+  } execution{};
 };
 
 /*
@@ -788,84 +821,6 @@ using RTASLifetime = owned_graphics::RTASLifetime<raytracing::ArenaKey, RTASStat
 
 // Tickets are released by GPU retirement, potentially on a different CPU thread.
 // A shared_mutex lock is therefore not a suitable submission lifetime token.
-class GPUExecutionGate {
-  std::mutex mutex_;
-  std::condition_variable changed_;
-  uint64_t readers_ = 0, writers_waiting_ = 0;
-  bool exclusive_ = false, cancelled_ = false;
-
-public:
-  class EncodingAdmission {
-    GPUExecutionGate *gate_;
-    EncodingAdmission *previous_;
-    inline static thread_local EncodingAdmission *current_ = nullptr;
-    friend class GPUExecutionGate;
-  public:
-    explicit EncodingAdmission(GPUExecutionGate &gate) : gate_(&gate), previous_(current_) { current_ = this; }
-    EncodingAdmission(const EncodingAdmission &) = delete;
-    EncodingAdmission &operator=(const EncodingAdmission &) = delete;
-    ~EncodingAdmission() { current_ = previous_; }
-  };
-  bool CurrentThreadAdmitted() const {
-    for (auto *scope = EncodingAdmission::current_; scope; scope = scope->previous_)
-      if (scope->gate_ == this) return true;
-    return false;
-  }
-  class Ticket {
-    GPUExecutionGate *gate_ = nullptr;
-    bool exclusive_ = false;
-    friend class GPUExecutionGate;
-    Ticket(GPUExecutionGate *gate, bool exclusive) : gate_(gate), exclusive_(exclusive) {}
-
-  public:
-    Ticket() = default;
-    Ticket(const Ticket &) = delete;
-    Ticket &operator=(const Ticket &) = delete;
-    Ticket(Ticket &&other) noexcept : gate_(std::exchange(other.gate_, nullptr)), exclusive_(other.exclusive_) {}
-    Ticket &operator=(Ticket &&other) noexcept {
-      if (this != &other) {
-        Reset();
-        gate_ = std::exchange(other.gate_, nullptr);
-        exclusive_ = other.exclusive_;
-      }
-      return *this;
-    }
-    ~Ticket() { Reset(); }
-    explicit operator bool() const { return gate_ != nullptr; }
-    void Reset() {
-      auto *gate = std::exchange(gate_, nullptr);
-      if (!gate) return;
-      {
-        std::lock_guard lock(gate->mutex_);
-        if (exclusive_) gate->exclusive_ = false;
-        else --gate->readers_;
-      }
-      gate->changed_.notify_all();
-    }
-  };
-
-  Ticket AcquireShared() {
-    std::unique_lock lock(mutex_);
-    changed_.wait(lock, [&] { return cancelled_ || (!exclusive_ && !writers_waiting_); });
-    if (cancelled_) return {};
-    ++readers_;
-    return Ticket(this, false);
-  }
-  Ticket AcquireExclusive() {
-    std::unique_lock lock(mutex_);
-    ++writers_waiting_;
-    changed_.wait(lock, [&] { return cancelled_ || (!exclusive_ && !readers_); });
-    --writers_waiting_;
-    if (cancelled_) return {};
-    exclusive_ = true;
-    return Ticket(this, true);
-  }
-  void Cancel() {
-    { std::lock_guard lock(mutex_); cancelled_ = true; }
-    changed_.notify_all();
-  }
-};
-
 struct Atomic64PhasePipelines;
 
 /* d3d12.asyncPipelineCompile: device-owned workers for deferred graphics PSO linking, the
@@ -924,6 +879,20 @@ public:
   DeviceDiagnostics diagnostics{this};
   ReflexState reflex{Config::getInstance().getOption<bool>("d3d12.lowLatency", false)};
   GPUExecutionGate gpu_execution_gate;
+  // Values only. An equality proof never extends a resource's lifetime.
+  struct SwizzleCarry {
+    uint64_t resource_id;
+    obj_handle_t canonical, shadow;
+    uintptr_t layout;
+    std::array<uint64_t, 4> valid;
+    uint64_t queue, submission;
+  };
+  struct {
+    std::mutex mutex;
+    std::array<SwizzleCarry, 64> entries;
+    size_t count = 0;
+    uint64_t serial = 0;
+  } swizzle_proofs;
   AsyncPipelineCompiler async_pipelines{Config::getInstance().getOption<bool>("d3d12.asyncPipelineCompile", false),
                                         Config::getInstance().getOption<int32_t>("d3d12.asyncPipelineCompileThreads", 0)};
   std::shared_ptr<Atomic64PhasePipelines> atomic64_phase_pipelines;
@@ -987,6 +956,7 @@ public:
   ) = 0;
 
   virtual Rc<BufferAllocation> LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
+  virtual std::vector<Rc<BufferAllocation>> SnapshotBufferAllocations() = 0;
   /* LookupBufferByVA that also reports the VA interval [*pBegin, *pEnd) over which the same
    * allocation is returned and the map generation observed; *pEnd is 0 for a null result. */
   virtual Rc<BufferAllocation> LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin,
@@ -1003,6 +973,7 @@ public:
 
   /* Sidecar lookup/publish for the acceleration structure at a D3D12 address. */
   virtual bool FindRTAS(const raytracing::ArenaKey &key, RTASState &state) = 0;
+  virtual bool FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state) = 0;
   virtual bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) = 0;
 
   /**
@@ -1023,18 +994,12 @@ public:
   virtual void ReleaseRTASLease(const raytracing::ArenaKey &key, uint32_t token) = 0;
 
   /**
-   * Take a second lease on a published version: its recording has been handed to a submission, so
-   * the version must survive the recording that published it.
+   * Take the submission lease and record this writer's FIFO execution provenance. A null
+   * metadata pointer invalidates the ordinary-refit proof (copy/compact/deserialize, etc.).
+   * This never observes a GPU token or completes a public fence.
    */
-  virtual void HoldRTASLease(const raytracing::ArenaKey &key, uint32_t token) = 0;
-
-  /**
-   * Report the version the GPU header holds for a D3D12 address, read from the shared mirror
-   * once the submission that wrote it has completed. This is the only authority on which native
-   * structure a dispatch will read, and it is what allows an executed version to be superseded
-   * and eventually released without ever guessing at GPU execution order.
-   */
-  virtual void ObserveRTAS(const raytracing::ArenaKey &key) = 0;
+  virtual void RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue,
+      const raytracing::ShadowMetadata *metadata) = 0;
 
   /**
    * Submission lifetime. A queue marks a submission active before it is enqueued and retires it
@@ -1043,7 +1008,9 @@ public:
    */
   virtual uint64_t BeginRTASSubmission() = 0;
 
-  virtual void RetireRTASSubmission(uint64_t id) = 0;
+  /** Observe GPU mirrors, release submission leases and retire under one residency lock/sweep. */
+  virtual void CompleteRTASSubmission(uint64_t id,
+      std::span<const std::pair<raytracing::ArenaKey, uint32_t>> leases, bool observe_gpu) = 0;
 
   /* Lazily compiled prepass/write/finalize kernels out of the internal command library. */
   virtual HRESULT GetRTASComputePipelines(RTASComputePipelines &pipelines) = 0;
@@ -1061,12 +1028,14 @@ public:
   // are shared; argument tables and recording state remain command-list local.
   std::mutex owned_helper_pipeline_mutex;
   WMT::Reference<WMT::Library> owned_predication_library;
-  std::array<WMT::Reference<WMT::ComputePipelineState>, 8> owned_predication_pipelines;
+  std::array<WMT::Reference<WMT::ComputePipelineState>, 11> owned_predication_pipelines;
   std::array<WMT::Reference<WMT::ComputePipelineState>, 2> owned_feedback_pipelines;
   enum class CommandHelper {
     D24Upload, D24Readback, RGB32Expand, RGB32Compact, Packed422Expand, Packed422Compact,
-    StreamOutputAssemble, StreamOutputPositions, StreamOutputIndirect, StreamOutputGS,
-    MSAAAssembly, MSAABounds, AtomicCopyU32, AtomicCopyU64, MatrixConversion, RaysIndirect, Count
+    StreamOutputAssemble, StreamOutputPositions, StreamOutputGS,
+    MSAAAssembly, MSAABounds, AtomicCopyU32, AtomicCopyU64, MatrixConversion, RaysIndirect,
+    CaptureFrontierPrepare, CaptureFrontierClear, CaptureFrontierConsume, CaptureFrontierAdvance,
+    MSAATilePrepare, MSAATileClear, MSAATileExtent, Count
   };
   struct CommandHelperEntry {
     WMT::Reference<WMT::Library> library;
@@ -1098,9 +1067,10 @@ public:
   WMT::Reference<WMT::DepthStencilState> default_depth_stencil_state;
 };
 
-// Flip-sequential partial presents composite into two private, source-sized
-// textures. Every submitted frame retains the generation until GPU completion,
-// including when ResizeBuffers replaces the swapchain's history.
+// Flip-sequential partial presents update one persistent image. The second
+// texture snapshots only a scroll source rectangle before an overlapping move.
+// The present-order GPU event serializes access across queues. Each submitted
+// frame retains this generation until retirement, including after ResizeBuffers.
 struct D3DalloyPresentHistory {
   Com<MTLD3D12Device> device;
   std::array<WMT::Reference<WMT::Texture>, 2> textures;
@@ -1119,7 +1089,6 @@ struct D3DalloyPresentComposition {
   uint32_t sync_interval = 0;
   bool allow_tearing = false;
   std::shared_ptr<D3DalloyPresentHistory> history;
-  UINT write_index = 0;
   bool has_previous = false;
   bool scroll = false;
   RECT scroll_rect{};

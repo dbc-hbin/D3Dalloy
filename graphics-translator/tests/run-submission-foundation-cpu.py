@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the actual access/VA/native-state implementations with sanitizers."""
+"""Compile actual access/sparse-heap/VA/native-state implementations with sanitizers."""
 from pathlib import Path
 import subprocess
 import tempfile

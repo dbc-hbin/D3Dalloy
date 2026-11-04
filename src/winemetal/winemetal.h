@@ -761,6 +761,8 @@ WINEMETAL_API bool WMTASEncoder_copy(obj_handle_t encoder, obj_handle_t source_s
 WINEMETAL_API void WMTASEncoder_compactedSize(obj_handle_t encoder, obj_handle_t source_sidecar,
     obj_handle_t destination_buffer, uint64_t destination_offset);
 
+enum { WMTASPrepassWriteShadow = 1u };
+
 struct WMTASPrepassInfo {
   uint64_t as_resource_id;
   uint64_t contributions_address;
@@ -773,6 +775,10 @@ struct WMTASPrepassInfo {
   uint32_t version_token;
   /* Slot in the shared version-mirror page the token is published into. */
   uint32_t live_mirror_slot;
+  /* WMTASPrepassWriteShadow: TLAS build/refit writes the original instance snapshot. */
+  uint32_t flags;
+  /* Bit-exact header bytes 16..63, matching raytracing::ShadowMetadata. */
+  uint64_t shadow_metadata[6];
 };
 
 /**

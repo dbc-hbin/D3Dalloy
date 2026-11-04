@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace d3dalloy::raytracing {
 namespace {
@@ -311,8 +312,42 @@ bool CalculatePrepassLayout(uint32_t instanceCount, PrepassLayout &layout) {
   return true;
 }
 
+bool MakeNativeSizeKey(const BuildInputs &inputs, NativeSizeKey &key) noexcept {
+  key = {};
+  if ((inputs.type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+       inputs.type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) ||
+      inputs.geometries.size() > owned_graphics::RTASSizeCache::kMaxGeometries)
+    return false;
+  try {
+    NativeSizeKey shape;
+    shape.type = uint32_t(inputs.type);
+    shape.flags = uint32_t(inputs.flags);
+    shape.metalUsage = inputs.metalUsage;
+    if (inputs.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+      // Both D3D12 instance layouts become the same 72-byte native indirect layout.
+      shape.instanceCount = inputs.instanceCount;
+    } else {
+      shape.geometries.reserve(inputs.geometries.size());
+      for (const auto &geometry : inputs.geometries)
+        shape.geometries.push_back({uint32_t(geometry.type), uint32_t(geometry.flags), geometry.primitiveCount,
+            geometry.stride, geometry.vertexFormat, uint32_t(geometry.indexFormat), geometry.hasTransform,
+            bool(geometry.verticesOrBoxes.buffer), bool(geometry.indices.buffer), bool(geometry.transform.buffer)});
+    }
+    // This covers every variable scalar passed to the native descriptor below;
+    // IFT slots derive from geometry type and matrix/instance layouts are fixed.
+    // Empty BLAS uses the fixed zero-triangle placeholder descriptor. Preserve
+    // native buffer presence separately from semantic flags: prebuild queries
+    // leave index/transform bindings unresolved even when their formats exist.
+    // No buffer addresses, contents, owners or shadow payloads are retained.
+    key = std::move(shape);
+    return true;
+  } catch (const std::bad_alloc &) {
+    return false;
+  }
+}
+
 HRESULT CreateNativeDescriptor(WMT::Device device, const BuildInputs &inputs,
-    WMT::Buffer convertedInstances, NativeDescriptor &result) {
+    WMT::Buffer convertedInstances, NativeDescriptor &result, const NativeSizes *knownSizes) {
   if (uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY) { result = {}; return S_OK; }
   const bool topLevel = inputs.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
   const uint32_t geometryCount = topLevel ? 0 : static_cast<uint32_t>(inputs.geometries.size());
@@ -347,14 +382,20 @@ HRESULT CreateNativeDescriptor(WMT::Device device, const BuildInputs &inputs,
         return E_INVALIDARG;
     }
   }
-  const auto sizes = device.accelerationStructureSizes(descriptor);
+  NativeSizes sizes{};
+  if (knownSizes) {
+    sizes = *knownSizes;
+  } else {
+    const auto queried = device.accelerationStructureSizes(descriptor);
+    sizes = {queried.acceleration_structure_size, queried.build_scratch_size, queried.refit_scratch_size};
+  }
   // Metal reports a zero refit scratch size for descriptors whose refit needs no temporary
   // storage, and D3D12 accepts that: only the sizes required to create and initially build the
   // structure are mandatory.
-  if (!sizes.acceleration_structure_size || !sizes.build_scratch_size)
+  if (!sizes.accelerationStructureSize || !sizes.buildScratchSize)
     return E_FAIL;
   result.descriptor = std::move(descriptor);
-  result.sizes = {sizes.acceleration_structure_size, sizes.build_scratch_size, sizes.refit_scratch_size};
+  result.sizes = sizes;
   return S_OK;
 }
 
@@ -381,7 +422,7 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
   if (!CheckedAdd(cursor, inputs.geometries.size() * sizeof(ShadowGeometry), cursor))
     return false;
   auto append = [&](uint64_t source, uint64_t sourceStride, uint32_t bytes, uint32_t count,
-                    uint64_t &offset) {
+                    uint64_t &offset, uint32_t flags = 0) {
     uint64_t size;
     const uint32_t stride = (bytes + 3u) & ~3u;
     if (!CheckedAlign(cursor, kShadowAlignment, cursor) || !CheckedMul(count, stride, size))
@@ -390,7 +431,7 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
     if (!CheckedAdd(cursor, size, cursor))
       return false;
     if (count)
-      plan.jobs.push_back({source, offset, sourceStride, bytes, stride, count, kShadowJobAddress, 0});
+      plan.jobs.push_back({source, offset, sourceStride, bytes, stride, count, kShadowJobAddress, flags});
     return true;
   };
   for (const auto &geometry : inputs.geometries) {
@@ -413,7 +454,7 @@ bool PlanShadow(const BuildInputs &inputs, ShadowPlan &plan) {
     if (triangles && geometry.indexFormat != DXGI_FORMAT_UNKNOWN &&
         !append(geometry.indices.address, geometry.indexFormat == DXGI_FORMAT_R16_UINT ? 2 : 4,
                 geometry.indexFormat == DXGI_FORMAT_R16_UINT ? 2 : 4,
-                geometry.primitiveCount ? geometry.indexCount : 0, record.indexOffset))
+                geometry.primitiveCount ? geometry.indexCount : 0, record.indexOffset, kShadowJobIndex))
       return false;
     if (geometry.hasTransform && !append(geometry.transform.address, 48, 48,
                                         geometry.primitiveCount ? 1 : 0, record.transformOffset))

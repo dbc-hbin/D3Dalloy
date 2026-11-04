@@ -58,6 +58,7 @@ SUITE_PREFIXES = {
     "atomic-copy": "OWNED_D3D12_ATOMIC_COPY",
     "atomic-copy-live": "OWNED_D3D12_ATOMIC_COPY",
     "atomic64-phase": "OWNED_D3D12_ATOMIC64_PHASE",
+    "atomic64-context": "OWNED_D3D12_ATOMIC64_CONTEXT",
     "atomic64-helpers": "OWNED_D3D12_ATOMIC64_HELPERS",
     "atomic64-pixel-coupled": "OWNED_D3D12_ATOMIC64_PIXEL",
     "atomic64-pixel-contention": "OWNED_D3D12_ATOMIC64_PIXEL_CONTENTION",
@@ -65,6 +66,7 @@ SUITE_PREFIXES = {
     "atomic64-groupshared-capacity": "OWNED_D3D12_ATOMIC64",
     "atomic64-typed": "OWNED_D3D12_ATOMIC64_TYPED",
     "present-queues": "OWNED_D3D12_PRESENT_QUEUES",
+    "present-history": "OWNED_D3D12_PRESENT_HISTORY",
     "hdr-metadata": "OWNED_D3D12_HDR_METADATA",
     "colorspace": "OWNED_D3D12_COLORSPACE",
     "fullscreen": "OWNED_DXGI_FULLSCREEN",
@@ -101,6 +103,8 @@ SUITE_PREFIXES = {
     "depth-bounds": "OWNED_D3D12_DEPTH_BOUNDS",
     "dxil-resource-review": "OWNED_D3D12_DXIL_RESOURCE_REVIEW",
     "raytracing": "OWNED_D3D12_RAYTRACING",
+    "raytracing-metadata-arena": "OWNED_D3D12_RAYTRACING_METADATA_ARENA",
+    "raytracing-refit-chain": "OWNED_D3D12_REFIT_CHAIN",
     "raytracing-atomic64": "OWNED_D3D12_RAYTRACING_ATOMIC64",
     "raytracing-omm": "OWNED_D3D12_OMM",
     # BINDLESS: Tier 3, SM 6.6 dynamic resources, root signature 1.2.
@@ -121,6 +125,8 @@ SUITE_PREFIXES = {
     "sm6": "OWNED_D3D12_SM6",
     "wide-waves": "OWNED_D3D12_WIDE_WAVES",
     "workgraph-batches": "OWNED_D3D12_WG_BATCH",
+    "workgraph-frontier": "OWNED_D3D12_WG_FRONTIER",
+    "workgraph-texture-frontier": "OWNED_D3D12_WG_TEXTURE_FRONTIER",
     "submission-foundation": "OWNED_D3D12_SUBMISSION_FOUNDATION",
     "rt-executable-cache": "OWNED_D3D12_RT_EXECUTABLE",
     "waves": "OWNED_D3D12_WAVES",
@@ -167,6 +173,8 @@ DEFAULT_DXIL_DIR = REPOSITORY_ROOT / "graphics-translator/tests/dxil"
 FG_CAPTURE_CHECKER = REPOSITORY_ROOT / "graphics-translator/tests/check-owned-fg-capture.py"
 # NGX and FSR fixtures run on the temporal backend and publish its identity line.
 BACKEND_PREFIXES = {
+    "raytracing-metadata-arena": "OWNED_D3D12_RAYTRACING",
+    "raytracing-refit-chain": "OWNED_D3D12_RAYTRACING",
     "raytracing-atomic64": "OWNED_D3D12_RAYTRACING",
     "relaxed-casting-shared": "RELAXED_CASTING",
     "relaxed-casting-volume": "RELAXED_CASTING",
@@ -238,6 +246,8 @@ ATOMIC64_PHASE_INPUTS = ("atomic64-phase.dxil", "atomic64-phase-prepare.dxil",
                         "atomic64-phase-returning.dxil", "atomic64-phase-observe32.dxil",
                         "atomic64-phase.hlsl", "build-atomic64-phase.sh")
 STREAM_OUTPUT_SHADERS = ("stream-output-packed-vs.dxil",)
+STREAM_OUTPUT_FRONTIER_INPUTS = ("stream-output-frontier-vs.dxil", "stream-output-frontier.hlsl",
+                                "build-stream-output-frontier.sh")
 # GS multi-stream cases load these by name beside the fixture (not passed on the command line).
 STREAM_OUTPUT_GS_INPUTS = ("stream-output-gs-vs_gs.dxil", "stream-output-gs-gs_multi.dxil")
 PARTIAL_3D_UAV_SHADERS = ("partial-3d-uav.dxil",)
@@ -405,7 +415,9 @@ TILED_CASES = (
     "volume-predicated-CopyResource-skip-all-mips",
     "volume-predicated-CopyResource-execute-all-mips-64KB-padding",
     "volume-predicated-CopyTextureRegion-skip-xyz", "volume-predicated-CopyTextureRegion-execute-xyz",
-    "volume-mip1-partialW-RTV-clear-dxbc-dxil-draw-64KB-alias", "caps",
+    "volume-mip1-partialW-RTV-clear-dxbc-dxil-draw-64KB-alias",
+    "volume-dxil-frontier-partial-w-RTV-residency", "volume-dxbc-frontier-partial-w-RTV-residency",
+    "mapping-gpu-timeline-closed-replay", "mapping-burst-fence-snapshots", "mapping-scattered-multiple-resources", "caps",
 )
 MSAA_LINE_INPUTS = (
     "msaa-lines-input.hlsl", "msaa-lines-vsLine.dxil", "msaa-lines-vsLineEdge.dxil",
@@ -504,7 +516,7 @@ SAMPLER_FEEDBACK_CASES = (
     "encode_decode_round_trips", "copy_resource_allowed_copy_texture_region_rejected",
 ) + tuple(f"cs_{shape}_{sampler}" for shape in _SF_SHAPES for sampler in _SF_SAMPLERS) + (
     "cs_srv_subrange_minmip", "cs_srv_subrange_used", "cs_srv_array_subrange_used", "cs_static_sampler_used",
-    "cs_null_paired_texture_drops_writes",
+    "cs_null_paired_texture_drops_writes", "cs_aniso16_window_minmip", "cs_aniso16_window_used",
 ) + tuple(f"{op}_{_SF_SHAPES[shape]}_{_SF_SAMPLERS[sampler]}"
           for shape in (0, 1, 4, 5) for sampler in (1, 2, 4) for op in ("ps_implicit", "ps_bias", "ps_clamp"))
 PIPELINE_STATISTICS_STAGE_INPUTS = (
@@ -954,6 +966,9 @@ ATOMIC64_PRODUCER_COUNTS = {
     "gs": (0, 0, 0, 4, 0, 0), "ds_gs": (0, 0, 6, 4, 0, 0), "ms_grid": (0, 0, 0, 0, 0, 16),
     "as_child1": (0, 0, 0, 0, 8, 8), "as_child2": (0, 0, 0, 0, 8, 16),
     "as_child3d": (0, 0, 0, 0, 8, 32),
+    "vs_indirect": (6, 0, 0, 0, 0, 0), "hs_indirect": (0, 6, 0, 0, 0, 0),
+    "ds_indirect": (0, 0, 6, 0, 0, 0), "gs_indirect": (0, 0, 0, 4, 0, 0),
+    "ds_gs_indirect": (0, 0, 6, 4, 0, 0),
 }
 ATOMIC64_PRODUCER_ENTRIES = ("vs_plain", "vs_atomic", "hs_plain", "hs_atomic", "ds_plain", "ds_atomic",
                             "gs_atomic", "as_atomic", "ms_atomic", "ms_payload", "ps_sample")
@@ -1048,7 +1063,7 @@ def atomic64_producers_failures(stdout: str, stderr: str) -> list[str]:
                           stdout, re.MULTILINE)
     if (verdicts != [(name, str(samples), "PASS") for name, samples in cases]
             or stdout.count("OWNED_D3D12_ATOMIC64_PRODUCERS_CASE ") != len(cases)
-            or stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PRODUCERS_PASS cases=18 stages=VS,HS,DS,GS,AS,MS") != 1):
+            or stdout.splitlines().count("OWNED_D3D12_ATOMIC64_PRODUCERS_PASS cases=28 stages=VS,HS,DS,GS,AS,MS") != 1):
         failures.append("atomic64 producer completion missing, duplicated or failed")
     if re.search(r"OWNED_D3D12_ATOMIC64_PRODUCERS_FAIL|OWNED_D3D12_SM6_MISMATCH|kIOGPUCommandBufferCallbackError", stdout + stderr):
         failures.append("atomic64 producer fixture or GPU failure")
@@ -1152,11 +1167,11 @@ def raytracing_atomic64_failures(stdout: str, stderr: str) -> list[str]:
                 failures.append(f"atomic64 RT lane{index} returning RMW/CAS readback wrong")
     extended_rows = re.findall(r"^OWNED_D3D12_RAYTRACING_ATOMIC64_EXT_LANE mode=(\d+) lane=(\d+) words=\("
                               + ",".join([r"0x([0-9a-f]{8})"] * 20) + r"\)$", stdout, re.MULTILINE)
-    if ([(int(row[0]), int(row[1])) for row in extended_rows] != [(mode, lane) for mode in range(2) for lane in range(24)]
-            or stdout.count("OWNED_D3D12_RAYTRACING_ATOMIC64_EXT_LANE ") != 48):
+    if ([(int(row[0]), int(row[1])) for row in extended_rows] != [(mode, lane) for mode in range(3) for lane in range(24)]
+            or stdout.count("OWNED_D3D12_RAYTRACING_ATOMIC64_EXT_LANE ") != 72):
         failures.append("atomic64 RT direct/indirect all-stage readback count/order/shape wrong")
     else:
-        for mode in range(2):
+        for mode in range(3):
             tickets = []
             for _, lane, *values in extended_rows[mode * 24:(mode + 1) * 24]:
                 index = int(lane)
@@ -1187,9 +1202,9 @@ def raytracing_atomic64_failures(stdout: str, stderr: str) -> list[str]:
                 failures.append(f"atomic64 RT mode{mode} shared-cell returning ticket multiset wrong")
     extended_shared = re.findall(r"^OWNED_D3D12_RAYTRACING_ATOMIC64_EXT_SHARED mode=(\d+) words=\("
                                 + ",".join([r"0x([0-9a-f]{8})"] * 4) + r"\)$", stdout, re.MULTILINE)
-    if extended_shared != [(str(mode), "00000017", "00000018", "0000005f", "00000000") for mode in range(2)]:
+    if extended_shared != [(str(mode), "00000017", "00000018", "0000005f", "00000000") for mode in range(3)]:
         failures.append("atomic64 RT shared-cell final value or stage-once counter wrong")
-    for mode in range(2):
+    for mode in range(3):
         extended_summary = f"OWNED_D3D12_RAYTRACING_ATOMIC64_EXT mode={mode} lanes=24 words=484 local=cbv stages=96 tickets=24 status=PASS"
         if stdout.splitlines().count(extended_summary) != 1:
             failures.append(f"atomic64 RT mode{mode} local-CBV/all-stage summary wrong")
@@ -1211,6 +1226,15 @@ def raytracing_failures(stdout: str, stderr: str) -> list[str]:
                                 re.MULTILINE)
     if hitobject_cases != ["PASS"]:
         failures.append("raytracing requires exactly one completed HitObject GPU oracle")
+    control_cases = re.findall(r"^OWNED_D3D12_RAYTRACING_CASE trace-control status=(PASS|FAIL)$", stdout,
+                              re.MULTILINE)
+    control_runs = re.findall(
+        r"^OWNED_D3D12_RAYTRACING_TRACE_CONTROL path=(native|query) deferred=([01]) rays=(\d+) words=(\d+) status=(PASS|FAIL)$",
+        stdout, re.MULTILINE)
+    if control_cases != ["PASS"] or control_runs != [
+            (path, str(deferred), "16", "512", "PASS")
+            for path in ("native", "query") for deferred in (0, 1)]:
+        failures.append("raytracing requires native/query ordinary/HitObject first-hit and control-state GPU oracles")
     coherence_cases = re.findall(r"^OWNED_D3D12_RAYTRACING_CASE hitobject-reorder-coherence status=(PASS|FAIL)$",
                                 stdout, re.MULTILINE)
     coherence_summary = re.findall(
@@ -1389,6 +1413,22 @@ def atomic64_phase_failures(stdout: str, stderr: str = "") -> list[str]:
         values = (initial, initial + 0x100000001, modified, modified,
                   0x123456789abcdef0, 0x123456789abcdef0)
         expected.append(prefix + f"MAP iteration={iteration} words=" + ",".join(f"{v:016x}" for v in values))
+    sparse_values = (
+        (0, (0x5555555500000000, 0x5555555600000001, 0x8765432100000001, 0x8765432100000001,
+             0x123456789abcdef0, 0x123456789abcdef0, 0x2222222200000002,
+             0xa11a11a11a11a11a, 0xb22b22b22b22b22b)),
+        (1, (0x5555555500000003, 0x123456789abcdef0, 0x5555555600000004, 0x5555555600000004,
+             0x876543219abcdef0, 0x876543219abcdef0, 0x5555555600000004,
+             0xa11a11a11a11a11a, 0xb22b22b22b22b22b)),
+        (0, (0x5555555500000006, 0x5555555600000007, 0x8765432100000007, 0x8765432100000007,
+             0x123456789abcdef0, 0x123456789abcdef0, 0x5555555600000004,
+             0xa11a11a11a11a11a, 0xb22b22b22b22b22b)),
+        (0, (0x5555555500000009, 0x555555560000000a, 0x876543210000000a, 0x876543210000000a,
+             0x123456789abcdef0, 0x123456789abcdef0, 0x5555555600000004,
+             0xa11a11a11a11a11a, 0xb22b22b22b22b22b)),
+    )
+    for iteration, (tile, values) in enumerate(sparse_values):
+        expected.append(prefix + f"SPARSE iteration={iteration} tile={tile} words=" + ",".join(f"{v:016x}" for v in values))
     cases = ("indirect_nonzero", "indirect_count_zero", "indirect_dimension_zero", "indirect_predicate_zero",
              "crossqueue_atomic_to_ordinary", "crossqueue_ordinary_to_atomic")
     for case_index, case in enumerate(cases):
@@ -1477,6 +1517,370 @@ def phase3_trace(text: str, limit: int = 8192) -> tuple[list[dict], list[str]]:
                     failures.append("phase3 producer causal order differs")
                 lanes[producer] = ordinal
     return events, failures
+
+
+def raytracing_refit_chain_failures(stdout: str, stderr: str) -> list[str]:
+    """GPU/public-layout oracle shared by old and optimized runtimes; no fast-path trace requirement."""
+    prefix = "OWNED_D3D12_REFIT_CHAIN"
+    cases = (("chain", (1, 2)), ("replay", (1, 2)), ("cross-queue", (3,)), ("after-cross", (1, 2)))
+    failures = []
+    recording_prefix = (prefix + "_RECORDINGS initial_lists=2 r_executions=3 r2_executions=1 "
+                        "unpublished_builds=2 cross_queue=1")
+    recordings = [line for line in stdout.splitlines() if line.startswith(prefix + "_RECORDINGS")]
+    # The fixture prints indexed=1 only for the exact OWNED_D3D12_REFIT_INDEXED=1
+    # request. Never infer its input mode from the sizes under test. Older default
+    # fixtures omit the suffix and retain the nonindexed contract.
+    if len(recordings) != 1 or recordings[0] not in (
+            recording_prefix, recording_prefix + " indexed=0", recording_prefix + " indexed=1"):
+        return ["refit chain recording/indexed-mode evidence invalid"]
+    indexed = recordings[0] == recording_prefix + " indexed=1"
+    bits = lambda value: struct.unpack("<I", struct.pack("<f", value))[0]
+    sources = re.findall(rf"^{prefix}_SOURCE blas_address=([0-9a-f]+) tlas_address=([0-9a-f]+) "
+                         r"blas_prebuild=(\d+) tlas_prebuild=(\d+)$", stdout, re.MULTILINE)
+    if len(sources) != 1:
+        return ["refit chain source/prebuild evidence incomplete"]
+    blas, tlas = (int(value, 16) for value in sources[0][:2])
+    prebuild = {kind: int(value) for kind, value in zip(("blas", "tlas"), sources[0][2:])}
+    if (not blas or not tlas or blas == tlas or blas % 256 or tlas % 256 or
+            any(not value or value % 256 for value in prebuild.values())):
+        failures.append("refit chain source alignment/prebuild evidence invalid")
+    expected_rays = []
+    for name, steps in cases:
+        for step in steps:
+            for lane in range(4):
+                instance, geometry = divmod(lane, 2)
+                words = [1, 0, 0x80 + 16 * step + instance, instance, geometry, 0xff, bits(3 * step + 1), 0,
+                         bits(0.25), bits(0.25), 0x1000, 0xffffffff, 0x101]
+                expected_rays.append((name, step, lane, words))
+    rays = re.findall(rf"^{prefix}_RAY case=([\w-]+) step=(\d+) lane=(\d+) words=([0-9a-f,]+)$",
+                      stdout, re.MULTILINE)
+    observed_rays = [(name, int(step), int(lane), [int(word, 16) for word in words.split(",")])
+                     for name, step, lane, words in rays]
+    if observed_rays != expected_rays:
+        failures.append("refit chain/replay/crossqueue ray words differ")
+    expected_shadows = []
+    for name, steps in cases:
+        step = steps[-1]
+        vertices = [bits(value) for g in range(2) for value in
+                    (4 * g, 0, 2 * step, 4 * g + 1, 0, 2 * step, 4 * g, 1, 2 * step)]
+        instance_words = []
+        for instance in range(2):
+            instance_words.extend(bits(value) for value in (1, 0, 0, 0, 0, 1, 0, 4 * instance, 0, 0, 1, step))
+            instance_words.extend((0xff000000 | (0x80 + 16 * step + instance), 0, blas & 0xffffffff, blas >> 32))
+        expected_shadows += [(name, "blas", 1, 2, 0, vertices), (name, "tlas", 0, 2, 0, instance_words)]
+    shadows = re.findall(rf"^{prefix}_SHADOW case=([\w-]+) kind=(blas|tlas) type=(\d+) descriptors=(\d+) "
+                         r"descriptor_mismatches=(\d+) words=([0-9a-f,]+)$", stdout, re.MULTILINE)
+    observed_shadows = [(name, kind, int(type_), int(count), int(bad), [int(word, 16) for word in words.split(",")])
+                        for name, kind, type_, count, bad, words in shadows]
+    if observed_shadows != expected_shadows:
+        failures.append("refit chain visualization geometry/instance bytes differ")
+    sizes = re.findall(rf"^{prefix}_SIZE case=([\w-]+) kind=(blas|tlas) compacted=(\d+) visualization=(\d+) "
+                       r"serialized=(\d+) pointers=(\d+) current=(\d+) header_serialized=(\d+) deserialized=(\d+) "
+                       r"header_pointers=(\d+) identifier=(\d+)$", stdout, re.MULTILINE)
+    if [(row[0], row[1]) for row in sizes] != [(name, kind) for name, _ in cases for kind in ("blas", "tlas")]:
+        failures.append("refit chain public size evidence incomplete")
+    for name, kind, *values in sizes:
+        compacted, visual, serial, pointers, current, header_serial, deserialized, header_pointers, identifier = map(int, values)
+        want_visual, want_serial, want_pointers = ((328, 440, 0) if indexed else (296, 408, 0)) \
+            if kind == "blas" else (136, 264, 2)
+        if (not 0 < compacted <= prebuild[kind] or compacted % 256 or visual != want_visual or
+                serial != want_serial or header_serial != serial or pointers != want_pointers or
+                header_pointers != pointers or current != prebuild[kind] or deserialized != prebuild[kind] or identifier != 1):
+            failures.append("refit chain public current/deserialized/compacted sizes differ: " + name + "/" + kind)
+    results = re.findall(rf"^{prefix}_CASE case=([\w-]+) steps=(\d+) status=(PASS|FAIL)$", stdout, re.MULTILINE)
+    if results != [(name, str(len(steps)), "PASS") for name, steps in cases]:
+        failures.append("refit chain completed case order differs")
+    execution = re.findall(rf"^{prefix}_EXECUTE case=([\w-]+) (begin|end)$", stderr, re.MULTILINE)
+    if execution != [(name, boundary) for name in ("chain", "replay", "cross-return") for boundary in ("begin", "end")]:
+        failures.append("refit chain ordered execution intervals incomplete")
+    required = (recordings[0],
+                prefix + "_RESULT cases=4 refits=14 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
+                prefix + "_PASS")
+    if (any(stdout.splitlines().count(line) != 1 for line in required) or any(marker in stdout + stderr for marker in
+            ("OWNED_D3D12_RAYTRACING_FAIL", "OWNED_D3D12_RAYTRACING_CASE_FAIL", "OWNED_D3D12_RAYTRACING_CASE_MISMATCH"))):
+        failures.append("refit chain fixture did not complete its GPU/public shadow oracle")
+    return failures
+
+
+def raytracing_metadata_arena_failures(stdout: str, stderr: str) -> list[str]:
+    """Require rollover plus ray, vertex and instance oracles for every uploaded shadow."""
+    prefix = "OWNED_D3D12_RAYTRACING_METADATA_ARENA"
+    events, failures = phase3_trace(stderr)
+    bits = lambda value: struct.unpack("<I", struct.pack("<f", value))[0]
+    rays = re.findall(rf"^{prefix}_RAY lane=(\d+) words=([0-9a-f,]+)$", stdout, re.MULTILINE)
+    expected_rays = []
+    for b in range(2):
+        for g in (0, 255):
+            expected_rays.append([1, 0, 0x70 + b, b, g, 0xff, bits(2 * b + 1), 0,
+                                  bits(0.25), bits(0.25), 0x1000, 0xffffffff, 0x101])
+    if ([int(lane) for lane, _ in rays] != list(range(4)) or
+            [[int(word, 16) for word in words.split(",")] for _, words in rays] != expected_rays):
+        failures.append("AS metadata arena ray readback differs")
+    shadows = re.findall(rf"^{prefix}_SHADOW blas=(\d+) descriptors=(\d+) descriptor_mismatches=(\d+) "
+                         r"words=([0-9a-f,]+)$", stdout, re.MULTILINE)
+    if [(b, count, bad) for b, count, bad, _ in shadows] != [("0", "256", "0"), ("1", "256", "0")]:
+        failures.append("AS metadata arena visualization descriptor readback differs")
+    for b, _, _, words in shadows:
+        y, z = 4 * int(b), 2 * int(b)
+        expected = [bits(value) for g in range(256) for value in
+                    (4 * g, y, z, 4 * g + 1, y, z, 4 * g, y + 1, z)]
+        if [int(word, 16) for word in words.split(",")] != expected:
+            failures.append("AS metadata arena visualization vertex bytes differ: BLAS " + b)
+    top = re.findall(rf"^{prefix}_TOP type=(\d+) descriptors=(\d+)$", stdout, re.MULTILINE)
+    instances = re.findall(rf"^{prefix}_INSTANCE index=(\d+) blas_address=([0-9a-f]+) words=([0-9a-f,]+)$",
+                           stdout, re.MULTILINE)
+    addresses = [int(address, 16) for _, address, _ in instances]
+    if (top != [("0", "2")] or [int(b) for b, _, _ in instances] != [0, 1] or len(set(addresses)) != 2 or
+            any(not address or address % 256 for address in addresses)):
+        failures.append("AS metadata arena TLAS visualization header or source BLAS identities differ")
+    for b, address, words in instances:
+        address = int(address, 16)
+        expected = [bits(value) for value in (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)]
+        expected += [0xff000070 + int(b), 0, address & 0xffffffff, address >> 32]
+        if [int(word, 16) for word in words.split(",")] != expected:
+            failures.append("AS metadata arena TLAS visualization instance bytes differ: " + b)
+    if (stdout.splitlines().count(prefix + "_RESULT rays=4 blas=2 geometries=512 vertex_bytes=18432 "
+                                 "instances=2 instance_bytes=128 failures=0") != 1 or
+            stdout.splitlines().count(prefix + "_PASS") != 1 or any(marker in stdout + stderr for marker in
+            ("OWNED_D3D12_RAYTRACING_FAIL", "OWNED_D3D12_RAYTRACING_CASE_FAIL", "OWNED_D3D12_RAYTRACING_CASE_MISMATCH"))):
+        failures.append("AS metadata arena fixture did not complete its exact oracle")
+    uploads = sorted((e for e in events if e["event"] == "rtas_metadata_upload"), key=lambda e: e["event_id"])
+    fields = ("submission", "block", "offset", "geometry_bytes", "job_bytes")
+    if len(uploads) != 3 or any(type(e.get(field)) is not int or e[field] < 0 for e in uploads for field in fields):
+        return failures + ["AS metadata arena upload evidence incomplete"]
+    if (len({e["submission"] for e in uploads}) != 1 or any(not e["block"] for e in uploads) or
+            [(e["geometry_bytes"], e["job_bytes"]) for e in uploads] != [(24576, 12288), (24576, 12288), (0, 48)] or
+            uploads[0]["block"] == uploads[1]["block"] or uploads[1]["block"] != uploads[2]["block"] or
+            uploads[2]["offset"] == 0):
+        failures.append("AS metadata arena did not roll over and share the second block in one submission")
+    ranges = []
+    for e in uploads:
+        start = e["offset"]
+        end = start + max(e["geometry_bytes"], 96) + max(e["job_bytes"], 48)
+        if (start % 16 or end > 65536 or
+                any(block == e["block"] and start < old_end and old_start < end for block, old_start, old_end in ranges)):
+            failures.append("AS metadata arena live slices overlap or exceed their aligned block")
+        ranges.append((e["block"], start, end))
+    submits = [e for e in events if e["event"] == "submit" and e.get("submission") == uploads[0]["submission"]]
+    if len(submits) != 1 or any(e["event_id"] >= submits[0]["event_id"] for e in uploads):
+        failures.append("AS metadata arena snapshots were not owned by one submitted GPU batch")
+    return failures
+
+
+def atomic64_reuse_failures(suite: str, stderr: str) -> list[str]:
+    """Pair actual GPU fixture results with cache reuse only after phase retirement."""
+    events, failures = phase3_trace(stderr, 1000000)
+    if failures:
+        return ["atomic64 reuse " + failure for failure in failures]
+    phases = [event for event in sorted(events, key=lambda event: event["event_id"])
+              if event["event"] in ("atomic64_prepare", "atomic64_retired")]
+    prepared = [event for event in phases if event["event"] == "atomic64_prepare"]
+    if not prepared:
+        return ["atomic64 reuse preparation evidence missing"]
+    active, seen = set(), {}
+    for event in phases:
+        identity = event.get("topology_id")
+        if type(identity) is not int or identity <= 0:
+            failures.append("atomic64 reuse topology identity missing or invalid")
+            continue
+        if event["event"] == "atomic64_retired":
+            if identity not in active:
+                failures.append("atomic64 reuse retirement has no live phase")
+            active.discard(identity)
+            continue
+        if (any(type(event.get(field)) is not int or event[field] <= 0
+                for field in ("participants", "cells", "node_capacity")) or
+                any(type(event.get(field)) is not int or event[field] < 0
+                    for field in ("cache_entries", "cache_bytes")) or
+                any(type(event.get(field)) is not int or event[field] not in (0, 1)
+                    for field in ("topology_hit", "context_reused"))):
+            failures.append("atomic64 reuse preparation fields missing or invalid")
+            continue
+        if identity in active:
+            failures.append("atomic64 reuse begins before previous phase retirement")
+        previous = seen.get(identity)
+        if event["topology_hit"]:
+            if previous is None or previous["cells"] != event["cells"]:
+                failures.append("atomic64 reuse hit has no matching prior topology")
+            if not event["cache_entries"] or not event["cache_bytes"]:
+                failures.append("atomic64 reuse hit lacks a retained cache entry")
+        elif previous is not None or event["context_reused"]:
+            failures.append("atomic64 reuse cold preparation reused an identity or context")
+        active.add(identity)
+        seen[identity] = event
+    if active:
+        failures.append("atomic64 reuse phase retirement evidence incomplete")
+    if failures:
+        return failures
+
+    groups = []
+    if suite == "atomic64-phase":
+        if len(prepared) < 6:
+            return ["atomic64 reuse compute MAP/sparse preparation evidence incomplete"]
+        groups = [(prepared[:2], [1, 1]), (prepared[4:6], [1, 1])]
+        sparse = prepared[2:5]
+        if (len({event["topology_id"] for event in sparse}) != 3 or
+                any(event["topology_hit"] or event["context_reused"] for event in sparse) or
+                [event["participants"] for event in sparse] != [1, 1, 1] or
+                sparse[0]["cells"] != sparse[2]["cells"] or sparse[1]["cells"] <= sparse[0]["cells"]):
+            failures.append("atomic64 reuse sparse A/B/A mapping must rebuild merged/split/merged topology")
+    elif suite == "workgraphs-atomic64-typed":
+        if len(prepared) != 16:
+            return ["atomic64 reuse typed work graph requires sixteen phases"]
+        # Thread-launch nodes use a physical 32-lane group even though one
+        # logical input record runs. The arena bound counts physical lanes.
+        groups = [(prepared, [32] * 16)]
+    elif suite == "workgraph-batches":
+        if len(prepared) != 6:
+            return ["atomic64 reuse work graph batching requires two three-phase inputs"]
+        groups = [(prepared[:3], [32, 32, 1]), (prepared[3:], [32, 32, 1])]
+    for group, participants in groups:
+        if (len({event["topology_id"] for event in group}) != 1 or
+                [event["topology_hit"] for event in group] != [0] + [1] * (len(group) - 1) or
+                [event["context_reused"] for event in group] != [0] + [1] * (len(group) - 1) or
+                [event["participants"] for event in group] != participants or
+                len({event["cells"] for event in group}) != 1):
+            failures.append("atomic64 reuse stable bindings must reuse retired topology and context: " + suite)
+        capacities = {}
+        for event in group:
+            bound, capacity = event["participants"], event["node_capacity"]
+            if bound in capacities and capacities[bound] != capacity:
+                failures.append("atomic64 reuse fixed participant capacity changed: " + suite)
+            capacities[bound] = capacity
+        if len(capacities) == 2 and capacities[min(capacities)] >= capacities[max(capacities)]:
+            failures.append("atomic64 reuse participant shrink did not reduce published capacity: " + suite)
+    return failures
+
+
+def atomic64_context_failures(stdout: str, stderr: str) -> list[str]:
+    """Independent full-buffer hashes and every returned 64-bit/ordinary lane."""
+    prefix = "OWNED_D3D12_ATOMIC64_CONTEXT_"
+    cases = (("ordinary_first_disjoint", 0, 0, 1), ("atomic_first_disjoint", 1, 0, 2),
+             ("ordinary_first_overlap", 0, 1, 1), ("atomic_first_overlap", 1, 1, 1))
+    expected_lanes, expected_cases = [], []
+    modulus, multiplier, increment, iterations = 1 << 32, 1664525, 1013904223, 1 << 22
+    # Geometric-series identity uses modular exponentiation independently of
+    # the fixture's affine-composition loop and the GPU's iterative recurrence.
+    product = pow(multiplier, iterations, modulus)
+    series = (pow(multiplier, iterations, modulus * (multiplier - 1)) - 1) // (multiplier - 1)
+
+    def checksum(data: bytearray) -> str:
+        value = 1469598103934665603
+        for byte in data:
+            value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+        return f"{value:016x}"
+
+    for name, atomic_first, same_view, executions in cases:
+        output, cells, ordinary = bytearray([0xcd] * 832), bytearray([0xcd] * 4096), bytearray([0xcd] * 4096)
+        for lane in range(32):
+            initial = ((0x12345678 + lane) << 32) | ((0xfffffff0 + lane) & (modulus - 1))
+            old = initial + (executions - 1) * 0x100000001 * 512
+            final = initial + executions * 0x100000001 * 512
+            value = ((product * (0x12345678 + lane) + increment * series) % modulus) ^ 0xa55a39c3
+            struct.pack_into("<QQQ", output, 32 + lane * 24, old, final, final)
+            struct.pack_into("<Q", cells, lane * 8, final)
+            struct.pack_into("<I", ordinary, (512 + lane) * 4, value)
+            if same_view:
+                struct.pack_into("<Q", ordinary, lane * 8, final)
+                struct.pack_into("<I", cells, (512 + lane) * 4, value)
+            expected_lanes.append(f"{prefix}LANE case={name} lane={lane} old={old:016x} "
+                                  f"final={final:016x} raw={final:016x} ordinary={value:08x}")
+        expected_cases.append(f"{prefix}CASE case={name} atomic_first={atomic_first} same_view={same_view} "
+                              f"executions={executions} atomic_iterations=512 ordinary_iterations=4194304 "
+                              f"output_hash={checksum(output)} cells_hash={checksum(cells)} "
+                              f"ordinary_hash={checksum(ordinary)} failures=0")
+    lines, failures = stdout.splitlines(), []
+    if [line for line in lines if line.startswith(prefix + "LANE ")] != expected_lanes:
+        failures.append("atomic64 context requires every ordered lane with exact old/final/raw/ordinary values")
+    if [line for line in lines if line.startswith(prefix + "CASE ")] != expected_cases:
+        failures.append("atomic64 context full-buffer hashes, guards or execution counts differ")
+    if (lines.count(prefix + "RESULT cases=4 lanes=128 atomic_executions=5 warmup_atomic=1 failures=0") != 1 or
+            lines.count(prefix + "PASS") != 1 or
+            re.search(r"OWNED_D3D12_(?:SM6|ATOMIC64_CONTEXT)_(?:FAIL|CASE_FAIL|MISMATCH)", stdout + stderr)):
+        failures.append("atomic64 context completion missing, duplicated or failed")
+    return failures
+
+
+def atomic_readback_batch_failures(suite: str, stderr: str) -> list[str]:
+    """Require staged readback batching and actual GPU completion inside the numeric fixture phases."""
+    if suite == "atomic64-phase":
+        kind = "compute"
+        expected_batches = {
+            "indirect_nonzero": [("metadata", 2), ("records", 1)],
+            "indirect_count_zero": [("metadata", 2)],
+            "indirect_dimension_zero": [("metadata", 2), ("records", 1)],
+            "indirect_predicate_zero": [("metadata", 2)],
+        }
+    elif suite == "raytracing-atomic64":
+        kind = "raytracing"
+        expected_batches = {
+            "base": [("metadata", 2), ("records", 4)],
+            "extended-direct": [("metadata", 2), ("records", 4)],
+            "extended-indirect": [("metadata", 3), ("records", 4)],
+            "extended-indirect-zero-stride": [("metadata", 3), ("records", 4), ("local_roots", 1)],
+        }
+    else:
+        return ["atomic readback checker requires an atomic64 fixture suite"]
+    events, failures = phase3_trace(stderr, 1000000)
+    if failures:
+        return ["atomic readback " + failure for failure in failures]
+    marker_prefix = "OWNED_D3D12_ATOMIC64_READBACK_PHASE"
+    marker_pattern = re.compile(re.escape(marker_prefix) + r" suite=(compute|raytracing) case=([\w-]+) (begin|end)")
+    markers, phases, active = [], [], None
+    for line in stderr.splitlines():
+        if marker_prefix in line:
+            marker = marker_pattern.fullmatch(line)
+            if marker is None:
+                return ["atomic readback phase marker malformed or interleaved"]
+            marker_kind, case, action = marker.groups()
+            markers.append((marker_kind, case, action))
+            if action == "begin":
+                if active is not None:
+                    return ["atomic readback phases overlap"]
+                active = (marker_kind, case, [])
+            elif active is None or active[:2] != (marker_kind, case):
+                return ["atomic readback phase end has no matching begin"]
+            else:
+                phases.append(active)
+                active = None
+        elif active is not None and "OWNED_GRAPHICS_TRACE " in line:
+            active[2].append(json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]))
+    expected_markers = [(kind, case, action) for case in expected_batches for action in ("begin", "end")]
+    if active is not None or markers != expected_markers:
+        return ["atomic readback phase sequence missing, duplicated, or reordered"]
+    submitted = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "submit"}
+    completed = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "complete" and event.get("status") == 4}
+    for _, case, phase in phases:
+        batches = [event for event in phase if event["event"] == "atomic_readback_batch"]
+        if [(event.get("stage"), event.get("requests")) for event in batches] != expected_batches[case]:
+            failures.append("atomic readback dependency-stage/request sequence differs: " + case)
+        executed = [event for event in phase if event["event"] == "execute_list"]
+        if len(executed) != 1 or type(executed[0].get("queue")) is not int or executed[0]["queue"] <= 0:
+            failures.append("atomic readback phase requires one closed-list execution: " + case)
+            continue
+        previous_producer = 0
+        encoders = set()
+        for batch in batches:
+            if (any(type(batch.get(field)) is not int or batch[field] <= 0
+                    for field in ("queue", "encoder", "producer", "requests", "bytes")) or
+                    any(type(batch.get(field)) is not int or batch[field] != 1
+                        for field in ("allocations", "blits", "waits"))):
+                failures.append("atomic readback batch allocation/blit/wait contract differs: " + case)
+                continue
+            encoders.add(batch["encoder"])
+            identity = (batch["queue"], batch["producer"])
+            if batch["queue"] != executed[0]["queue"] or identity not in submitted or identity not in completed:
+                failures.append("atomic readback producer did not complete a native submission: " + case)
+            if batch["producer"] <= previous_producer:
+                failures.append("atomic readback dependent stage precedes its producer: " + case)
+            previous_producer = batch["producer"]
+            if batch["stage"] == "local_roots" and batch["bytes"] != 8:
+                failures.append("atomic readback zero-stride callable CBV tail differs: " + case)
+        if len(encoders) != 1:
+            failures.append("atomic readback phases did not batch one consumer encoder: " + case)
+    return failures
 
 
 def prepared_indirect_rows() -> tuple[list[str], list[str], list[str]]:
@@ -1761,6 +2165,130 @@ def native_msaa_lines(stderr: str) -> tuple[list[str], list[str]]:
     return lines, []
 
 
+def msaa_tile_trace_failures(events: list[dict], label: str) -> list[str]:
+    """Prove retired native-scissor batches and release of their completed scratch."""
+    failures, claimed = [], set()
+    begins = [(index, event) for index, event in enumerate(events) if event["event"] == "msaa_tile_begin"]
+    tile_names = {"msaa_tile_begin", "msaa_tile_extent", "msaa_tile_ready", "msaa_tile_quantum", "msaa_tile_release"}
+    if any(type(event.get("event_id")) is not int or event["event_id"] <= 0
+           for event in events if event["event"] in tile_names):
+        return [label + ": GPU tile event identity is invalid"]
+    for begin_index, begin in begins:
+        claimed.add(begin_index)
+        if (any(type(begin.get(field)) is not int or begin[field] <= 0
+                for field in ("queue", "encoder", "list", "recording", "submission")) or
+                begin.get("source") != "gpu" or
+                begin.get("host_interop") != "native_scissor" or
+                type(begin.get("capacity")) is not int or begin["capacity"] < 0 or
+                any(type(begin.get(field)) is not int for field in
+                    ("first_budget", "quantum_budget", "descriptor_capacity", "descriptor_bytes")) or
+                (begin.get("first_budget"), begin.get("quantum_budget"),
+                 begin.get("descriptor_capacity"), begin.get("descriptor_bytes")) != (1, 64, 64, 1088)):
+            failures.append(label + ": GPU tile source/native-scissor/capacity/budget contract differs")
+            continue
+        context = [event for event in events[:begin_index] if event["event"] == "execute_list"
+                   and event.get("queue") == begin["queue"]]
+        if not context or (context[-1].get("list"), context[-1].get("recording")) != (begin["list"], begin["recording"]):
+            failures.append(label + ": GPU tile task has no matching executing recording")
+        end_index = next((index for index, event in begins
+                          if index > begin_index and event.get("queue") == begin["queue"]), len(events))
+        rows = [(index, event) for index, event in enumerate(events)
+                if begin_index < index < end_index and
+                (event.get("queue"), event.get("encoder")) == (begin["queue"], begin["encoder"])]
+        quanta = [(index, event) for index, event in rows if event["event"] == "msaa_tile_quantum"]
+        extents = [(index, event) for index, event in rows if event["event"] == "msaa_tile_extent"]
+        readies = [(index, event) for index, event in rows if event["event"] == "msaa_tile_ready"]
+        releases = [(index, event) for index, event in rows if event["event"] == "msaa_tile_release"]
+        if not quanta or len(extents) > 1 or len(readies) != 1:
+            failures.append(label + ": GPU tile initial batch, continuation or attachmentless extent is missing/duplicated")
+        if len(releases) != 1:
+            failures.append(label + ": GPU tile completed scratch release is missing/duplicated")
+        if any(event["event"] == "msaa_producer_wait" for _, event in rows):
+            failures.append(label + ": GPU tile path retained the CPU bounds producer wait")
+        previous_index, previous_producer, previous_done, previous_ready = begin_index, begin["submission"] - 1, 0, 1
+        initial_count = None
+
+        def retired(index, event):
+            producer = event.get("producer")
+            if type(producer) is not int or producer <= previous_producer:
+                return False
+            submitted = [(i, e) for i, e in enumerate(events)
+                         if e["event"] == "submit" and (e.get("queue"), e.get("submission")) == (begin["queue"], producer)]
+            completed = [(i, e) for i, e in enumerate(events)
+                         if e["event"] == "complete" and (e.get("queue"), e.get("submission")) == (begin["queue"], producer)]
+            if len(submitted) != 1 or len(completed) != 1:
+                return False
+            si, submit = submitted[0]
+            ci, complete = completed[0]
+            return (complete.get("status") == 4 and
+                    all(type(e.get("event_id")) is int for e in (submit, complete)) and
+                    previous_index < si < ci < index and
+                    events[previous_index]["event_id"] < submit["event_id"] < complete["event_id"] < event["event_id"])
+
+        for index, extent in extents:
+            claimed.add(index)
+            if (any(type(extent.get(field)) is not int or extent[field] <= 0 for field in ("width", "height")) or
+                    not readies or index >= readies[0][0] or not retired(index, extent)):
+                failures.append(label + ": attachmentless extent lacks ordered native retirement")
+            else:
+                previous_index, previous_producer = index, extent["producer"]
+        for index, ready in readies:
+            claimed.add(index)
+            # Coordinates stay in the bounded host mailbox. This trace proves the
+            # descriptor domain and retirement; the host validates each x/y/view/layer.
+            if (any(type(ready.get(field)) is not int for field in
+                    ("ready", "status", "width", "height", "viewports", "layers")) or
+                    (ready.get("ready"), ready.get("status")) not in ((0, 1), (1, 0)) or
+                    ready.get("width", -1) < 0 or ready.get("height", -1) < 0 or
+                    not 0 <= ready.get("viewports", -1) <= 16 or not 1 <= ready.get("layers", -1) <= 2048 or
+                    (ready.get("ready") == 1 and any(ready[field] == 0 for field in ("width", "height", "viewports")))):
+                failures.append(label + ": GPU tile initial native-scissor batch count/domain differs")
+            if not quanta or index >= quanta[0][0] or not retired(index, ready):
+                failures.append(label + ": GPU tile descriptors were observed before ordered native retirement")
+            else:
+                previous_index, previous_producer = index, ready["producer"]
+            if type(ready.get("ready")) is int:
+                initial_count = ready["ready"]
+        for ordinal, (index, quantum) in enumerate(quanta, 1):
+            claimed.add(index)
+            final, budget = ordinal == len(quanta), 1 if ordinal == 1 else previous_ready
+            if (any(type(quantum.get(field)) is not int for field in
+                    ("quantum", "budget", "count", "task_done", "status", "ready", "scissors")) or
+                    quantum.get("quantum") != ordinal or quantum.get("budget") != budget or
+                    not 1 <= budget <= 64 or
+                    (quantum.get("count") != budget and not (ordinal == 1 and final and quantum.get("count") == 0)) or
+                    (ordinal == 1 and quantum.get("count") != initial_count) or
+                    quantum.get("scissors") != quantum.get("count") or
+                    quantum.get("task_done") != previous_done + quantum.get("count", 0) or
+                    quantum.get("status") != int(final) or
+                    (quantum.get("ready") != 0 if final else not 1 <= quantum.get("ready", -1) <= 64)):
+                failures.append(label + ": GPU tile quantum count/scissors/progress/terminal status differs")
+            if not retired(index, quantum):
+                failures.append(label + ": GPU tile cursor was observed before actual native retirement")
+            if type(quantum.get("task_done")) is int:
+                previous_done = quantum["task_done"]
+            if type(quantum.get("producer")) is int:
+                previous_producer = quantum["producer"]
+            if type(quantum.get("ready")) is int:
+                previous_ready = quantum["ready"]
+            previous_index = index
+        for index, release in releases:
+            claimed.add(index)
+            if (any(type(release.get(field)) is not int or release[field] < 0 for field in
+                    ("released_buffers", "released_textures", "released_markers",
+                     "retained_buffers", "retained_textures", "retained_markers")) or
+                    any(release.get(field) != 0 for field in
+                        ("retained_buffers", "retained_textures", "retained_markers"))):
+                failures.append(label + ": GPU tile completed scratch ownership counts differ")
+            if (type(release.get("producer")) is not int or not quanta or
+                    release.get("producer") != quanta[-1][1].get("producer") or
+                    index <= quanta[-1][0] or release["event_id"] <= quanta[-1][1]["event_id"]):
+                failures.append(label + ": GPU tile scratch release is not after its terminal retired producer")
+    if {index for index, event in enumerate(events) if event["event"] in tile_names} != claimed:
+        failures.append(label + ": GPU tile event has no matching task execution")
+    return failures
+
+
 def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
     prefix = "OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
     expected, labels = [], []
@@ -1818,7 +2346,10 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
         encoder_ids = [e.get("encoder") for e in begins]
         draws = [e for e in events if e["event"] == "native_msaa_draw_record" and e.get("encoder") in encoder_ids]
         bindings = [e for e in events if e["event"] == "native_msaa_record" and e.get("encoder") in encoder_ids]
-        waits = [e for e in part if e["event"] == "msaa_producer_wait"]
+        captures = [e for e in part if e["event"] == "msaa_tile_begin"]
+        failures.extend(msaa_tile_trace_failures(part, label))
+        if any(e["event"] == "msaa_producer_wait" for e in part):
+            failures.append("eligible MSAA capture retained the CPU bounds producer wait: " + label)
         sample_frequency = label.startswith("native_sample_frequency_")
         query = label.startswith("captured_sample_frequency_query_")
         if sample_frequency or query:
@@ -1833,15 +2364,15 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
                     failures.append("sample-frequency actual direct/indexed/index-pull draws differ: " + label)
                 if [e.get("encoder") for e in bindings] != encoder_ids or [e.get("index_pull") for e in bindings] != [0, 0, 1] or any((e.get("sample_count"), e.get("center")) != (count, 0) or not e.get("pso") for e in bindings) or any((e.get("list"), e.get("recording")) not in executes for e in bindings + draws):
                     failures.append("sample-frequency native recording attribution differs: " + label)
-                if waits or any(e["event"] == "native_compute_encode" for e in part):
+                if captures or any(e["event"] == "native_compute_encode" for e in part):
                     failures.append("sample-frequency native execution encoded captured producer work: " + label)
                 retained_encoders = tuple(encoder_ids)
             else:
                 if any(e["event"] in ("native_render_begin", "native_render_end") for e in part):
                     failures.append("sample-frequency active query incorrectly selected native MSAA: " + label)
-                if len(waits) != 1 or any(e.get("wait_count") != 1 or not e.get("queue") or not e.get("encoder") or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
-                    failures.append("sample-frequency query capture producer/wait/completion differs: " + label)
-                retained_encoders = tuple(e.get("encoder") for e in waits)
+                if len(captures) != 1:
+                    failures.append("sample-frequency query GPU task execution count differs: " + label)
+                retained_encoders = tuple(e.get("encoder") for e in captures)
             replay_label, replay = label.rsplit("_replay", 1)
             identity = (tuple(executes), retained_encoders)
             if replay == "0":
@@ -1858,8 +2389,8 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
         if volatile:
             if any(e["event"] == "native_render_begin" for e in part) or begins or draws or bindings:
                 failures.append("volatile reflected descriptor incorrectly selected native MSAA: " + label)
-            if len(waits) != (4 if transition else 1) or any(e.get("wait_count") != 1 or not e.get("queue") or not e.get("encoder") or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
-                failures.append("volatile MSAA actual capture producer/wait/completion differs: " + label)
+            if len(captures) != (4 if transition else 1):
+                failures.append("volatile MSAA actual GPU task execution count differs: " + label)
             continue
         frequency_transition = transition and not resource and quality != 0xfffffffe
         native_count = 3 if transition and (resource or frequency_transition) else 2 if transition else 1
@@ -1870,14 +2401,70 @@ def native_msaa_failures(stdout: str, stderr: str) -> list[str]:
             failures.append("MSAA actual native indexed/index-pull ordering differs: " + label)
         if [e.get("encoder") for e in part if e["event"] == "native_render_end" and e.get("encoder") in encoder_ids] != encoder_ids:
             failures.append("MSAA native encoder completion attribution differs: " + label)
-        if len(waits) != (4 - native_count if transition else 0) or any(e.get("encoder") in encoder_ids or e.get("wait_count") != 1 or not any(c["event"] == "complete" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in part) for e in waits):
+        if len(captures) != (4 - native_count if transition else 0) or any(e.get("encoder") in encoder_ids for e in captures):
             failures.append("MSAA captured producer retirement work differs: " + label)
         if not transition and any(e["event"] == "native_compute_encode" for e in part):
             failures.append("ordinary native MSAA encoded captured producer work: " + label)
-        route_order = ["native" if e in begins else "fallback" for e in part if e in begins or e in waits]
+        route_order = ["native" if e in begins else "fallback" for e in part if e in begins or e in captures]
         wanted_routes = ["native", "fallback", "native", "native"] if transition and resource else ["native", "native", "native", "fallback"] if frequency_transition else ["native", "fallback", "native", "fallback"] if transition else ["native"]
         if route_order != wanted_routes:
             failures.append("MSAA actual native/fallback producer order differs: " + label)
+    return failures
+
+
+def msaa_tile_task_failures(stdout: str, stderr: str) -> list[str]:
+    prefix = "OWNED_D3D12_MULTISAMPLE_CAPABILITIES"
+    expected = [
+        f"{prefix}_TILE_TASKS_PASS replay={replay} width=19 height=13 samples=4 mask=00000005 primitives=14 expected_tiles=84 pixels=247 sample_values=988 ps_invocations=4928 guard_pixels=71 counter_guards=8 output_guards=8 ordered_blend=1 exact_depth=1 same_recording=1"
+        for replay in range(2)
+    ]
+    lines, failures = native_msaa_lines(stderr)
+    if failures:
+        return failures
+    _, failures = phase3_trace("\n".join(lines), 100000)
+    if failures:
+        return failures
+    if [line for line in stdout.splitlines() if line.startswith(prefix + "_TILE_TASKS_")] != expected:
+        failures.append("MSAA tile exact replay/color/depth/counter/guard observations differ")
+    brackets = [(i, m[1], int(m[2]), m[3]) for i, line in enumerate(lines)
+                if (m := re.fullmatch(prefix + r"_SUBMISSION_(BEGIN|END) id=([0-9]+) label=(msaa_tile_tasks_[^ ]+)", line))]
+    labels = ["msaa_tile_tasks_first", "msaa_tile_tasks_replay"]
+    if (len(brackets) != 4 or [b[3] for b in brackets[::2]] != labels or
+            any(a[1] != "BEGIN" or b[1] != "END" or a[2:] != b[2:]
+                for a, b in zip(brackets[::2], brackets[1::2])) or
+            brackets[0][2] >= brackets[2][2]):
+        return failures + ["MSAA tile closed-list replay brackets differ"]
+    identities = []
+    for start, end in zip(brackets[::2], brackets[1::2]):
+        label = start[3]
+        part = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                for line in lines[start[0] + 1:end[0]] if "OWNED_GRAPHICS_TRACE " in line]
+        failures.extend(msaa_tile_trace_failures(part, label))
+        executes = [(e.get("list"), e.get("recording")) for e in part if e["event"] == "execute_list"]
+        begins = [e for e in part if e["event"] == "msaa_tile_begin"]
+        readies = [e for e in part if e["event"] == "msaa_tile_ready"]
+        quanta = [e for e in part if e["event"] == "msaa_tile_quantum"]
+        if len(executes) != 1 or any(type(value) is not int or value <= 0 for key in executes for value in key):
+            failures.append("MSAA tile execution identity missing: " + label)
+        if len(begins) != 1 or any(e.get("capacity") != 14 for e in begins):
+            failures.append("MSAA tile primitive capacity or execution count differs: " + label)
+        if [(e.get("ready"), e.get("status"), e.get("width"), e.get("height"), e.get("viewports"), e.get("layers"))
+                for e in readies] != [(1, 0, 19, 13, 1, 1)]:
+            failures.append("MSAA tile initial native-scissor batch count or target domain differs: " + label)
+        if [(e.get("quantum"), e.get("budget"), e.get("count"), e.get("task_done"), e.get("status"), e.get("ready"))
+                for e in quanta] != [(1, 1, 1, 1, 0, 64), (2, 64, 64, 65, 0, 19), (3, 19, 19, 84, 1, 0)]:
+            failures.append("MSAA tile 84 tasks did not continue as 1/64/19 with exact retirement progress: " + label)
+        identities.append((tuple(executes), tuple((e.get("queue"), e.get("encoder"), e.get("capacity")) for e in begins)))
+        if any(e["event"] in ("msaa_producer_wait", "msaa_tile_extent", "native_render_begin", "native_render_end") for e in part):
+            failures.append("MSAA tile used a CPU bounds wait, attachmentless extent or native MSAA shortcut: " + label)
+        submitted = [(e.get("queue"), e.get("submission")) for e in part if e["event"] == "submit"]
+        completed = [(e.get("queue"), e.get("submission")) for e in part if e["event"] == "complete" and e.get("status") == 4]
+        if not submitted or Counter(submitted) != Counter(completed):
+            failures.append("MSAA tile fenced execution/readback retirement missing: " + label)
+    if identities[0] != identities[1]:
+        failures.append("MSAA tile replay changed the closed recording, encoder or capacity")
+    if prefix + "_FAIL" in stdout + stderr:
+        failures.append("MSAA tile numerical fixture failed")
     return failures
 
 
@@ -1917,7 +2504,7 @@ def native_msaa_budget_failures(stdout: str, stderr: str) -> list[str]:
         return failures + ["budget execution/readback replay brackets differ"]
     for index, (a, b) in enumerate(zip(brackets[::2], brackets[1::2])):
         part = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]) for line in lines[a[0] + 1:b[0]] if "OWNED_GRAPHICS_TRACE " in line]
-        if any(e["event"] in ("msaa_producer_wait", "native_msaa_budget_rollover") for e in part):
+        if any(e["event"] in ("msaa_producer_wait", "msaa_tile_begin", "msaa_tile_extent", "msaa_tile_ready", "msaa_tile_quantum", "msaa_tile_release", "native_msaa_budget_rollover") for e in part):
             failures.append("budget replay captured fallback or repeated recording rollover")
         if index in (0, 3):
             begins = [e for e in part if e["event"] == "native_render_begin"]
@@ -1957,7 +2544,7 @@ def pipeline_native_msaa_failures(stdout: str, stderr: str) -> list[str]:
                 failures.append("pipeline native2x malformed trace")
     native = [e for e in events if e.get("event") == "native_render_begin" and e.get("native_msaa_sample_count") == 2]
     draws = [e for e in events if e.get("event") == "native_msaa_draw_record"]
-    if len(native) != 1 or len(draws) != 1 or draws[0].get("encoder") != native[0].get("encoder") or any(e.get("event") == "msaa_producer_wait" for e in events):
+    if len(native) != 1 or len(draws) != 1 or draws[0].get("encoder") != native[0].get("encoder") or any(e.get("event") in ("msaa_producer_wait", "msaa_tile_begin", "msaa_tile_extent", "msaa_tile_ready", "msaa_tile_quantum", "msaa_tile_release") for e in events):
         failures.append("pipeline ordinary native2x encoded fallback or lacks actual native route")
     if len(native) == 1 and (len([e for e in events if e.get("event") == "native_render_end" and e.get("encoder") == native[0].get("encoder")]) != 1 or not any(e.get("event") == "complete" and e.get("status") == 4 and e.get("submission") == native[0].get("submission") for e in events)):
         failures.append("pipeline native2x actual render/completion evidence missing")
@@ -1978,11 +2565,10 @@ def pipeline_native_msaa_failures(stdout: str, stderr: str) -> list[str]:
         if any(not isinstance(e, dict) or not isinstance(e.get("event"), str) for e in captured):
             failures.append("malformed pipeline consumed coverage event schema")
             continue
-        waits = [e for e in captured if e.get("event") == "msaa_producer_wait"]
-        if len(waits) != 1 or any(e.get("wait_count") != 1 or not e.get("queue") or not e.get("encoder") or not any(c.get("event") == "complete" and c.get("queue") == e["queue"] and c.get("submission") == e.get("producer") and c.get("status") == 4 for c in captured) for e in waits) or any(e.get("event") == "native_render_begin" for e in captured):
-            failures.append("genuinely consumed SV_Coverage did not use captured producer: " + phase)
-        if any(not any(c.get("event") == "submit" and c.get("queue") == e.get("queue") and c.get("submission") == e.get("producer") for c in captured) for e in waits):
-            failures.append("pipeline captured producer lacks actual submit: " + phase)
+        tasks = [e for e in captured if e.get("event") == "msaa_tile_begin"]
+        failures.extend(msaa_tile_trace_failures(captured, "pipeline " + phase))
+        if len(tasks) != 1 or any(e.get("event") in ("msaa_producer_wait", "native_render_begin") for e in captured):
+            failures.append("consumed SV_Coverage did not use the GPU tile task route: " + phase)
     return failures
 
 
@@ -3470,6 +4056,13 @@ def low_latency_failures(stdout: str, stderr: str, mode: str, frames: int, *,
 
 def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     """Inputs a suite reads beside its own executable, frozen before launch."""
+    if suite in ("present-queues", "present-history"):
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [source / "owned-d3d12-present-queues.cpp", source / "owned-d3d12-present-history.inc"]
+    if suite in ("standard-swizzle", "render-passes"):
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [source / f"owned-d3d12-{suite}.cpp"] + (
+            [source / "owned-d3d12-placed-render-groups.inc"] if suite == "render-passes" else [])
     if suite in ("ngx-fg-present", "ngx-alpha", "ngx-fg"):
         return suite_inputs("ngx-features", fixture, dxil_dir)
     game_sources = {
@@ -3560,8 +4153,15 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         return [dxil_dir / name for name in ATOMIC_COPY_SHADERS]
     if suite == "atomic64-phase":
         return [dxil_dir / name for name in ATOMIC64_PHASE_INPUTS]
+    if suite == "atomic64-context":
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return ([dxil_dir / name for name in ("atomic64-context-atomic.dxil", "atomic64-context-ordinary.dxil")] +
+                [source / "dxil/atomic64-context.hlsl", source / "owned-d3d12-atomic64-context.cpp",
+                 source / "owned-d3d12-sm6.cpp"])
     if suite == "raytracing":
         return [dxil_dir / name for name in RAYTRACING_SHADERS]
+    if suite in ("raytracing-metadata-arena", "raytracing-refit-chain"):
+        return [dxil_dir / "raytracing-contract.dxil"]
     if suite == "raytracing-atomic64":
         return [dxil_dir / name for name in
                 ("raytracing-contract.dxil", "raytracing-atomic64.dxil", "raytracing-atomic64.hlsl",
@@ -3571,11 +4171,15 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
     if suite == "enhanced-barriers":
         return [dxil_dir / name for name in ENHANCED_BARRIERS_INPUTS]
     if suite == "stream-output":
-        return [dxil_dir / name for name in STREAM_OUTPUT_SHADERS + STREAM_OUTPUT_GS_INPUTS]
+        return [dxil_dir / name for name in
+                STREAM_OUTPUT_SHADERS + STREAM_OUTPUT_GS_INPUTS + STREAM_OUTPUT_FRONTIER_INPUTS]
     if suite == "partial-3d-uav-dxil":
         return [dxil_dir / name for name in PARTIAL_3D_UAV_SHADERS]
     if suite == "tiled":
-        return [dxil_dir / name for name in TILED_SHADERS + TILED_INPUTS]
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [dxil_dir / name for name in TILED_SHADERS + TILED_INPUTS] + [
+            source / "owned-d3d12-tiled.cpp", source / "owned-d3d12-tiled-volume.inc",
+            source / "owned-d3d12-tiled-timeline.inc"]
     if suite == "msaa-lines":
         return [dxil_dir / name for name in MSAA_LINE_INPUTS]
     if suite == "raster-order":
@@ -3670,6 +4274,11 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
                                            "work-graphs-nodes.dxil", "work-graphs-sharing.dxil", "work-graphs-link-nodes.dxil", "work-graphs-link-helpers.dxil", "work-graphs-root-subobjects.dxil")] + [
                                                REPOSITORY_ROOT / "graphics-translator/tests/owned-d3d12-work-graphs.cpp",
                                                dxil_dir / "preview-d3d12.h"]
+    if suite in ("workgraph-frontier", "workgraph-texture-frontier"):
+        source = REPOSITORY_ROOT / "graphics-translator/tests"
+        return [dxil_dir / name for name in (f"{suite}.dxil", f"{suite}.hlsl",
+            f"build-{suite}.sh", "preview-d3d12.h")] + [
+            source / f"owned-d3d12-{suite}.cpp", source / "owned-d3d12-atomic64-workgraph-typed.cpp"]
     if suite == "workgraph-batches":
         source = REPOSITORY_ROOT / "graphics-translator/tests"
         return [dxil_dir / "workgraph-batches.dxil", dxil_dir / "workgraph-batches.hlsl",
@@ -3677,7 +4286,8 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
             source / "owned-d3d12-atomic64-workgraph-typed.cpp"]
     if suite == "submission-foundation":
         source = REPOSITORY_ROOT / "graphics-translator/tests"
-        return [source / "owned-d3d12-submission-foundation.cpp", source / "owned-d3d12-render-passes.cpp"]
+        return [source / "owned-d3d12-submission-foundation.cpp", source / "owned-d3d12-render-passes.cpp",
+                source / "owned-d3d12-placed-render-groups.inc", source / "owned-d3d12-dispatch-independence.inc"]
     if suite == "rt-executable-cache":
         source = REPOSITORY_ROOT / "graphics-translator/tests"
         return [dxil_dir / name for name in ("raytracing-contract.dxil","raytracing-stateobj.dxil",
@@ -3717,14 +4327,53 @@ def multiqueue_submission_failures(events: list[dict]) -> list[str]:
     return []
 
 
+def standard_swizzle_output_matches(stdout: str, success: bool) -> bool:
+    prefix = "OWNED_D3D12_STANDARD_SWIZZLE_BATCH_"
+    expected = [(name, str(replay), str(tiles), str(canonical), str(absent))
+                for name, tiles, canonical, absent in
+                (("rgba8", 48, 3145728, 0), ("r8g8-b8g8", 50, 3276800, 128),
+                 ("g8r8-g8b8", 50, 3276800, 128)) for replay in range(2)]
+    rows = re.findall(r"^" + prefix + r"REPLAY_PASS case=([\w-]+) replay=([01]) tiles=(\d+) "
+                      r"mips=3 arrays=2 linear_bytes=([1-9]\d*) canonical_bytes=(\d+) "
+                      r"absent_g1=(\d+) exact=1 guards=1$", stdout, re.MULTILINE)
+    return (success and [(name, replay, tiles, canonical, absent)
+                         for name, replay, tiles, _, canonical, absent in rows] == expected
+            and stdout.count(prefix + "REPLAY_PASS ") == len(expected)
+            and stdout.splitlines().count(prefix + "PASS cases=3 replays=6 subresources=36 "
+                "canonical_guards=1 packed_odd_mip=1 large_alias=1") == 1
+            and re.findall(r"^OWNED_D3D12_STANDARD_SWIZZLE_VIEW_REPLAY_PASS replay=([01]) bytes=3145728 "
+                           r"writes=2 after_close=1 table_rebind=1 overlap_srv=1 inactive_uav=1 "
+                           r"untouched_stale=1 guards=1$", stdout, re.MULTILINE) == ["0", "1"]
+            and stdout.count("OWNED_D3D12_STANDARD_SWIZZLE_VIEW_REPLAY_PASS ") == 2
+            and "OWNED_D3D12_STANDARD_SWIZZLE_FAIL" not in stdout)
+
+
+def placed_render_output_matches(stdout: str) -> bool:
+    prefix = "OWNED_D3D12_RENDER_PASSES_PLACED_"
+    expected = [f"{prefix}GROUP case={name} replay={replay} first=ff000030 second=ff006000 "
+                f"depth=3e000000 stencil=5a draws=5 sealed=1 lifetime_reset={int(name == 'same-list-union' and replay == 1)} exact=1"
+                for name in ("same-list-union", "committed-leader", "cross-list-boundary")
+                for replay in range(2)]
+    expected += [f"{prefix}ALIAS case={name} replay={replay} before={before} after=ff204000 "
+                 f"stencil={stencil} draws=2 sealed=1 exact=1"
+                 for name, before, stencil in (("color-color-alias", "ff000020", "00"),
+                                              ("depth-color-alias", "3e800000", "5a"))
+                 for replay in range(2)]
+    return [line for line in stdout.splitlines() if line.startswith(prefix)] == expected
+
+
 def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> bool:
     success = (success
-               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 42
+               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 47
                and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
                        for case in ("graph-frontier-256", "graph-frontier-512",
                                     "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary",
                                     "graph-cross-execute-producer", "depth-clear-srv-compute-read",
-                                    "final-discard-query-split", "final-discard-suspend-resume"))
+                                    "final-discard-query-split", "final-discard-suspend-resume",
+                                    "placed-render-same-list-union", "placed-render-committed-leader",
+                                    "placed-render-cross-list-boundary", "placed-render-color-color-alias",
+                                    "placed-render-depth-color-alias"))
+               and placed_render_output_matches(stdout)
                and "OWNED_D3D12_RENDER_PASSES_DEPTH_SRV depth=3f400000 exact=1" in stdout
                and depth_srv_dispatch_ordered(stderr)
                and all(f"OWNED_D3D12_RENDER_PASSES_CROSS_EXECUTE replay={replay} word=13579bdf exact=1" in stdout
@@ -3747,7 +4396,7 @@ def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> boo
                and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
                and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
                and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
-               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=42") == 1
+               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=47") == 1
                and "_FAIL" not in stdout)
     return success
 
@@ -3782,9 +4431,21 @@ def tiled_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, 
     # Tier 3 (SRV-only) unreported and no Metal validation fault.
     dxil_compiler_loaded = native_compiler_proof
     cases = re.findall(r"^OWNED_D3D12_TILED_CASE ([\w.-]+) status=PASS$", stdout, re.MULTILINE)
+    frontier_stats = re.findall(r"^OWNED_D3D12_TILED_FRONTIER_STATS shader=(dxil|dxbc) ia_vertices=(\d+) "
+                               r"ia_primitives=(\d+) vs_invocations=(\d+) instances=(\d+)$", stdout, re.MULTILINE)
     success = (success and tuple(cases) == TILED_CASES
+               and stdout.splitlines().count("OWNED_D3D12_TILED_BURST_PASS requests=31 heaps=2 snapshots=2 bytes=3276800") == 1
+               and frontier_stats == [(shader, "195", "65", "195", "65") for shader in ("dxil", "dxbc")]
+               and stdout.count("OWNED_D3D12_TILED_FRONTIER_STATS ") == 2
                and "OWNED_D3D12_TILED_CAPS tier=4 srv_only_tier3=0 " in stdout
                and f"OWNED_D3D12_TILED_PASS cases={len(TILED_CASES)} tier=4" in stdout
+               and stdout.count("OWNED_D3D12_TILED_MAPPING_IDEMPOTENT_PASS update=3 copy=1 no_hazard=1 gpu_bytes=exact") == 1
+               and stdout.splitlines().count("OWNED_D3D12_TILED_TIMELINE_BEGIN waves=2 rounds=36 "
+                   "closed_list_count=36 replay=72 handoff=18") == 1
+               and [line for line in stdout.splitlines() if line.startswith("OWNED_D3D12_TILED_TIMELINE_WAVE_PASS ")] ==
+                   [f"OWNED_D3D12_TILED_TIMELINE_WAVE_PASS wave={wave} shift={wave} bytes=4718592" for wave in range(2)]
+               and stdout.splitlines().count("OWNED_D3D12_TILED_TIMELINE_PASS waves=2 rounds=36 bytes=9437184 "
+                   "closed_list_count=36 replay=72 null_rounds=24 no_hazard=72 cross_queue=2") == 1
                and "OWNED_D3D12_TILED_FAIL" not in stdout + stderr)
     return success, dxil_compiler_loaded
 
@@ -4055,26 +4716,397 @@ def rt_executable_output_matches(stdout: str, stderr: str, native_compiler_proof
         not any(marker in stdout+stderr for marker in ("OWNED_D3D12_RT_EXECUTABLE_FAIL","OWNED_D3D12_RAYTRACING_CASE_MISMATCH","OWNED_D3D12_RAYTRACING_FAIL")))
 
 
+def placed_sparse_range_failures(stdout: str, stderr: str) -> list[str]:
+    """Check placed-range independence and fresh sparse proof on one sealed replay."""
+    failures = []
+    expected_values = (
+        "OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=placed_disjoint_ranges textures=2 buffer=1 pixels=185 words=64 exact=1",
+        "OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=placed_sparse_range_replay executions=4 close_count=1 mapping=unmapped,disjoint,overlap,null pixels=64 words=256 exact=1",
+    )
+    for line in expected_values:
+        if stdout.splitlines().count(line) != 1:
+            failures.append("placed range numeric proof missing or duplicated")
+    trace, malformed = phase3_trace(stderr, 1000000)
+    if malformed:
+        return failures + ["placed range " + error for error in malformed]
+    names = ("placed_alias_clears", "placed_disjoint_ranges", "placed_sparse_unmapped",
+             "placed_sparse_disjoint", "placed_sparse_overlap", "placed_sparse_null")
+    prefix = "OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE "
+    phases, active = [], None
+    for line in stderr.splitlines():
+        if line.startswith(prefix):
+            marker = re.fullmatch(re.escape(prefix) + r"(begin|end)=(\w+)", line)
+            if marker is None:
+                failures.append("placed range phase marker malformed")
+                continue
+            action, name = marker.groups()
+            if name not in names:
+                if active is not None:
+                    failures.append("placed range phase overlaps another phase")
+                continue
+            if action == "begin":
+                if active is not None:
+                    failures.append("placed range phases overlap")
+                active = {"name": name, "events": []}
+            elif active is None or active["name"] != name:
+                failures.append("placed range phase end has no matching begin")
+            else:
+                phases.append(active)
+                active = None
+        elif active is not None and "OWNED_GRAPHICS_TRACE " in line:
+            active["events"].append(json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]))
+    if active is not None or [phase["name"] for phase in phases] != list(names):
+        return failures + ["placed range phase sequence incomplete or duplicated"]
+    replay_identity, prior_generation, replay_ranges = None, 0, None
+    for phase in phases:
+        name, scoped = phase["name"], phase["events"]
+        def events(kind):
+            return [event for event in scoped if event.get("event") == kind]
+        executions = events("execute_list")
+        if len(executions) != 1 or any(type(executions[0].get(key)) is not int or executions[0][key] <= 0
+                                       for key in ("queue", "list", "recording")):
+            failures.append("placed range phase does not execute one identified list: " + name)
+            continue
+        execution = executions[0]
+        queue, list_id = execution["queue"], execution["list"]
+        submits = [event for event in events("submit") if event.get("queue") == queue and
+                   event["event_id"] > execution["event_id"]]
+        if not submits:
+            failures.append("placed range execution lacks native submission: " + name)
+        if name in names[:2]:
+            clears = events("submission_heap_clear_in_place")
+            clear_ids = [event.get("encoder") for event in clears]
+            if len(clears) != 2 or len(set(clear_ids)) != 2 or any(type(value) is not int or value <= 0 for value in clear_ids):
+                failures.append("placed texture clears were not kept as two native encoders: " + name)
+            native_begins, native_ends = events("native_clear_begin"), events("native_clear_end")
+            if (events("submission_render_merged") or
+                    [event.get("encoder") for event in native_begins] != clear_ids or
+                    [event.get("encoder") for event in native_ends] != clear_ids or
+                    any(event.get("members") != 1 or event.get("begin_count") != 1 or "batch" in event
+                        for event in native_begins) or
+                    any(event.get("end_count") != 1 or "batch" in event for event in native_ends) or
+                    any(begin["event_id"] >= end["event_id"] for begin, end in zip(native_begins, native_ends))):
+                failures.append("placed texture clears lack two standalone native passes: " + name)
+            if name == "placed_disjoint_ranges":
+                for encoder in clear_ids:
+                    skips = [event for event in events("native_fence_wait_skipped") if event.get("encoder") == encoder]
+                    if len(skips) != 1 or skips[0].get("reason") != "no_known_hazard" or skips[0].get("skip_count") != 1:
+                        failures.append("disjoint placed texture retained a false dependency")
+                if events("submission_access_opaque"):
+                    failures.append("disjoint placed ranges lack complete access proof")
+            continue
+        identity = (queue, list_id, execution["recording"])
+        if replay_identity is None:
+            replay_identity = identity
+        elif identity != replay_identity:
+            failures.append("placed sparse replay changed its closed recording")
+        if events("recording_plan_sealed"):
+            failures.append("placed sparse replay recorded a new command list")
+        proofs = events("sparse_publication_proof")
+        if len(proofs) != 1:
+            failures.append("placed sparse replay lacks one mapping proof: " + name)
+            continue
+        proof = proofs[0]
+        generation, ranges = proof.get("mapping_generation"), proof.get("heap_ranges")
+        required = name == "placed_sparse_overlap"
+        if (proof.get("queue") != queue or proof.get("list") != list_id or
+                type(generation) is not int or generation <= prior_generation or
+                type(ranges) is not int or ranges <= 0 or
+                type(proof.get("required")) not in (bool, int) or proof.get("required") != required or
+                type(proof.get("current")) not in (bool, int) or proof.get("current") != (not required)):
+            failures.append("placed sparse proof identity, generation or decision differs: " + name)
+        if type(generation) is int:
+            prior_generation = generation
+        if replay_ranges is None:
+            replay_ranges = ranges
+        elif ranges != replay_ranges:
+            failures.append("placed sparse replay changed its heap access ranges")
+        elided, retained = events("sparse_publication_elided"), events("sparse_publication_required")
+        decisions = retained if required else elided
+        if len(decisions) != 1 or (elided if required else retained):
+            failures.append("placed sparse publication decision missing or contradictory: " + name)
+        else:
+            decision = decisions[0]
+            reason = (decision.get("reason") == "mapped_heap_or_opaque_access" if required else
+                      decision.get("proof") == "disjoint_sparse_heap_ranges")
+            if not reason or any(decision.get(key) != value for key, value in (
+                    ("queue", queue), ("list", list_id), ("mapping_generation", generation), ("heap_ranges", ranges))):
+                failures.append("placed sparse publication decision differs from its proof: " + name)
+        # Mapping tasks run before Execute on the same FIFO. Their publication
+        # may land inside the phase marker but is not this consumer's flush.
+        flushes = [event for event in events("sparse_alias_flush") if event.get("queue") == queue and
+                   event["event_id"] > execution["event_id"]]
+        if bool(flushes) != required or any(type(event.get("value")) is not int or event["value"] <= 0 for event in flushes):
+            failures.append("placed sparse consumer signal/wait publication differs: " + name)
+        barriers = events("sparse_barrier_elided")
+        if len(barriers) != (0 if required else 4) or any(any(event.get(key) != value for key, value in (
+                ("queue", queue), ("list", list_id), ("mapping_generation", generation), ("heap_ranges", ranges)))
+                for event in barriers):
+            failures.append("placed sparse barrier elision did not retain the current mapping proof: " + name)
+    return failures
+
+
 def submission_foundation_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
     cases = re.findall(r"^OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=(\w+) .+$",stdout,re.MULTILINE)
-    trace, failures = phase3_trace(stderr)
+    trace, failures = phase3_trace(stderr, 1000000)
     def events(kind): return [event for event in trace if event.get("event") == kind]
     sealed = events("recording_plan_sealed")
     reuse = events("indirect_buffer_reuse")
     sparse = events("sparse_publication_elided")
     clears = events("submission_heap_clear_in_place")
     batches = events("query_fanout_batch")
+    cache_steps = [("cold", False), ("payload", True), ("unrelated", True), ("copy", False),
+                   ("copy_payload", True), ("null", False), ("null_replay", True), ("restore", False),
+                   ("va_epoch", False), ("va_replay", True)]
+    phase_prefix = "OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE "
+    phase_rows = re.findall(r"^" + phase_prefix + r"(begin|end)=(descriptor_cache_\w+)\r?$", stderr, re.MULTILINE)
+    cache_ok = phase_rows == [(edge, "descriptor_cache_" + name)
+                              for name, _ in cache_steps for edge in ("begin", "end")]
+    for name, hit in cache_steps:
+        marker = "descriptor_cache_" + name
+        blocks = re.findall(r"^" + phase_prefix + "begin=" + marker + r"\r?\n(.*?)^" +
+                            phase_prefix + "end=" + marker + r"\r?$", stderr, re.MULTILINE | re.DOTALL)
+        if len(blocks) != 1:
+            cache_ok = False
+            continue
+        try:
+            scoped = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                      for line in blocks[0].splitlines() if "OWNED_GRAPHICS_TRACE " in line]
+            work = [event for event in scoped if event.get("event") == "submission_plan_work"]
+            cache_ok &= len(work) == 1 and all(event.get(key) == value for event in work for key, value in (
+                ("descriptor_cache_hits", int(hit)), ("descriptor_cache_misses", int(not hit)),
+                ("descriptor_cache_builds", int(not hit)), ("descriptor_resolutions", int(not hit))))
+        except (ValueError, TypeError, AttributeError):
+            cache_ok = False
     return bool(success and native_compiler_proof and not failures and
-        cases == ["volatile_replay","retired_icb_reuse","placed_alias_clears","query_fanout","sparse_mapping_positive","cpu_strip_transfer"] and
-        stdout.count("OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=6") == 1 and
+        cases == ["volatile_replay","descriptor_cache_reuse","retired_icb_reuse","placed_alias_clears",
+                  "placed_disjoint_ranges","placed_sparse_range_replay","query_fanout","sparse_mapping_positive","cpu_strip_transfer",
+                  "dispatch_independence"] and
+        stdout.count("OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10") == 1 and cache_ok and
+        stdout.count("case=dispatch_independence phases=7 table_replays=3 potential_raw_war_waw=serial "
+                     "budget=65 roots=8 all_words_and_guards=exact") == 1 and
+        not placed_sparse_range_failures(stdout, stderr) and
         sealed and all(event.get("descriptor_values_captured") == 0 for event in sealed) and
         len(reuse) >= 2 and all(event.get("capacity",0) >= event.get("count",1) for event in reuse) and
-        len(sparse) >= 4 and all(event.get("proof") == "no_sparse_heap_or_opaque_access" for event in sparse) and
-        len(clears) == 2 and batches and all(event.get("native_encoders") == 1 and event.get("targets",0) > 0 for event in batches) and
+        sum(event.get("proof") == "no_sparse_heap_or_opaque_access" for event in sparse) >= 4 and
+        all(event.get("proof") in ("no_sparse_heap_or_opaque_access", "disjoint_sparse_heap_ranges") for event in sparse) and
+        len(clears) == 4 and batches and all(event.get("native_encoders") == 1 and event.get("targets",0) > 0 for event in batches) and
         any(event["targets"] > 1 for event in batches) and
         any(event.get("reason") == "sparse_alias" for event in events("submission_access_opaque")) and
         any(event.get("allocations",0) > 1 and event.get("commits") == 1 for event in events("residency_add_batch")) and
         "_FAIL" not in stdout and "OWNED_D3D12_RENDER_PASSES_FAIL" not in stderr)
+
+
+def workgraph_frontier_failures(stdout: str, stderr: str) -> list[str]:
+    expected_cases = [
+        "OWNED_D3D12_WG_FRONTIER_CASE name=cpu gpu_input=0 replay=0 groups=65 leaves=293 "
+        "zero_children=65 sharing_last=1 sharing_count=65 payload=exact hits=exact guards=ok tag=0x13579bdf",
+        "OWNED_D3D12_WG_FRONTIER_CASE name=gpu gpu_input=1 replay=0 groups=66 leaves=297 "
+        "zero_children=66 sharing_last=1 sharing_count=66 payload=exact hits=exact guards=ok tag=0x2468ace0",
+        "OWNED_D3D12_WG_FRONTIER_CASE name=gpu_replay gpu_input=1 replay=1 groups=21 leaves=95 "
+        "zero_children=21 sharing_last=1 sharing_count=21 payload=exact hits=exact guards=ok tag=0xdeadbeef",
+        "OWNED_D3D12_WG_FRONTIER_CASE name=zero_shared source_groups=0 shared_groups=1 "
+        "payload=exact hits=exact guards=ok",
+    ]
+    final = ("OWNED_D3D12_WG_FRONTIER_PASS cases=4 active_cases=3 zero_shared=1 "
+             "default_gpu_input=1 closed_list_replay=1 exact_min_range=1")
+    failures = []
+    if [line for line in stdout.splitlines() if line.startswith("OWNED_D3D12_WG_FRONTIER_CASE")] != expected_cases:
+        failures.append("frontier exact payload/hit/zero-grid/sharing/replay cases differ")
+    if stdout.splitlines().count(final) != 1:
+        failures.append("frontier full four-case completion missing or duplicated")
+    memory = re.findall(r"^OWNED_D3D12_WG_FRONTIER_MEMORY exact_min_range=(\d+) max=(\d+) "
+                        r"guards=64,64 slots=528$", stdout, re.MULTILINE)
+    if len(memory) != 1 or not 0 < int(memory[0][0]) <= int(memory[0][1]):
+        failures.append("frontier exact-minimum backing range and guard evidence differs")
+    if any(marker in stdout + stderr for marker in (
+            "OWNED_D3D12_WG_FRONTIER_FAIL", "OWNED_D3D12_WG_FRONTIER_MISMATCH",
+            "OWNED_D3D12_ATOMIC64_WG_TYPED_FAIL")):
+        failures.append("frontier numerical fixture failed")
+
+    events, trace_failures = phase3_trace(stderr)
+    failures.extend(trace_failures)
+    if trace_failures:
+        return failures
+    executions = [event for event in events if event.get("event") == "execute_list"]
+    keys = [(event.get("list"), event.get("recording")) for event in executions]
+    if (len(executions) != 4 or any(type(value) is not int or value <= 0 for key in keys for value in key)
+            or keys[1] != keys[2] or len(set(keys)) != 3
+            or len({event.get("queue") for event in executions}) != 1):
+        return failures + ["frontier GPU input replay did not execute the same closed recording"]
+    if any(event.get("event") in ("work_graph_node_batch", "work_graph_host_batch") for event in events):
+        failures.append("ordinary nonterminal frontier used legacy per-node or host-phase execution")
+    quanta = [event for event in events if event.get("event") == "work_graph_frontier_quantum"]
+    reads = [event for event in events if event.get("event") == "work_graph_readback"]
+    if not quanta or len(reads) != 2:
+        failures.append("frontier quantum evidence or two GPU input header reads missing")
+    expected_totals = [(652, 359, 4), (661, 364, 4), (212, 117, 4), (1, 0, 1)]
+    fields = ("quantum", "node_steps", "nonterminal_steps", "host_steps", "total_node_steps",
+              "total_nonterminal_steps", "peak_depth", "host_yield", "done", "error", "gpu_slots", "admitted_groups")
+    covered_quanta = 0
+    covered_reads = 0
+    for index, (execution, expected) in enumerate(zip(executions, expected_totals)):
+        start = execution["event_id"]
+        end = executions[index + 1]["event_id"] if index + 1 < len(executions) else len(events) + 1
+        part = [event for event in quanta if start < event["event_id"] < end]
+        headers = [event for event in reads if start < event["event_id"] < end]
+        covered_quanta += len(part)
+        covered_reads += len(headers)
+        expected_headers = [("gpu_input_header", 24)] if index in (1, 2) else []
+        if [(event.get("kind"), event.get("bytes")) for event in headers] != expected_headers:
+            failures.append(f"frontier case {index} read back generated records/grids or wrong input metadata")
+        if not part:
+            failures.append(f"frontier case {index} has no GPU quantum")
+            continue
+        if any(type(event.get(field)) is not int for event in part for field in fields):
+            failures.append(f"frontier case {index} has malformed quantum fields")
+            continue
+        totals = [0, 0]
+        peak = 0
+        for ordinal, event in enumerate(part, 1):
+            nodes, nonterminal = event["node_steps"], event["nonterminal_steps"]
+            totals[0] += nodes
+            totals[1] += nonterminal
+            if (event["quantum"] != ordinal or event["gpu_slots"] != 64
+                    or not 0 <= nonterminal <= nodes <= 64 or nodes == 0
+                    or not 0 < event["admitted_groups"] <= 65535
+                    or event["host_steps"] != 0 or event["host_yield"] != 0 or event["error"] != 0
+                    or event["done"] != int(ordinal == len(part))
+                    or event["total_node_steps"] != totals[0]
+                    or event["total_nonterminal_steps"] != totals[1]
+                    or not peak <= event["peak_depth"] <= expected[2]):
+                failures.append(f"frontier case {index} quantum progression, bounds, completion or host fallback differs")
+                break
+            peak = event["peak_depth"]
+        if (totals[0], totals[1], peak) != expected:
+            failures.append(f"frontier case {index} exact GPU node/nonterminal/depth totals differ")
+        if index < 3 and (len(part) < 2 or len(part) >= expected[0]
+                         or max(event.get("node_steps", 0) for event in part) != 64):
+            failures.append(f"frontier case {index} does not prove a full GPU quantum and continuation")
+        if headers and headers[0]["event_id"] >= part[0]["event_id"]:
+            failures.append(f"frontier case {index} input header was read after frontier execution began")
+    if covered_quanta != len(quanta) or covered_reads != len(reads):
+        failures.append("frontier GPU/readback events fall outside fixture executions")
+    return failures
+
+
+def workgraph_frontier_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
+    return bool(success and native_compiler_proof and not workgraph_frontier_failures(stdout, stderr))
+
+
+def workgraph_texture_frontier_failures(stdout: str, stderr: str) -> list[str]:
+    prefix = "OWNED_D3D12_WG_TEXTURE_FRONTIER"
+    expected = []
+    for index in range(16):
+        initial = 0x12340000 + index * 0x101
+        observed = initial + 0x10007
+        final = observed + 0x2000B
+        expected.append(f"{prefix}_TEXEL index={index} initial={initial:08x} "
+                        f"child_observed={observed:08x} final={final:08x} copy={final:08x} visits=1")
+    failures = []
+    if [line for line in stdout.splitlines() if line.startswith(prefix + "_TEXEL")] != expected:
+        failures.append("texture frontier exact initial/child/final/physical-copy/visit texels differ")
+    terminal = (prefix + "_PASS cases=1 nodes=2 cpu_records=16 seed_count=16 child_count=16 "
+                "raw_words=74 guards=8 physical_copy=PASS layout=STANDARD_SWIZZLE atomic64=0")
+    if [line for line in stdout.splitlines() if line.startswith(prefix + "_PASS")] != [terminal]:
+        failures.append("texture frontier complete raw-word/count/guard/publication evidence differs")
+    if stdout.splitlines().count(prefix + "_BACKEND id=owned-graphics-d3d12") != 1:
+        failures.append("texture frontier owned backend evidence missing or duplicated")
+    if any(marker in stdout + stderr for marker in (
+            prefix + "_FAIL", prefix + "_MISMATCH", "OWNED_D3D12_ATOMIC64_WG_TYPED_FAIL")):
+        failures.append("texture frontier numerical fixture failed")
+
+    events, integrity = phase3_trace(stderr)
+    failures.extend(integrity)
+    if integrity:
+        return failures
+    executions = [event for event in events if event.get("event") == "execute_list"]
+    if len(executions) != 1 or any(type(executions[0].get(field)) is not int or executions[0][field] <= 0
+                                   for field in ("queue", "list", "recording")):
+        return failures + ["texture frontier must execute one retained command list"]
+    if any(event.get("event") in ("work_graph_node_batch", "work_graph_readback") for event in events):
+        failures.append("texture frontier used legacy node execution or CPU record/grid readback")
+    work = [event for event in events if event.get("event") in
+            ("work_graph_frontier_quantum", "work_graph_host_batch")]
+    if not work or any(event["event_id"] <= executions[0]["event_id"] for event in work):
+        return failures + ["texture frontier progress is absent or precedes command-list execution"]
+
+    fields = ("quantum", "node_steps", "nonterminal_steps", "host_steps", "total_node_steps",
+              "total_nonterminal_steps", "peak_depth", "host_yield", "done", "error", "gpu_slots")
+    quantum = nodes = nonterminal = host_steps = peak = 0
+    pending = None
+    completed = False
+    host_counts = {}
+    role_nodes = {}
+    for event in work:
+        if completed:
+            failures.append("texture frontier emitted work after final completion")
+            break
+        if event["event"] == "work_graph_host_batch":
+            if pending is None:
+                failures.append("texture frontier host batch lacks a preceding GPU yield")
+                break
+            if (any(type(event.get(field)) is not int for field in ("node", "groups", "atomic64", "texture"))
+                    or not 0 <= event["node"] < 2 or event["groups"] != 1
+                    or event["atomic64"] != 0 or event["texture"] != 1):
+                failures.append("texture frontier did not execute ordinary texture publication for one selected group")
+                break
+            role = pending["nonterminal_steps"]
+            node = event["node"]
+            if ((role in role_nodes and role_nodes[role] != node)
+                    or any(other != role and selected == node for other, selected in role_nodes.items())):
+                failures.append("texture frontier seed/child host node identity changed")
+                break
+            role_nodes[role] = node
+            host_counts[node] = host_counts.get(node, 0) + 1
+            pending = None
+            continue
+
+        if pending is not None:
+            failures.append("texture frontier resumed GPU traversal before retiring the selected host batch")
+            break
+        if any(type(event.get(field)) is not int for field in fields):
+            failures.append("texture frontier quantum fields are malformed")
+            break
+        quantum += 1
+        count, children, hosts = event["node_steps"], event["nonterminal_steps"], event["host_steps"]
+        if (event["quantum"] != quantum or event["gpu_slots"] != 64 or event["error"] != 0
+                or event["host_yield"] not in (0, 1) or event["done"] not in (0, 1)
+                or not 0 <= children <= count <= 1 or hosts != count
+                or not peak <= event["peak_depth"] <= 2):
+            failures.append("texture frontier quantum bounds, progress, depth or error state differs")
+            break
+        nodes += count
+        nonterminal += children
+        host_steps += hosts
+        peak = event["peak_depth"]
+        if (event["total_node_steps"] != nodes or event["total_nonterminal_steps"] != nonterminal
+                or nodes > 32 or nonterminal > 16):
+            failures.append("texture frontier cumulative GPU selection counters differ")
+            break
+        if event["host_yield"]:
+            if count != 1 or event["done"]:
+                failures.append("texture frontier yielded without one live selected host node")
+                break
+            pending = event
+        elif not event["done"] or count != 0:
+            failures.append("texture frontier lost a selected host node or made no progress")
+            break
+        else:
+            completed = True
+
+    if pending is not None or not completed:
+        failures.append("texture frontier lacks retired host work or final GPU completion")
+    if (nodes, nonterminal, host_steps, peak) != (32, 16, 32, 2):
+        failures.append("texture frontier final node/nonterminal/host/depth totals differ")
+    if sorted(host_counts.values()) != [16, 16] or set(role_nodes) != {0, 1}:
+        failures.append("texture frontier must publish both distinct nodes exactly sixteen times")
+    return failures
+
+
+def workgraph_texture_frontier_output_matches(stdout: str, stderr: str,
+                                              native_compiler_proof: bool, success: bool) -> bool:
+    return bool(success and native_compiler_proof and not workgraph_texture_frontier_failures(stdout, stderr))
 
 
 def workgraph_batches_output_matches(stdout: str, stderr: str, native_compiler_proof: bool, success: bool) -> bool:
@@ -4194,6 +5226,10 @@ def feature_level_output_matches(stdout: str, stderr: str, success: bool) -> boo
     typed = re.findall(r"OWNED_D3D12_FEATURE_LEVEL_TYPED_UAV_LOAD format=(\w+) texels=32 "
                        r"views=texture2d,buffer", stdout)
     cases = re.findall(r"^OWNED_D3D12_FEATURE_LEVEL_CASE_PASS (\w+)$", stdout, re.MULTILINE)
+    admission = [line for line in stdout.splitlines()
+                 if line.startswith("OWNED_D3D12_FEATURE_LEVEL_ADMISSION")]
+    summary = [line for line in stdout.splitlines()
+               if line.startswith("OWNED_D3D12_FEATURE_LEVEL_PASS")]
     success = (success and logic == ["R8G8B8A8_UINT", "R16G16_UINT", "R32_UINT", "R10G10B10A2_UINT",
                                      "R8_UINT", "R16_UINT", "R8G8_UINT"]
                and [samples for samples, _ in forced] == ["1", "4", "8", "16"]
@@ -4202,11 +5238,14 @@ def feature_level_output_matches(stdout: str, stderr: str, success: bool) -> boo
                                ("4", "0x0")]
                and len(typed) == 18 and len(set(typed)) == 18
                and re.search(r"OWNED_D3D12_FEATURE_LEVEL_TIR16_RTV triangles=40 partial=[1-9]\d*", stdout)
-               and cases == ["logic_ops_16_uint_formats_7_mrt_and_rejections",
+               and admission == ["OWNED_D3D12_FEATURE_LEVEL_ADMISSION max=0xc200 sm=0x66 "
+                                  "mandatory12_2=1 waves=4..32"]
+               and cases == ["public_admission_mandatory_caps_creation_and_probe",
+                             "logic_ops_16_uint_formats_7_mrt_and_rejections",
                              "uav_only_forced_1_4_8_16_and_tir16_rtv_coverage_invocation_occlusion_exact",
                              "forced1_multisample_rtv_4x_8x_samplemask_occlusion_statistics",
                              "typed_uav_load_18_required_formats_texture2d_and_buffer_exact"]
-               and stdout.count("OWNED_D3D12_FEATURE_LEVEL_PASS cases=4") == 1
+               and summary == ["OWNED_D3D12_FEATURE_LEVEL_PASS cases=5"]
                and "OWNED_D3D12_FEATURE_LEVEL_FAIL" not in stdout + stderr)
     return success
 
@@ -4399,6 +5438,23 @@ def atomic_copy_output_matches(args: argparse.Namespace, stdout: str, native_com
     return success, dxil_compiler_loaded
 
 
+def present_history_output_matches(stdout: str, stderr: str, success: bool) -> bool:
+    history = re.findall(r"^OWNED_D3D12_PRESENT_HISTORY_CASE case=([\w-]+) pixels=48 hash=([0-9a-f]{8}) exact=1$",
+                         stdout, re.MULTILINE)
+    expected = [("seed", "24d7cc45"), ("full-dirty-scroll", "77e858a5"),
+                ("partial-dirty-scroll", "3c4ba7bd"), ("full-dirty-list", "f5a0cae5"),
+                ("partial-after-full", "23586f54"), ("full-dirty-cropped", "5820e745"),
+                ("dirty-crop-only", "18c9a105"), ("overlap-positive-scroll", "d791e13c"),
+                ("stationary-scroll", "f61989e8"), ("large-inner-scroll", "26eba67d"),
+                ("large-edge-dirty", "97e990ef")]
+    phases = re.findall(r"^OWNED_D3D12_PRESENT_HISTORY_PHASE (begin|end)=([\w-]+)\r?$", stderr, re.MULTILINE)
+    return bool(success and history == expected and phases == [
+        (edge, name) for name, _ in expected for edge in ("begin", "end")] and
+        stdout.count("OWNED_D3D12_PRESENT_HISTORY_PASS cases=11 pixels=528 full_dirty=3 partial=7 crop=3 queues=2 exact=1") == 1 and
+        "OWNED_D3D12_PRESENT_HISTORY_FAIL" not in stdout + stderr and
+        "OWNED_D3D12_PRESENT_QUEUES_FAIL" not in stdout + stderr)
+
+
 def present_queues_output_matches(stdout: str, stderr: str, success: bool) -> bool:
     success = (success
                and stdout.count("OWNED_D3D12_PRESENT_QUEUES_VALIDATION_PASS rejected=12 preserved=1") == 1
@@ -4496,15 +5552,419 @@ def stream_output_output_matches(stdout: str, stderr: str, success: bool) -> boo
                           r"written=([\d,]+) needed=([\d,]+) filled=([\d,]+)$", stdout, re.MULTILINE)
     success = success and found_gs == [(name, shader, *rest) for shader in ("dxbc", "dxil")
                                        for name, *rest in gs_streams]
-    success = (success and stdout.count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=122") == 1
-               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=53") == 1
-               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 55
+    bounded_cases = [
+        ("indirect_bounded_snapshot_zero_count", "0", "0", "0,0", "0", "0", "0", "0"),
+        ("indirect_bounded_snapshot_small_count", "4", "4", "64,0", "4", "4", "4", "0"),
+        ("indirect_bounded_snapshot_predicate_zero", "0", "0", "0,0", "0", "0", "0", "0"),
+        ("indirect_bounded_snapshot_replay_growth", "3", "3", "64,0", "4", "4", "4", "0"),
+        ("indirect_mutating_bounded_views", "14", "14", "224,0", "14", "14", "14", "0"),
+        # Seven non-cut IA positions are shaded once; the native strip control shades eight corners.
+        ("indirect_mutating_bounded_strip_cut", "4", "4", "128,0", "7", "8", "7", "0"),
+        ("indirect_mutating_bounded_conservative_triangle", "1", "1", "48,0", "3", "3", "3", "0"),
+    ]
+    found_bounded = re.findall(
+        r"^OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=(indirect_(?:bounded_snapshot|mutating_bounded)_\w+) "
+        r"written=(\d+) needed=(\d+) filled=([\d,]+) invocations=(\d+) baseline=(\d+) "
+        r"ia_positions=(\d+) tickets=(\d+)$", stdout, re.MULTILINE)
+    frontier_cases = [
+        ("direct_frontier_original_bases", "4", "4", "96,0", "4", "4", "4"),
+        ("indirect_frontier_strip_carry_bases", "16898", "16898", "1216656,0", "16902", "16902", "50694"),
+        ("indirect_frontier_commands_replay_bases", "17", "17", "1968,0", "82", "82", "82"),
+        ("indirect_frontier_overflow_progress", "2", "16386", "48,0", "16386", "16386", "2"),
+    ]
+    found_frontier = re.findall(
+        r"^OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=((?:in)?direct_frontier_\w+) "
+        r"written=(\d+) needed=(\d+) filled=([\d,]+) invocations=(\d+) baseline=(\d+) "
+        r"ia_positions=(\d+) tickets=(\d+)$", stdout, re.MULTILINE)
+    frontier_details = re.findall(
+        r"^OWNED_D3D12_STREAM_OUTPUT_FRONTIER_PASS case=(\w+) original_bases=1 exact_ia=1 "
+        r"carry=([01]) keys=(\d+) invocations=(\d+) target_bytes=2097152$", stdout, re.MULTILINE)
+    native_intervals = [(4, 4), (16902, 50694), (82, 82), (16386, 16386)]
+    success = (success and found_bounded == bounded_cases
+               and [row[:5] + row[6:] for row in found_frontier] == frontier_cases
+               and all(minimum <= int(row[5]) <= maximum
+                       for row, (minimum, maximum) in zip(found_frontier, native_intervals))
+               and frontier_details == [
+                   ("direct_frontier_original_bases", "0", "0", "4"),
+                   ("indirect_frontier_strip_carry_bases", "1", "16902", "16902"),
+                   ("indirect_frontier_commands_replay_bases", "0", "0", "82"),
+                   ("indirect_frontier_overflow_progress", "0", "0", "16386")]
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_FRONTIER_PASS ") == 4
+               and (stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=indirect_bounded_snapshot_") +
+                    stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS case=indirect_mutating_bounded_")) == 7
+               and stdout.splitlines().count("OWNED_D3D12_STREAM_OUTPUT_VALIDATION_PASS cases=133") == 1
+               and stdout.splitlines().count("OWNED_D3D12_STREAM_OUTPUT_CAPTURE_PASS cases=64") == 1
+               and stdout.count("OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PASS ") == 66
                and stdout.count("OWNED_D3D12_STREAM_OUTPUT_NO_RASTER_DISTANCE_PASS cases=2") == 1
                and "OWNED_D3D12_STREAM_OUTPUT_PASS validation=1 capture=1" in stdout
                and "OWNED_D3D12_STREAM_OUTPUT_FAIL" not in stdout + stderr
                and stdout.count("OWNED_D3D12_STREAM_OUTPUT_QUERY_GPU_PASS streams=0,1,2,3 "
                                 "written=0 needed=0 offset=24 guards=1") == 1)
     return success
+
+
+def capture_frontier_atomic_phase_failures(phase: list[dict], begin: int, end: int, queue: int,
+                                          host_windows: list[tuple[int, int, int]]) -> list[str]:
+    """Require producer export and pixel import/export at each explicit host handoff."""
+    failures, claimed = [], set()
+    atomic_names = {"atomic64_prepare", "atomic64_retired"}
+    reasons = [reason for _, _, reason in host_windows]
+    if not reasons or reasons != [1, 2] * (len(reasons) // 2):
+        failures.append("atomic bindings and MSAA host phases do not alternate")
+    completed = {(event.get("queue"), event.get("submission")): (index, event)
+                 for index, event in enumerate(phase) if event["event"] == "complete" and event.get("status") == 4}
+
+    def prepared(event):
+        return all(type(event.get(field)) is int and event[field] > 0
+                   for field in ("topology_id", "participants", "cells", "node_capacity"))
+
+    def retired_after_native(prepare_index, after_index, retire_index):
+        # The cursor quantum already retired before the host event. Atomic export
+        # is a separate submission; it too must complete before MarkRetired.
+        submissions = [(index, event) for index, event in enumerate(phase)
+                       if prepare_index < index < retire_index and event["event"] == "submit" and
+                       event.get("queue") == queue]
+        if not any(index > after_index for index, _ in submissions):
+            return False
+        for index, event in submissions:
+            completion = completed.get((queue, event.get("submission")))
+            if (completion is None or not index < completion[0] < retire_index or
+                    not phase[prepare_index]["event_id"] < event["event_id"] <
+                        completion[1]["event_id"] < phase[retire_index]["event_id"]):
+                return False
+        return True
+
+    producer = None
+    for host_index, next_submit, reason in host_windows:
+        rows = [(index, event) for index, event in enumerate(phase)
+                if host_index < index < next_submit and event["event"] in atomic_names]
+        if reason == 1:
+            if (producer is not None or len(rows) != 1 or rows[0][1]["event"] != "atomic64_prepare" or
+                    not prepared(rows[0][1]) or
+                    not phase[host_index]["event_id"] < rows[0][1]["event_id"] < phase[next_submit]["event_id"]):
+                failures.append("producer atomic preparation is missing, overlapping or outside its host phase")
+                continue
+            producer = rows[0]
+            claimed.add(producer[1]["event_id"])
+            if not retired_after_native(host_index, host_index, producer[0]):
+                failures.append("producer atomic bindings were prepared before native metadata retirement")
+            continue
+        if (reason != 2 or producer is None or
+                [event["event"] for _, event in rows] !=
+                ["atomic64_retired", "atomic64_prepare", "atomic64_retired"]):
+            failures.append("MSAA handoff lacks ordered producer retirement and pixel preparation/retirement")
+            continue
+        producer_retire, pixel_prepare, pixel_retire = rows
+        ids = [phase[host_index]["event_id"], *[event["event_id"] for _, event in rows],
+               phase[next_submit]["event_id"]]
+        if (not prepared(pixel_prepare[1]) or pixel_prepare[1]["participants"] != 16384 or
+                producer_retire[1].get("topology_id") != producer[1]["topology_id"] or
+                pixel_retire[1].get("topology_id") != pixel_prepare[1].get("topology_id") or
+                any(type(event.get("topology_id")) is not int for _, event in rows) or
+                any(left >= right for left, right in zip(ids, ids[1:]))):
+            failures.append("MSAA producer/pixel phase identity or causal order differs")
+        if (not retired_after_native(producer[0], host_index, producer_retire[0]) or
+                not retired_after_native(pixel_prepare[0], pixel_prepare[0], pixel_retire[0])):
+            failures.append("atomic export or pixel consumer retired before its native completion")
+        claimed.update(event["event_id"] for _, event in rows)
+        producer = None
+    if producer is not None:
+        failures.append("producer atomic phase remains live after frontier completion")
+    actual = {event["event_id"] for index, event in enumerate(phase)
+              if event["event"] in atomic_names and begin < index < end}
+    if actual != claimed:
+        failures.append("atomic phase event is unpaired or outside its explicit host window")
+    return failures
+
+
+def capture_frontier_failures(suite: str, stderr: str, dxil_frozen: bool = True) -> list[str]:
+    """Join GPU cursor progress to fixed scratch, the original recording and real native retirement."""
+    events, failures = phase3_trace(stderr, 1000000)
+    if failures:
+        return ["capture frontier " + failure for failure in failures]
+    if any(event["event"] in ("indirect_capture_wait", "indirect_capture_ready") for event in events):
+        failures.append("capture frontier used CPU draw-argument preflight")
+
+    # path, completed commands per execution, minimum quanta, exact producer steps (if known).
+    # First quantum has one slot; all continuations have 64. These are scheduler budgets,
+    # not command/instance/primitive limits. Empty strip scans can advance without a producer.
+    if suite == "stream-output":
+        cases = {
+            "indirect_bounded_snapshot_zero_count": ("vertex_so", [0], [1], [0]),
+            "indirect_bounded_snapshot_small_count": ("vertex_so", [1], [1], [2]),
+            "indirect_bounded_snapshot_predicate_zero": ("vertex_so", [0], [1], [0]),
+            "indirect_bounded_snapshot_replay_growth": ("vertex_so", [1, 2046], [1, 2], [1, 2]),
+            "indirect_mutating_bounded_views": ("vertex_so", [5], [1], [6]),
+            "indirect_mutating_bounded_strip_cut": ("vertex_so", [2], [1], [2]),
+            "indirect_mutating_bounded_conservative_triangle": ("vertex_so", [1], [1], [1]),
+            "indirect_frontier_strip_carry_bases": ("vertex_so", [1], [3], [68]),
+            "indirect_frontier_commands_replay_bases": ("vertex_so", [65, 17], [2, 1], [65, 17]),
+            "indirect_frontier_overflow_progress": ("vertex_so", [1], [3], [66]),
+        }
+        expected = [("", case) for case in cases]
+        marker_prefix = "OWNED_D3D12_STREAM_OUTPUT_GPU_CASE_PHASE"
+        marker_pattern = re.compile(re.escape(marker_prefix) + r" case=(\w+) (begin|end)")
+    elif suite == "atomic64-producers":
+        cases = {
+            "vs_indirect": ("vertex_so", [1], [2], [2]),
+            "hs_indirect": ("domain", [1], [2], [2]),
+            "ds_indirect": ("domain", [1], [2], [2]),
+            "gs_indirect": ("geometry", [1], [2], [2]),
+            "ds_gs_indirect": ("tess_geometry", [1], [2], [4]),
+        }
+        expected = [(str(samples), case) for case in cases for samples in (1, 4)]
+        marker_prefix = "OWNED_D3D12_ATOMIC64_PRODUCERS_PHASE"
+        marker_pattern = re.compile(re.escape(marker_prefix) + r" case=(\w+) samples=([14]) (begin|end)")
+    elif suite == "tiled":
+        cases = {"volume-frontier-partial-w-residency": ("vertex_so", [1], [2], [65])}
+        expected = [(shader, case) for shader in ("dxil", "dxbc") for case in cases]
+        marker_prefix = "OWNED_D3D12_CAPTURE_FRONTIER_PHASE"
+        marker_pattern = re.compile(re.escape(marker_prefix) + r" suite=tiled shader=(dxbc|dxil) "
+                                    r"case=([\w-]+) (begin|end)")
+    else:
+        cases = ({
+            "indirect-frontier-strip-cut-carry": ("geometry", [3], [3], [None]),
+            "indirect-frontier-triadj-carry": ("geometry", [3], [3], [None]),
+        } if suite == "geometry" else {
+            "tsgs-frontier-parent-child-order": ("tess_geometry", [2], [3], [None]),
+            "ds-frontier-point67-overflow": ("domain", [2], [1], [1]),
+        })
+        expected = [(shader, case) for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                    for case in cases]
+        marker_prefix = "OWNED_D3D12_CAPTURE_FRONTIER_PHASE"
+        marker_pattern = re.compile(re.escape(marker_prefix) + rf" suite={suite} shader=(dxbc|dxil) "
+                                    r"case=([\w-]+) (begin|end)")
+
+    phases, markers, active = [], [], None
+    for line in stderr.splitlines():
+        if marker_prefix in line:
+            marker = marker_pattern.fullmatch(line)
+            if marker is None:
+                return failures + ["capture frontier case marker malformed or interleaved"]
+            if suite == "atomic64-producers":
+                case, shader, action = marker.groups()
+            else:
+                shader, case, action = ("", *marker.groups()) if suite == "stream-output" else marker.groups()
+            key = (shader, case)
+            if suite != "stream-output" or case in cases:
+                markers.append((key, action))
+            if action == "begin":
+                if active is not None:
+                    return failures + ["capture frontier case phases overlap"]
+                active = (key, [])
+            elif active is None or active[0] != key:
+                return failures + ["capture frontier case end has no matching begin"]
+            else:
+                if key in expected:
+                    phases.append(active)
+                active = None
+        elif active is not None and "OWNED_GRAPHICS_TRACE " in line:
+            active[1].append(json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]))
+    if active is not None or markers != [(key, action) for key in expected for action in ("begin", "end")]:
+        return failures + ["capture frontier case sequence missing, duplicated, or reordered"]
+
+    capacity_fields = ("vertex_capacity", "object_group_capacity", "tess_parent_slots", "gs_key_capacity",
+                       "parent_bytes", "child_bytes")
+    progress_fields = ("producer_steps", "consumer_steps", "parent_steps", "child_steps", "commands_done")
+    previous_producer = {}
+    for (shader, case), phase in phases:
+        label = f"capture frontier {suite}/{shader or 'dxil'}/{case}"
+        path, commands, minimum_quanta, producers = cases[case]
+        # These line/conservative raster consumers retain the explicit MSAA
+        # consumption handoff at one sample; their tile work stays on the GPU.
+        allow_msaa_host = suite == "stream-output" and case in (
+            "indirect_mutating_bounded_strip_cut", "indirect_mutating_bounded_conservative_triangle")
+        atomic_hosts = suite == "atomic64-producers"
+        allowed_host_reasons = {1, 2} if atomic_hosts else {2} if allow_msaa_host else set()
+        failures.extend(msaa_tile_trace_failures(phase, label))
+        positions = {event["event_id"]: index for index, event in enumerate(phase)}
+        submitted = {(event.get("queue"), event.get("submission")): event
+                     for event in phase if event["event"] == "submit"}
+        completed = {(event.get("queue"), event.get("submission")): event
+                     for event in phase if event["event"] == "complete" and event.get("status") == 4}
+        begins = [(index, event) for index, event in enumerate(phase) if event["event"] == "capture_frontier_begin"]
+        if len(begins) != len(commands):
+            failures.append(label + ": logical execution count differs")
+            continue
+        claimed, identities, executions, capacities = set(), [], [], []
+        for execution_index, (begin_index, begin) in enumerate(begins):
+            claimed.add(begin["event_id"])
+            if (begin.get("path") != path or
+                    any(type(begin.get(field)) is not int or begin[field] <= 0 for field in ("queue", "encoder")) or
+                    any(type(begin.get(field)) is not int or begin[field] < 0 for field in capacity_fields) or
+                    begin["parent_bytes"] + begin["child_bytes"] <= 0 or
+                    (path == "vertex_so" and begin["vertex_capacity"] != 256) or
+                    (path != "vertex_so" and begin["object_group_capacity"] != 1) or
+                    (path in ("geometry", "tess_geometry") and not begin["gs_key_capacity"]) or
+                    (path in ("domain", "tess_geometry") and not begin["tess_parent_slots"]) or
+                    (case == "ds-frontier-point67-overflow" and begin["tess_parent_slots"] != 268)):
+                failures.append(label + ": fixed PSO scratch contract differs")
+                continue
+            capacities.append(tuple(begin[field] for field in capacity_fields))
+            context = [(index, event) for index, event in enumerate(phase[:begin_index])
+                       if event["event"] == "execute_list" and event.get("queue") == begin["queue"]]
+            if not context:
+                failures.append(label + ": frontier has no executing closed-list context")
+                continue
+            execute_index, execute = context[-1]
+            if any(type(execute.get(field)) is not int or execute[field] <= 0
+                   for field in ("submission", "list", "recording")):
+                failures.append(label + ": executing recording identity is invalid")
+                continue
+            identity = (begin["queue"], execute["list"], execute["recording"], begin["encoder"])
+            identities.append(identity)
+            executions.append(execute)
+            recorded = [event for event in phase if event["event"] == "capture_frontier_record" and
+                        (event.get("list"), event.get("recording"), event.get("encoder")) ==
+                        (execute["list"], execute["recording"], begin["encoder"])]
+            if (len(recorded) != 1 or
+                    any(type(recorded[0].get(field)) is not int or recorded[0][field] <= 0 or
+                        recorded[0][field] == begin["encoder"] for field in ("producer", "consumer")) or
+                    recorded[0]["event_id"] >= execute["event_id"] or
+                    positions[recorded[0]["event_id"]] >= execute_index):
+                failures.append(label + ": detached producer/consumer recording is missing, duplicated or late")
+            else:
+                claimed.add(recorded[0]["event_id"])
+            next_execute = next((index for index in range(begin_index + 1, len(phase))
+                                 if phase[index]["event"] == "execute_list" and
+                                 phase[index].get("queue") == begin["queue"]), len(phase))
+            encodes = [(index, event) for index, event in enumerate(phase)
+                       if execute_index < index < next_execute and event["event"] == "encode" and
+                       (event.get("queue"), event.get("encoder")) == (begin["queue"], begin["encoder"])]
+            # EncoderType::CaptureFrontier is 14. Its detached render templates are owned by
+            # this logical recording; a fresh render record is not evidence of closed replay.
+            if (len(encodes) != 1 or
+                    (encodes[0][1].get("list"), encodes[0][1].get("recording"), encodes[0][1].get("type")) !=
+                    (execute["list"], execute["recording"], 14)):
+                failures.append(label + ": frontier is not the original logical encoder")
+            quanta = [(index, event) for index, event in enumerate(phase)
+                      if begin_index < index < next_execute and event["event"] == "capture_frontier_quantum" and
+                      (event.get("queue"), event.get("encoder")) == (begin["queue"], begin["encoder"])]
+            if len(quanta) < minimum_quanta[execution_index]:
+                failures.append(label + ": required GPU continuation was not observed")
+            previous_progress = (0,) * len(progress_fields)
+            previous_quantum = begin_index
+            host_windows = []
+            for ordinal, (quantum_index, quantum) in enumerate(quanta, 1):
+                claimed.add(quantum["event_id"])
+                final = ordinal == len(quanta)
+                host = not final and bool(allowed_host_reasons) and quantum.get("status") == 3
+                if (quantum.get("quantum") != ordinal or type(quantum.get("quantum")) is not int or
+                        type(quantum.get("budget")) is not int or quantum["budget"] != (1 if ordinal == 1 else 64) or
+                        type(quantum.get("status")) is not int or quantum["status"] != (3 if host else int(final)) or
+                        type(quantum.get("done")) is not bool or quantum["done"] != final or
+                        type(quantum.get("error")) is not int or quantum["error"] != 0 or
+                        type(quantum.get("host_reason")) is not int or
+                        quantum["host_reason"] not in (allowed_host_reasons if host else {0}) or
+                        any(type(quantum.get(field)) is not int or quantum[field] < 0 for field in progress_fields)):
+                    failures.append(label + ": quantum sequence/status/progress schema differs")
+                    continue
+                progress = tuple(quantum[field] for field in progress_fields)
+                if (any(value < previous for value, previous in zip(progress, previous_progress)) or
+                        quantum["commands_done"] > commands[execution_index] or
+                        (not final and not (atomic_hosts and host) and progress == previous_progress and
+                         quantum["consumer_steps"] != 0)):
+                    failures.append(label + ": GPU continuation counters regressed or stopped")
+                previous_progress = progress
+                producer = (begin["queue"], quantum.get("producer"))
+                if (type(quantum.get("producer")) is not int or
+                        quantum["producer"] <= previous_producer.get(begin["queue"], 0) or
+                        quantum["producer"] < execute["submission"] or
+                        producer not in submitted or producer not in completed):
+                    failures.append(label + ": quantum producer identity/native completion differs")
+                    continue
+                submit_index = positions[submitted[producer]["event_id"]]
+                complete_index = positions[completed[producer]["event_id"]]
+                if (not previous_quantum < submit_index < complete_index < quantum_index < next_execute or
+                        not begin["event_id"] < submitted[producer]["event_id"] <
+                            completed[producer]["event_id"] < quantum["event_id"]):
+                    failures.append(label + ": GPU cursor was observed before actual native retirement")
+                previous_producer[begin["queue"]] = quantum["producer"]
+                previous_quantum = quantum_index
+                if host:
+                    next_index, next_quantum = quanta[ordinal]
+                    host_rows = [(index, event) for index, event in enumerate(phase)
+                                 if quantum_index < index < next_index and event["event"] == "capture_frontier_host" and
+                                 (event.get("queue"), event.get("encoder")) == (begin["queue"], begin["encoder"])]
+                    reason = "atomic_bindings" if quantum["host_reason"] == 1 else "msaa_consume"
+                    if (len(host_rows) != 1 or host_rows[0][1].get("reason") != reason or
+                            host_rows[0][1].get("producer") != quantum["producer"]):
+                        failures.append(label + ": explicit " + reason + " host phase is missing or misidentified")
+                        continue
+                    host_index, host_event = host_rows[0]
+                    claimed.add(host_event["event_id"])
+                    next_producer = (begin["queue"], next_quantum.get("producer"))
+                    if type(next_quantum.get("producer")) is not int or next_producer not in submitted:
+                        failures.append(label + ": host acknowledgement has no next GPU quantum")
+                        continue
+                    next_submit = positions[submitted[next_producer]["event_id"]]
+                    consumers = [(key, event) for key, event in submitted.items() if key[0] == begin["queue"] and
+                                 host_index < positions[event["event_id"]] < next_submit]
+                    if not consumers or any(
+                            key not in completed or
+                            not host_index < positions[event["event_id"]] <
+                                positions[completed[key]["event_id"]] < next_submit or
+                            not host_event["event_id"] < event["event_id"] < completed[key]["event_id"] <
+                                submitted[next_producer]["event_id"] for key, event in consumers):
+                        failures.append(label + ": host consumer was acknowledged before actual native retirement")
+                    if quantum["host_reason"] == 2:
+                        task_rows = [event for index, event in enumerate(phase)
+                                     if host_index < index < next_submit and event["event"] == "msaa_tile_begin"
+                                     and event.get("queue") == begin["queue"]]
+                        if len(task_rows) != 1 or any(
+                                event["event"] == "msaa_producer_wait" and event.get("queue") == begin["queue"]
+                                for event in phase[host_index + 1:next_submit]):
+                            failures.append(label + ": MSAA host handoff did not consume one GPU tile task stream")
+                    host_windows.append((host_index, next_submit, quantum["host_reason"]))
+            if atomic_hosts:
+                failures.extend(label + ": " + failure for failure in capture_frontier_atomic_phase_failures(
+                    phase, begin_index, next_execute, begin["queue"], host_windows))
+            if quanta and all(type(quanta[-1][1].get(field)) is int for field in progress_fields):
+                final = quanta[-1][1]
+                if (final.get("commands_done") != commands[execution_index] or
+                        (producers[execution_index] is not None and
+                         final.get("producer_steps") != producers[execution_index]) or
+                        (commands[execution_index] and not final.get("consumer_steps"))):
+                    failures.append(label + ": final GPU command/producer consumption differs")
+                if case.startswith("indirect-frontier-") and final.get("consumer_steps", 0) < 66:
+                    failures.append(label + ": raw strip scan did not cross the bounded scheduler quantum")
+                if (case == "tsgs-frontier-parent-child-order" and
+                        (final.get("parent_steps") != 18 or
+                         final.get("child_steps", 0) <= final.get("parent_steps", 0))):
+                    failures.append(label + ": TS parents were regenerated or child drain was not observed")
+                if (case == "ds-frontier-point67-overflow" and
+                        (final.get("parent_steps") != 1 or final.get("child_steps") != 0)):
+                    failures.append(label + ": domain-only parent launch count differs")
+                if atomic_hosts and (final.get("consumer_steps") != 2 or
+                        final.get("parent_steps") != (2 if path in ("domain", "tess_geometry") else 0) or
+                        final.get("child_steps") != (2 if path == "tess_geometry" else 0)):
+                    failures.append(label + ": atomic producer/consumer instances were repeated or omitted")
+                if suite == "tiled" and (final.get("consumer_steps") != 65 or
+                        final.get("parent_steps") != 0 or final.get("child_steps") != 0):
+                    failures.append(label + ": sparse-volume frontier did not consume all 65 instances")
+        actual = {event["event_id"] for event in phase if event["event"].startswith("capture_frontier_")}
+        if actual != claimed:
+            failures.append(label + ": orphan frontier event or unexpected host phase")
+        if len(identities) != len(commands) or len(set(identities)) != 1 or len(set(capacities)) != 1:
+            failures.append(label + ": replay changed the logical encoder, recording or fixed scratch capacity")
+        elif identities:
+            queue, list_id, recording, _ = identities[0]
+            matching = [event for event in phase if event["event"] == "execute_list" and
+                        (event.get("queue"), event.get("list"), event.get("recording")) ==
+                        (queue, list_id, recording)]
+            closes = [event for event in phase if event["event"] == "record_close" and
+                      (event.get("list"), event.get("recording")) == (list_id, recording)]
+            recorded = [event for event in phase if event["event"] == "capture_frontier_record" and
+                        (event.get("list"), event.get("recording"), event.get("encoder")) ==
+                        (list_id, recording, identities[0][3])]
+            if (matching != executions or len(closes) != 1 or
+                    closes[0]["event_id"] >= executions[0]["event_id"] or
+                    positions[closes[0]["event_id"]] >= positions[executions[0]["event_id"]] or
+                    any(event["event_id"] >= closes[0]["event_id"] or
+                        positions[event["event_id"]] >= positions[closes[0]["event_id"]] for event in recorded)):
+                failures.append(label + ": original closed recording was not executed exactly as recorded")
+    return failures
+
 
 
 def so_format_support_output_matches(stdout: str, stderr: str, success: bool) -> bool:
@@ -4620,11 +6080,175 @@ def multisample_capabilities_output_matches(stdout: str, stderr: str, success: b
     return success
 
 
+def indirect_gpu_mutation_failures(suite: str, stderr: str, dxil_frozen: bool) -> list[str]:
+    """Join exact GPU mutation executions to their no-preflight recording and execution-owned buffer pins."""
+    prefix = SUITE_PREFIXES[suite]
+    kind = "gs" if suite == "geometry" else "ts"
+    cases = [f"indirect-mutation-{kind}-{suffix}" for suffix in ("fixed-ib", "nonindexed", "dynamic-ib")]
+    expected = [(shader, case, str(replay), action)
+                for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                for case in cases for replay in range(2) for action in ("begin", "end")]
+    marker_prefix = prefix + "_GPU_MUTATION_PHASE"
+    marker_pattern = re.compile(re.escape(marker_prefix) +
+                                r" shader=(dxbc|dxil) case=([\w-]+) replay=([01]) (begin|end)")
+    markers, events, phases, failures = [], [], [], []
+    active = None
+    for line in stderr.splitlines():
+        if marker_prefix in line:
+            marker = marker_pattern.fullmatch(line)
+            if not marker:
+                return ["GPU mutation phase marker malformed or interleaved"]
+            fields = marker.groups()
+            markers.append(fields)
+            if fields[3] == "begin":
+                if active is not None:
+                    return ["GPU mutation phases overlap"]
+                active = (fields[:3], [])
+            elif active is None or active[0] != fields[:3]:
+                return ["GPU mutation phase end has no matching begin"]
+            else:
+                phases.append(active)
+                active = None
+            continue
+        if "OWNED_GRAPHICS_TRACE " not in line:
+            continue
+        try:
+            event = json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                raise ValueError("event schema")
+            events.append(event)
+            if active is not None:
+                active[1].append(event)
+        except (TypeError, ValueError):
+            return ["GPU mutation trace is malformed"]
+    if markers != expected or active is not None:
+        return ["GPU mutation phase sequence missing, duplicated, or reordered"]
+    ids = [event.get("event_id") for event in events]
+    if (not ids or len(ids) >= 1000000 or any(type(value) is not int for value in ids) or
+            set(ids) != set(range(1, len(ids) + 1)) or
+            re.search(r"trace.{0,30}(?:truncat|limit.?reach|dropp)", stderr, re.I)):
+        return ["GPU mutation trace missing, duplicated, or truncated"]
+    committed = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "submit"}
+    completed = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "complete" and event.get("status") == 4}
+    recordings = {}
+    for (shader, case, replay), phase in phases:
+        label = f"{shader}/{case}/replay{replay}"
+        if any(event["event"] == "indirect_capture_wait" for event in phase):
+            failures.append("GPU mutation used CPU capture preflight: " + label)
+        draws = [event for event in phase if event["event"] == "draw_mesh_indirect"]
+        pins = [event for event in phase if event["event"] == "indirect_gpu_buffer_pins"]
+        executed = [event for event in phase if event["event"] == "execute_list"]
+        if len(executed) != 1 or any(type(executed[0].get(field)) is not int or executed[0][field] <= 0
+                                    for field in ("queue", "submission", "list", "recording")):
+            failures.append("GPU mutation requires one actual closed-list execution: " + label)
+            continue
+        execution = executed[0]
+        identity = (execution["list"], execution["recording"])
+        submission = (execution["queue"], execution["submission"])
+        if submission not in committed or submission not in completed:
+            failures.append("GPU mutation execution did not complete a native submission: " + label)
+        if (len(pins) != 1 or pins[0].get("queue") != execution["queue"] or
+                type(pins[0].get("allocations")) is not int or pins[0]["allocations"] <= 0):
+            failures.append("GPU mutation execution-owned buffer pins missing or duplicated: " + label)
+        if replay == "0":
+            recordings[(shader, case)] = identity
+            dynamic_index = int(case.endswith("dynamic-ib"))
+            if ([event.get("commands") for event in draws] != [5, 2, 2] or
+                    any((event.get("list"), event.get("recording")) != identity or
+                        (event.get("capture"), event.get("root_updates"), event.get("vertex_updates"),
+                         event.get("index_updates", 0), event.get("draw_offset"), event.get("tessellation")) !=
+                        (0, 1, 1, dynamic_index, 60 if dynamic_index else 44,
+                         int(suite == "tessellation")) for event in draws)):
+                failures.append("GPU mutation did not record the three guarded GPU-only argument consumers: " + label)
+        elif draws or recordings.get((shader, case)) != identity:
+            failures.append("GPU mutation replay changed the closed recording or recorded new work: " + label)
+    return failures
+
+
+def indirect_gpu_index_view_failures(suite: str, stderr: str, dxil_frozen: bool) -> list[str]:
+    """Require each NULL/bounds/width probe to replay the original GPU-only recording through native retirement."""
+    prefix = SUITE_PREFIXES[suite]
+    case = "indirect-mutation-" + ("gs" if suite == "geometry" else "ts") + "-dynamic-ib"
+    probes = ("null", "empty-view", "view-oob", "partial-u32", "byte-wrap", "u16-max", "u32-max")
+    expected = [(shader, case, probe, action)
+                for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+                for probe in probes for action in ("begin", "end")]
+    marker_prefix = prefix + "_GPU_INDEX_VIEW_PHASE"
+    marker_pattern = re.compile(re.escape(marker_prefix) +
+                                r" shader=(dxbc|dxil) case=([\w-]+) probe=([\w-]+) (begin|end)")
+    anchor_pattern = re.compile(re.escape(prefix + "_GPU_MUTATION_PHASE") +
+                                r" shader=(dxbc|dxil) case=" + re.escape(case) + r" replay=1 (begin|end)")
+    markers, phases, events, failures = [], [], [], []
+    active, anchor = None, None
+    identities = {}
+    for line in stderr.splitlines():
+        match = anchor_pattern.fullmatch(line)
+        if match:
+            anchor = match[1] if match[2] == "begin" else None
+        if marker_prefix in line:
+            match = marker_pattern.fullmatch(line)
+            if not match:
+                return ["GPU index-view phase marker malformed"]
+            fields = match.groups()
+            markers.append(fields)
+            if fields[3] == "begin":
+                if active is not None:
+                    return ["GPU index-view phases overlap"]
+                active = (fields[:3], [])
+            elif active is None or active[0] != fields[:3]:
+                return ["GPU index-view phase end has no matching begin"]
+            else:
+                phases.append(active)
+                active = None
+            continue
+        if "OWNED_GRAPHICS_TRACE " not in line:
+            continue
+        try:
+            event = json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                raise ValueError("event schema")
+        except (TypeError, ValueError):
+            return ["GPU index-view trace is malformed"]
+        events.append(event)
+        if anchor is not None and event["event"] == "execute_list":
+            identities[anchor] = (event.get("list"), event.get("recording"))
+        if active is not None:
+            active[1].append(event)
+    if markers != expected or active is not None:
+        return ["GPU index-view phase sequence missing, duplicated, or reordered"]
+    committed = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "submit"}
+    completed = {(event.get("queue"), event.get("submission"))
+                 for event in events if event["event"] == "complete" and event.get("status") == 4}
+    for (shader, _, probe), phase in phases:
+        label = f"{shader}/{case}/{probe}"
+        if any(event["event"] in ("draw_mesh_indirect", "indirect_capture_wait") for event in phase):
+            failures.append("GPU index-view probe rerecorded work or used CPU preflight: " + label)
+        executed = [event for event in phase if event["event"] == "execute_list"]
+        pins = [event for event in phase if event["event"] == "indirect_gpu_buffer_pins"]
+        if len(executed) != 1 or any(type(executed[0].get(field)) is not int or executed[0][field] <= 0
+                                    for field in ("queue", "submission", "list", "recording")):
+            failures.append("GPU index-view probe requires one actual list execution: " + label)
+            continue
+        execution = executed[0]
+        if (execution["list"], execution["recording"]) != identities.get(shader):
+            failures.append("GPU index-view probe changed the original closed recording: " + label)
+        submission = (execution["queue"], execution["submission"])
+        if submission not in committed or submission not in completed:
+            failures.append("GPU index-view execution lacks native completion: " + label)
+        if (len(pins) != 1 or pins[0].get("queue") != execution["queue"] or
+                type(pins[0].get("allocations")) is not int or pins[0]["allocations"] <= 0):
+            failures.append("GPU index-view execution lacks fresh owner pins: " + label)
+    return failures
+
+
 def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, success: bool) -> bool:
     # GSTS: the DXBC matrix always runs; once frozen <suite>-*.dxil inputs exist the DXIL matrix must pass with
     # exactly the DXBC case list.
     prefix = SUITE_PREFIXES[args.suite]
-    matrix_cases = {"geometry": 87, "tessellation": 166}[args.suite]
+    matrix_cases = {"geometry": 107, "tessellation": 178}[args.suite]
     dxil_frozen = (args.dxil_dir / f"{args.suite}-vs_pass.dxil").exists()
     # A case is identified by its name plus the tessellation domain/partition it ran with.
     case_names = [(shader, name + qualifier) for shader, name, qualifier in re.findall(
@@ -4644,6 +6268,37 @@ def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, 
                and f"{prefix}_MISMATCH" not in stdout + stderr)
     mutation_kinds = ["gs", "stripcut", "adjacency"] if args.suite == "geometry" else ["ts", "tsgs"]
     mutation_cases = [f"indirect-mutation-{kind}{suffix}" for kind in mutation_kinds for suffix in ("", "-so")]
+    gpu_kind = "gs" if args.suite == "geometry" else "ts"
+    gpu_cases = [f"indirect-mutation-{gpu_kind}-{suffix}" for suffix in ("fixed-ib", "nonindexed", "dynamic-ib")]
+    mutation_cases += gpu_cases
+    gpu_mutations = re.findall(
+        rf"^{prefix}_GPU_MUTATION_PASS shader=(dxbc|dxil) case=([\w-]+) executions=2 instances=2 "
+        rf"partial_constant=1 fixed_index=([01]) dynamic_index=([01]) count=3,2 root_reset=1 toxic_skip=1 raster=exact$",
+        stdout, re.MULTILINE)
+    success = success and gpu_mutations == [
+        (shader, name, "1" if name.endswith("fixed-ib") else "0", "1" if name.endswith("dynamic-ib") else "0")
+        for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",)) for name in gpu_cases]
+    success = success and not indirect_gpu_mutation_failures(args.suite, stderr, dxil_frozen)
+    success = success and not indirect_gpu_index_view_failures(args.suite, stderr, dxil_frozen)
+    view_proofs = re.findall(
+        rf"^{prefix}_GPU_INDEX_VIEW_PASS shader=(dxbc|dxil) case=([\w-]+) probes=7 null=1 bounds=3 "
+        rf"byte_wrap=1 max_indices=2 new_owner=1 negative_base=1 raster=exact$", stdout, re.MULTILINE)
+    success = success and view_proofs == [(shader, f"indirect-mutation-{gpu_kind}-dynamic-ib")
+        for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))]
+    capture_cases = (["gs-so", "stripcut", "stripcut-so", "adjacency", "adjacency-so"]
+                     if args.suite == "geometry" else
+                     ["ts-so", "ts-so-no-raster", "ts-so-overflow", "ts-so-no-raster-overflow", "tsgs", "tsgs-so"])
+    capture_proofs = re.findall(rf"^{prefix}_CAPTURE_INDEX_VIEW_PASS shader=(dxbc|dxil) case=([\w-]+) "
+                                rf"null=1 view_oob=1 raster=exact so=([01])$", stdout, re.MULTILINE)
+    success = success and capture_proofs == [
+        (shader, f"indirect-mutation-{name}-index-bounds", "1" if "-so" in name else "0")
+        for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",)) for name in capture_cases]
+    mutation_cases += [f"indirect-mutation-{name}-index-bounds" for name in capture_cases]
+    maximum_proofs = re.findall(rf"^{prefix}_CAPTURE_INDEX_MAX_PASS shader=(dxbc|dxil) case=([\w-]+) "
+                                rf"index=0xffffffff cut=0xffff ordinary=1 so=([01])$", stdout, re.MULTILINE)
+    success = success and maximum_proofs == ([(shader, f"indirect-mutation-stripcut{so}-index-bounds", flag)
+        for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+        for so, flag in (("", "0"), ("-so", "1"))] if args.suite == "geometry" else [])
     if args.suite == "tessellation":
         success = success and (stdout.count(
             f"{prefix}_HALF_TRANSPORT_PASS cases=24 values=288 independent=1 output_cp_read=1") == 1
@@ -4651,17 +6306,29 @@ def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, 
         mutation_cases += ["indirect-mutation-ts-so-no-raster", "indirect-mutation-ts-so-overflow",
                            "indirect-mutation-ts-so-no-raster-overflow",
                            "ds-so-fractional-tri-order", "ds-so-fractional-quad-order",
-                           "ds-so-isoline-points", "ds-so-isoline-lines"]
+                           "ds-so-isoline-points", "ds-so-isoline-lines", "tsgs-indirect-scan",
+                           "tsgs-frontier-parent-child-order", "ds-frontier-point67-overflow"]
+        frontier = [line for line in stdout.splitlines() if line.startswith(f"{prefix}_CAPTURE_FRONTIER_PASS ")]
+        expected_frontier = [
+            f"{prefix}_CAPTURE_FRONTIER_PASS shader={shader} case={case} {proof}"
+            for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
+            for case, proof in (
+                ("tsgs-frontier-parent-child-order", "parent_once=1 ordered_so=1 commands=2 instances=9 "
+                 "gs=648 written=1296 needed=1296 bytes=93312"),
+                ("ds-frontier-point67-overflow", "parent_slots=268 workloads=67 points=8450 patches=2 per_patch=4225 ds=8450 "
+                 "written=4096 needed=8450 bytes=98304"))]
+        success = success and frontier == expected_frontier
         domain_so = re.findall(rf"^{prefix}_DOMAIN_SO shader=(dxbc|dxil) case=([\w-]+) bytes=(\d+) "
                                rf"written=(\d+) needed=(\d+) ds=(\d+) c=(\d+) ps=(\d+)$",
                                stdout, re.MULTILINE)
-        expected_domain_so = [(shader, "indirect-mutation-ts-so" + suffix, size, written, "2", "6", clip, ps)
+        expected_domain_so = [(shader, "indirect-mutation-ts-so" + suffix + bounds, size, written, "2", "6", clip, ps)
                               for shader in (("dxbc", "dxil") if dxil_frozen else ("dxbc",))
                               for suffix, size, written, clip, ps in (
                                   ("", "192", "2", "2", "2"),
                                   ("-no-raster", "192", "2", "0", "0"),
                                   ("-overflow", "96", "1", "2", "2"),
-                                  ("-no-raster-overflow", "96", "1", "0", "0"))]
+                                  ("-no-raster-overflow", "96", "1", "0", "0"))
+                              for bounds in ("", "-index-bounds")]
         success = success and sorted(domain_so) == sorted(expected_domain_so)
     success = success and all(dxbc_cases.count(case) == 1 for case in mutation_cases)
     if args.suite == "geometry":
@@ -4692,11 +6359,23 @@ def geometry_output_matches(args: argparse.Namespace, stdout: str, stderr: str, 
         strips = re.findall(rf"^{prefix}_STRIP_EXPANSION shader=(dxbc|dxil) case=([\w-]+) .* "
                             rf"filled=(\d+)/(\d+)$", stdout, re.MULTILINE)
         expected_strips = [("indirect-strip-cut", "0", "0"), ("indirect-strip-cut-so", "2304", "2304"),
-                           ("indirect-triadj-strip", "0", "0"), ("indirect-triadj-strip-so", "1920", "1920")]
+                           ("indirect-triadj-strip", "0", "0"), ("indirect-triadj-strip-so", "1920", "1920"),
+                           ("indirect-strip-cut-scan", "0", "0"), ("indirect-strip-cut-scan-so", "7680", "7680"),
+                           ("indirect-triadj-strip-scan", "0", "0"), ("indirect-triadj-strip-scan-so", "4608", "4608"),
+                           ("indirect-frontier-strip-cut-carry-so", "9216", "9216"),
+                           ("indirect-frontier-triadj-carry-so", "4992", "4992")]
         shaders = ("dxbc", "dxil") if dxil_frozen else ("dxbc",)
+        frontier = [line for line in stdout.splitlines() if line.startswith(f"{prefix}_CAPTURE_FRONTIER_PASS ")]
+        expected_frontier = [
+            f"{prefix}_CAPTURE_FRONTIER_PASS shader={shader} case={case} raw_positions=16657 carry=1 "
+            f"commands=2 gs={gs} primitives={primitives} bytes={size} guards=1 direct=exact"
+            for shader in shaders for case, gs, primitives, size in (
+                ("indirect-frontier-strip-cut-carry", 48, 96, 9216),
+                ("indirect-frontier-triadj-carry", 13, 52, 4992))]
         success = (success
                    and early == [(shader, *case) for shader in shaders for case in expected_early]
-                   and strips == [(shader, *case) for shader in shaders for case in expected_strips])
+                   and strips == [(shader, *case) for shader in shaders for case in expected_strips]
+                   and frontier == expected_frontier)
     if args.suite == "tessellation":
         # MSAA HS/DS and HS/DS/GS draws with a forced-early-depth PS (claim buffer): direct and indirect
         # PSInvocations equal the CPU oracle at 2x/4x/8x.
@@ -5029,7 +6708,42 @@ def depth_casting_output_matches(stdout: str, stderr: str, native_compiler_proof
     return success, dxil_compiler_loaded
 
 
+def sr_timing_evidence(stderr: str, period: int) -> tuple[list[dict], list[str]]:
+    rows, errors = [], []
+    for line in stderr.splitlines():
+        if not line.startswith("D3DALLOY_SR_GPU_PHASE "):
+            continue
+        try:
+            fields = dict(word.split("=", 1) for word in line.split()[1:])
+            sample, slots = int(fields["sample"]), int(fields["slots"])
+            if sample < 0 or sample % period or slots & ~1023 or slots & 12 != 12:
+                raise ValueError
+            row = {"sample": sample, "slots": slots}
+            for index, name in enumerate(("pre_us", "native_us", "alpha_us", "finish_us", "copy_us")):
+                pair = (slots >> (index * 2)) & 3
+                value = float(fields[name])
+                if pair not in (0, 3) or not math.isfinite(value) or value < 0 or (not pair and value != 0):
+                    raise ValueError
+                row[name] = value
+            for key in ("generation", "reset", "sharpen", "prefix_fold", "direct_center"):
+                row[key] = int(fields[key])
+            for key in ("input", "capacity", "output"):
+                if not re.fullmatch(r"[1-9]\d*x[1-9]\d*", fields[key]):
+                    raise ValueError
+                row[key] = fields[key]
+            rows.append(row)
+        except (KeyError, ValueError):
+            errors.append("malformed SR GPU phase: " + line)
+    if not rows:
+        errors.append("requested SR GPU timing produced no complete native timestamp samples")
+    return rows, errors
+
+
 def run(args: argparse.Namespace) -> int:
+    sr_period = getattr(args, "sr_gpu_timing_period", None)
+    if sr_period is not None and (not 1 <= sr_period <= 0xffffffff or args.suite not in
+            ("fsr", "fsr-debug", "temporal", "ngx", "ngx-alpha", "sr-alpha")):
+        raise ValueError("--sr-gpu-timing-period requires 1..4294967295 and an SR suite")
     latency_mode = getattr(args, "low_latency_mode", "off")
     latency_frames = getattr(args, "low_latency_frames", 120)
     latency_performance = getattr(args, "low_latency_performance", False)
@@ -5163,11 +6877,13 @@ def run(args: argparse.Namespace) -> int:
         "D3DALLOY_METAL4_ARCHIVE_DIR": str(out / "native-pipeline-archives"),
         "D3DALLOY_METAL4_ARCHIVE_TRACE": "1" if getattr(args,"native_archive_trace",False) else "0",
         "OWNED_GRAPHICS_TRACE": "0" if latency_performance else "1",
-        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite in ("arena-heap-upload-reuse", "low-latency") else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "predication-indirect", "fsr-fg") else "8192",
+        "OWNED_GRAPHICS_TRACE_LIMIT": "1000000" if args.suite in ("arena-heap-upload-reuse", "low-latency", "geometry", "tessellation", "tiled", "atomic64-phase", "atomic64-producers", "raytracing-atomic64", "submission-foundation", "stream-output") else "100000" if args.suite in ("queries", "multisample-capabilities", "render-passes", "standard-swizzle", "predication-indirect", "fsr-fg") else "8192",
         # macOS strips DYLD_* while entering /bin/sh. The owned wrapper sets
         # this diagnostic variable itself on the final hop into real Wine.
         "OWNED_GRAPHICS_DYLD_AUDIT": "1",
     })
+    if sr_period is not None:
+        env["D3DALLOY_SR_GPU_TIMING"] = str(sr_period)
     env.pop("OWNED_SHADER_CACHE_CONTROL_ISOLATED", None)
     # Only async-pipeline-hold may stop workers; an inherited value would fake real-worker evidence.
     env.pop("OWNED_ASYNC_PIPELINE_HOLD", None)
@@ -5213,6 +6929,8 @@ def run(args: argparse.Namespace) -> int:
     command = [str(runtime / "bin/wine"), str(executable)]
     if args.suite == "low-latency":
         command.extend(("--mode", latency_mode, "--frames", str(latency_frames)))
+    elif args.suite == "present-history":
+        command.append("--history-only")
     elif args.suite == "composition":
         command.append("--composition")
         if getattr(args, "composition_visual_proof", False):
@@ -5291,6 +7009,10 @@ def run(args: argparse.Namespace) -> int:
         command.extend(RAYTRACING_SHADERS)
     elif args.suite == "raytracing-omm":
         command.extend(RAYTRACING_OMM_SHADERS)
+    elif args.suite == "raytracing-metadata-arena":
+        command.extend(("--metadata-arena", "raytracing-contract.dxil"))
+    elif args.suite == "raytracing-refit-chain":
+        command.extend(("--refit-chain", "raytracing-contract.dxil"))
     elif args.suite == "raytracing-atomic64":
         command.extend(("--atomic64", "raytracing-contract.dxil", "raytracing-atomic64.dxil"))
     elif args.suite == "rt-executable-cache":
@@ -5305,10 +7027,12 @@ def run(args: argparse.Namespace) -> int:
         "low_latency_performance": latency_performance,
         "low_latency_trace_assertions_exercised": (not latency_performance
                                                    if args.suite == "low-latency" else None),
+        "atomic64_reuse_required": getattr(args, "atomic64_reuse", False),
         "owned_graphics_trace_enabled": env["OWNED_GRAPHICS_TRACE"] == "1",
         "logger_level": env["D3DALLOY_LOG_LEVEL"],
         "native_archive_directory": env["D3DALLOY_METAL4_ARCHIVE_DIR"],
         "native_archive_trace": env["D3DALLOY_METAL4_ARCHIVE_TRACE"] == "1",
+        "sr_gpu_timing_period": sr_period,
         "validation_mode": validation_mode,
         "architecture": arch,
         "command": command, "prefix": env["WINEPREFIX"],
@@ -5344,6 +7068,11 @@ def run(args: argparse.Namespace) -> int:
             # user's/global wineserver. Stop our prefix services even on error.
             try:
                 subprocess.run([str(runtime / "bin/wineserver"), "-k"], env=env,
+                               stdout=subprocess.DEVNULL, stderr=stderr, timeout=15)
+                # -k only requests shutdown. Native Wine processes can still
+                # append completion/diagnostic lines after it returns, especially
+                # on a timeout. Parse the final log only after our server exits.
+                subprocess.run([str(runtime / "bin/wineserver"), "-w"], env=env,
                                stdout=subprocess.DEVNULL, stderr=stderr, timeout=15)
             except (OSError, subprocess.TimeoutExpired) as error:
                 stderr.write(f"prefix cleanup: {error}\n")
@@ -5435,6 +7164,10 @@ def run(args: argparse.Namespace) -> int:
     raytracing_evidence = None
     fence_rewind_cases: list[str] = []
     validation_errors: list[str] = list(rr_native_validation_errors)
+    sr_phases = []
+    if sr_period is not None:
+        sr_phases, sr_errors = sr_timing_evidence(stderr, sr_period)
+        validation_errors.extend(sr_errors)
     if args.suite == "low-latency":
         validation_errors.extend(low_latency_failures(stdout, stderr, latency_mode, latency_frames,
                                                       performance=latency_performance))
@@ -5478,6 +7211,8 @@ def run(args: argparse.Namespace) -> int:
                    and "_FAIL" not in stdout)
     if args.suite == "render-passes":
         success = render_passes_output_matches(stdout, stderr, success)
+    if args.suite == "standard-swizzle":
+        success = standard_swizzle_output_matches(stdout, success)
     if args.suite == "enhanced-barriers":
         success = enhanced_barriers_output_matches(stdout, success)
     if args.suite == "multiqueue":
@@ -5516,6 +7251,12 @@ def run(args: argparse.Namespace) -> int:
         success, dxil_compiler_loaded = matrix_shaders_output_matches(stdout, stderr, native_compiler_proof, success)
     if args.suite == "waves":
         success, dxil_compiler_loaded = waves_output_matches(stdout, stderr, native_compiler_proof, success)
+    if args.suite == "workgraph-frontier":
+        success = workgraph_frontier_output_matches(stdout,stderr,native_compiler_proof,success)
+        dxil_compiler_loaded = native_compiler_proof
+    if args.suite == "workgraph-texture-frontier":
+        success = workgraph_texture_frontier_output_matches(stdout,stderr,native_compiler_proof,success)
+        dxil_compiler_loaded = native_compiler_proof
     if args.suite == "workgraph-batches":
         success = workgraph_batches_output_matches(stdout,stderr,native_compiler_proof,success)
     if args.suite == "submission-foundation":
@@ -5612,9 +7353,17 @@ def run(args: argparse.Namespace) -> int:
         success, dxil_compiler_loaded = atomic_copy_output_matches(args, stdout, native_compiler_proof, success)
     if args.suite == "atomic64-phase":
         dxil_compiler_loaded = native_compiler_proof
-        success = success and dxil_compiler_loaded and not atomic64_phase_failures(stdout, stderr)
+        success = (success and dxil_compiler_loaded and not atomic64_phase_failures(stdout, stderr)
+                   and not atomic_readback_batch_failures(args.suite, stderr))
+    if args.suite == "atomic64-context":
+        dxil_compiler_loaded = native_compiler_proof
+        context_failures = atomic64_context_failures(stdout, stderr)
+        validation_errors.extend(context_failures)
+        success = success and dxil_compiler_loaded and not context_failures
     if args.suite == "present-queues":
         success = present_queues_output_matches(stdout, stderr, success)
+    if args.suite == "present-history":
+        success = present_history_output_matches(stdout, stderr, success)
     if args.suite == "hdr-metadata":
         success, frames = hdr_metadata_output_matches(stdout, stderr, success)
     if args.suite == "colorspace":
@@ -5716,9 +7465,20 @@ def run(args: argparse.Namespace) -> int:
                    and stdout.splitlines().count("OWNED_D3D12_OMM_CAPS tier=12 actually_reorders=0 byte_offset_views=0 max_dispatch=65535 max_mesh=65535 query_abi=16 errors=8") == 1
                    and stdout.splitlines().count("OMM_DRIVER_IDENTIFIER_PASS type=0 array=1 blas=1 rejects=3") == 2
                    and not re.search(r"OMM_[A-Z_]*FAIL|OWNED_D3D12_RAYTRACING_FAIL", stdout + stderr))
+    if args.suite == "raytracing-refit-chain":
+        dxil_compiler_loaded = native_compiler_proof
+        chain_failures = raytracing_refit_chain_failures(stdout, stderr)
+        raytracing_evidence = {"refit_chain": True, "failures": chain_failures}
+        success = success and dxil_compiler_loaded and not chain_failures
+    if args.suite == "raytracing-metadata-arena":
+        dxil_compiler_loaded = native_compiler_proof
+        arena_failures = raytracing_metadata_arena_failures(stdout, stderr)
+        raytracing_evidence = {"metadata_arena": True, "failures": arena_failures}
+        success = success and dxil_compiler_loaded and not arena_failures
     if args.suite == "raytracing-atomic64":
         dxil_compiler_loaded = native_compiler_proof
         atomic_rt_failures = raytracing_atomic64_failures(stdout, stderr)
+        atomic_rt_failures += atomic_readback_batch_failures(args.suite, stderr)
         raytracing_evidence = {"lanes": re.findall(r"^OWNED_D3D12_RAYTRACING_ATOMIC64_LANE lane=(\d+) ",
                                                  stdout, re.MULTILINE), "failures": atomic_rt_failures}
         success = success and dxil_compiler_loaded and not atomic_rt_failures
@@ -5778,7 +7538,8 @@ def run(args: argparse.Namespace) -> int:
                    and "OWNED_D3D12_RAYTRACING_RAYQUERY failures=0" in stdout
                    and "OWNED_D3D12_RAYTRACING_RAYQUERY_STAGES failures=0" in stdout
                    and "OWNED_D3D12_RAYTRACING_RAYQUERY_MISMATCH" not in stderr
-                   and contract_cases == RAYTRACING_CONTRACT_CASES + RAYTRACING_STATEOBJ_CASES + ("hitobject", "hitobject-reorder-coherence")
+                   and contract_cases == RAYTRACING_CONTRACT_CASES + RAYTRACING_STATEOBJ_CASES + (
+                       "hitobject", "hitobject-reorder-coherence", "trace-control")
                    and vertex_formats == RAYTRACING_VERTEX_FORMATS
                    and "OWNED_D3D12_RAYTRACING_CONTRACT failures=0" in stdout
                    and "OWNED_D3D12_RAYTRACING_STATEOBJ failures=0" in stdout
@@ -5830,11 +7591,15 @@ def run(args: argparse.Namespace) -> int:
         validation_errors.extend(multiqueue_submission_failures(trace_events))
     if args.suite == "predication-indirect":
         validation_errors.extend(prepared_indirect_failures(stdout, stderr))
+    if args.suite in ("stream-output", "geometry", "tessellation", "atomic64-producers", "tiled"):
+        validation_errors.extend(capture_frontier_failures(
+            args.suite, stderr, (args.dxil_dir / f"{args.suite}-vs_pass.dxil").is_file()))
     if args.suite == "arena-heap-upload-reuse":
         validation_errors.extend(upload_reuse_failures(stdout, stderr))
     if args.suite == "multisample-capabilities":
         validation_errors.extend(native_msaa_failures(stdout, stderr))
         validation_errors.extend(native_msaa_budget_failures(stdout, stderr))
+        validation_errors.extend(msaa_tile_task_failures(stdout, stderr))
     if args.suite == "queries":
         validation_errors.extend(query_interval_failures(stdout, stderr))
     if args.suite == "pipeline-cache":
@@ -5875,6 +7640,8 @@ def run(args: argparse.Namespace) -> int:
                    and "OWNED_D3D12_PIPELINE_LIBRARY_FAIL" not in stdout + stderr)
         if not (child_restores == 4 and child_colds == 0):
             validation_errors.append(f"child process restores={child_restores} cold_compiles={child_colds}")
+    if getattr(args, "atomic64_reuse", False):
+        validation_errors.extend(atomic64_reuse_failures(args.suite, stderr))
     if validation_errors:
         success = False
     fg_capture_analysis = None
@@ -5925,6 +7692,7 @@ def run(args: argparse.Namespace) -> int:
             if analysis_path.is_file():
                 temporal_analysis = {"file": analysis_path.name, "sha256": digest(analysis_path)}
     report = {**evidence, "exit_code": code, "timed_out": timed_out,
+              "sr_gpu_phases": sr_phases,
               "backend_marker_verified": marker_ok, "frames_verified": frames,
               "uav_barrier_verified": barrier_ok, "dyld_lines": len(dyld),
               "owned_native_loads": native_loads,
@@ -6019,6 +7787,10 @@ def main() -> int:
     validation.add_argument("--api-validation", action="store_true",
                             help="enable Metal API validation without shader instrumentation")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--atomic64-reuse", action="store_true",
+                        help="require Atomic64 topology/context reuse and phase retirement traces")
+    parser.add_argument("--sr-gpu-timing-period", type=int, metavar="N",
+                        help="sample every Nth submitted SR execution; require actual native timing rows")
     parser.add_argument("--native-archive-trace", action="store_true",
                         help="trace native pipeline archive hits/fallbacks; cache is always isolated under --out")
     parser.add_argument("--async-pipeline-compile", action="store_true",

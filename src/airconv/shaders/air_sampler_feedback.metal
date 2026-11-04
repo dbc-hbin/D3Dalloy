@@ -80,33 +80,35 @@ inline int texel_floor(float x) { return int(floor(clamp(x, -16777216.0f, 167772
  * is exactly region tx >> log2(region width) of the mip; for others it is the spec's projected
  * grid. It never leaves the decoded grid.
  */
-inline void record(device atomic_uint *map, Layout l, uint slice, uint level, int tx, int ty, uint sx, uint sy) {
-  const uint gw0 = grid_w(l), gh0 = grid_h(l);
-  const uint x0 = uint(tx) * l.width / sx, y0 = uint(ty) * l.height / sy;
-  uint gx = gw0, gy = gh0, offset = 0, rx = x0 >> l.region_w_log2, ry = y0 >> l.region_h_log2;
-  if (l.region_used) {
-    uint slice_cells = 0;
-    for (uint m = 0; m < l.mips; m++) {
-      const uint cells = max(1u, gw0 >> m) * max(1u, gh0 >> m);
-      if (m < level)
-        offset += cells;
-      slice_cells += cells;
-    }
-    offset += slice * slice_cells;
-    gx = max(1u, gw0 >> level);
-    gy = max(1u, gh0 >> level);
-    rx >>= level;
-    ry >>= level;
-  } else {
-    offset = slice * gw0 * gh0;
+inline uint region_coordinate(int texel, uint size, uint mip_size, uint region_log2, uint level,
+                              bool region_used, uint grid) {
+  uint region = (uint(texel) * size / mip_size) >> region_log2;
+  if (region_used)
+    region >>= level;
+  return min(grid - 1u, region);
+}
+
+inline void record_footprint(device atomic_uint *map, uint4 cells, bool4 valid, uint4 previous,
+                             bool4 previous_valid, bool region_used, uint level) {
+  // A write has no returned value and OR/MAX are idempotent. Coalesce only
+  // identical decoded cells; every addressed texel and anisotropic tap remains
+  // represented. The previous tap is a bounded four-cell window, not a hash.
+#pragma unroll
+  for (uint i = 0; i < 4; ++i) {
+    if (!valid[i])
+      continue;
+    bool repeated = any((previous == cells[i]) & previous_valid);
+#pragma unroll
+    for (uint j = 0; j < i; ++j)
+      repeated |= valid[j] && cells[j] == cells[i];
+    if (repeated)
+      continue;
+    device atomic_uint *cell = map + cells[i];
+    if (region_used)
+      atomic_fetch_or_explicit(cell, 1u, memory_order_relaxed);
+    else
+      atomic_fetch_max_explicit(cell, 255u - level, memory_order_relaxed);
   }
-  rx = min(gx - 1u, rx);
-  ry = min(gy - 1u, ry);
-  device atomic_uint *cell = map + offset + ry * gx + rx;
-  if (l.region_used)
-    atomic_fetch_or_explicit(cell, 1u, memory_order_relaxed);
-  else
-    atomic_fetch_max_explicit(cell, 255u - level, memory_order_relaxed);
 }
 
 } // namespace
@@ -199,27 +201,66 @@ void d3dalloy_sampler_feedback_write(
   if (slice >= l.slices)
     return;
 
+  const uint gw0 = grid_w(l), gh0 = grid_h(l);
+  uint slice_cells = gw0 * gh0;
+  uint2 mip_offsets = uint2(0);
+  if (l.region_used) {
+    // The decoded layout is invariant across all texels/taps. Walk the mip
+    // chain once for this write, including both mip-filter passes.
+    slice_cells = 0;
+    for (uint m = 0; m < l.mips; ++m) {
+      const uint count = max(1u, gw0 >> m) * max(1u, gh0 >> m);
+      if (m < first_mip + m0) mip_offsets.x += count;
+      if (m < first_mip + m1) mip_offsets.y += count;
+      slice_cells += count;
+    }
+  }
+
   for (uint pass = 0; pass < (m1 != m0 ? 2u : 1u); pass++) {
     const uint level = first_mip + (pass ? m1 : m0);
     const uint sx = max(1u, l.width >> level), sy = max(1u, l.height >> level);
+    const uint gx = l.region_used ? max(1u, gw0 >> level) : gw0;
+    const uint gy = l.region_used ? max(1u, gh0 >> level) : gh0;
+    const uint base = slice * slice_cells + (pass ? mip_offsets.y : mip_offsets.x);
+    // A single point sample cannot repeat a cell within this mip pass. Avoid
+    // constructing a four-cell footprint and history for this uniform case.
+    if (!linear && taps == 1) {
+      const int x = texel_floor((u + 0.0f * major_u) * float(sx));
+      const int y = texel_floor((v + 0.0f * major_v) * float(sy));
+      int tx, ty;
+      if (apply_address(y, int(sy), address_v, ty) && apply_address(x, int(sx), address_u, tx)) {
+        const uint rx = region_coordinate(tx, l.width, sx, l.region_w_log2, level, l.region_used, gx);
+        const uint ry = region_coordinate(ty, l.height, sy, l.region_h_log2, level, l.region_used, gy);
+        device atomic_uint *cell = map + base + ry * gx + rx;
+        if (l.region_used)
+          atomic_fetch_or_explicit(cell, 1u, memory_order_relaxed);
+        else
+          atomic_fetch_max_explicit(cell, 255u - level, memory_order_relaxed);
+      }
+      continue;
+    }
+    uint4 previous = uint4(0);
+    bool4 previous_valid = bool4(false);
     for (uint tap = 0; tap < taps; tap++) {
       const float offset = taps > 1 ? (float(tap) + 0.5f) / float(taps) - 0.5f : 0.0f;
       const float su = (u + offset * major_u) * float(sx);
       const float sv = (v + offset * major_v) * float(sy);
       const int x0 = linear ? texel_floor(su - 0.5f) : texel_floor(su);
       const int y0 = linear ? texel_floor(sv - 0.5f) : texel_floor(sv);
-      const int extent = linear ? 2 : 1;
-      for (int dy = 0; dy < extent; dy++) {
-        int ty;
-        if (!apply_address(y0 + dy, int(sy), address_v, ty))
-          continue;
-        for (int dx = 0; dx < extent; dx++) {
-          int tx;
-          if (!apply_address(x0 + dx, int(sx), address_u, tx))
-            continue;
-          record(map, l, slice, level, tx, ty, sx, sy);
-        }
-      }
+      int tx0 = 0, tx1 = 0, ty0 = 0, ty1 = 0;
+      const bool vx0 = apply_address(x0, int(sx), address_u, tx0);
+      const bool vx1 = linear && apply_address(x0 + 1, int(sx), address_u, tx1);
+      const bool vy0 = apply_address(y0, int(sy), address_v, ty0);
+      const bool vy1 = linear && apply_address(y0 + 1, int(sy), address_v, ty1);
+      const uint rx0 = region_coordinate(tx0, l.width, sx, l.region_w_log2, level, l.region_used, gx);
+      const uint rx1 = region_coordinate(tx1, l.width, sx, l.region_w_log2, level, l.region_used, gx);
+      const uint ry0 = region_coordinate(ty0, l.height, sy, l.region_h_log2, level, l.region_used, gy);
+      const uint ry1 = region_coordinate(ty1, l.height, sy, l.region_h_log2, level, l.region_used, gy);
+      const uint4 footprint = base + uint4(ry0 * gx + rx0, ry0 * gx + rx1, ry1 * gx + rx0, ry1 * gx + rx1);
+      const bool4 valid = bool4(vx0 && vy0, vx1 && vy0, vx0 && vy1, vx1 && vy1);
+      record_footprint(map, footprint, valid, previous, previous_valid, l.region_used, level);
+      previous = footprint;
+      previous_valid = valid;
     }
   }
 }

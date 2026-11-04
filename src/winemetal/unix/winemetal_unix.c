@@ -3567,6 +3567,7 @@ sm50_compilation_argument32_convert(
     case SM50_SHADER_D3D12_CONSERVATIVE_RASTER:
     case SM50_SHADER_D3D12_ATOMIC64_PHASE:
     case SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT:
+    case SM50_SHADER_D3D12_CAPTURE_FRONTIER:
     case SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: {
       struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data = malloc(sizeof(*data));
       if (!data)
@@ -5220,12 +5221,15 @@ _WMTASEncoder_compactedSize(void *obj) {
 
 static NTSTATUS
 _WMTComputeEncoder_encodeASPrepass(void *obj) {
+  _Static_assert(sizeof(struct d3dalloy_as_prepass_params) == sizeof(struct WMTASPrepassInfo), "AS prepass size ABI");
+  _Static_assert(offsetof(struct d3dalloy_as_prepass_params, shadow_metadata) == 48, "AS prepass metadata ABI");
   struct unixcall_wmt_as *params = obj;
   struct d3dalloy_as_prepass_params info = {
       params->args[12], params->args[13], (uint32_t)params->args[14], (uint32_t)params->args[15],
       (uint32_t)params->args[16], (uint32_t)params->args[17], (uint32_t)params->args[18],
-      (uint32_t)params->args[19], (uint32_t)params->args[20]
+      (uint32_t)params->args[19], (uint32_t)params->args[20], (uint32_t)params->args[21], {0}
   };
+  memcpy(info.shadow_metadata, (const void *)(uintptr_t)params->args[22], sizeof(info.shadow_metadata));
   params->ret[0] = d3dalloy_as_encode_prepass(
       params->args[0], params->args[1], params->args[2], params->args[3], params->args[4],
       params->args[5], params->args[6], params->args[7], params->args[8], params->args[9],

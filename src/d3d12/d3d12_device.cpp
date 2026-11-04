@@ -173,6 +173,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   std::unordered_map<raytracing::ArenaKey, uint32_t, RTASKeyHash> rtas_slots_;
   std::mutex rtas_pipeline_lock_;
   RTASComputePipelines rtas_pipelines_;
+  std::mutex rtas_sizes_lock_;
+  owned_graphics::RTASSizeCache rtas_sizes_;
 
   struct ResidencyBatchEntry {
     MTLD3D12PageableResidency *pageable;
@@ -3155,22 +3157,37 @@ public:
       return E_OUTOFMEMORY;
     try {
       std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-      if (!va_registry_.Insert(allocation->gpuAddress(), allocation->byteLength(), allocation))
+      size_t alias_members = 0;
+      auto same_placement = [](const Rc<BufferAllocation> &a, const Rc<BufferAllocation> &b) {
+        return a->canonicalHeap && a->canonicalHeap.handle == b->canonicalHeap.handle &&
+            a->canonicalHeapOffset == b->canonicalHeapOffset && a->flags() == b->flags() &&
+            a->flags().test(BufferAllocationFlag::AllocatedOnHeap) &&
+            !a->flags().any(BufferAllocationFlag::CpuPlaced, BufferAllocationFlag::PlacementSparse,
+                            BufferAllocationFlag::SuballocateFromOnePage) &&
+            !a->currentSuballocationOffset() && !b->currentSuballocationOffset() &&
+            !a->reservedResource && !b->reservedResource;
+      };
+      if (!va_registry_.Insert(allocation->gpuAddress(), allocation->byteLength(), allocation, same_placement,
+                               &alias_members))
         return E_INVALIDARG;
+      if (alias_members)
+        owned_graphics::Trace("placed_va_alias_register", ",\"address\":", allocation->gpuAddress(),
+            ",\"length\":", allocation->byteLength(), ",\"heap\":", allocation->canonicalHeap.handle,
+            ",\"offset\":", allocation->canonicalHeapOffset, ",\"members\":", alias_members);
       if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap))
         return S_OK;
       auto buffer = allocation->buffer();
       try {
         if (owner) {
           if (!owner->AddResidencyAllocation(buffer)) {
-            va_registry_.Remove(allocation->gpuAddress());
+            va_registry_.Remove(allocation->gpuAddress(), allocation);
             return E_OUTOFMEMORY;
           }
           if (!owner->SupportsResidency())
             owner->InitializeResidency(initially_resident);
         }
       } catch (...) {
-        va_registry_.Remove(allocation->gpuAddress());
+        va_registry_.Remove(allocation->gpuAddress(), allocation);
         throw;
       }
       if (!owner || initially_resident) {
@@ -3200,10 +3217,10 @@ public:
     if (!state.sidecar)
       return;
     // In-place refits publish a new version of the same native object. Sweeping the
-    // previous version must not make the current one nonresident. Only versions
-    // at this key share a sidecar; cross-address updates and copies allocate their own.
-    const auto *current = rtas_.FindRecorded(key);
-    if (current && current->sidecar == state.sidecar)
+    // previous version must not make any retained version nonresident, even when
+    // a newer recording names a different sidecar than the GPU-live version.
+    // Only versions at this key share a sidecar; other addresses allocate their own.
+    if (rtas_.HasRetainedPayload(key, [&](const RTASState &current) { return current.sidecar == state.sidecar; }))
       return;
     WMT::Allocation structure = state.sidecar.accelerationStructure();
     if (structure)
@@ -3226,7 +3243,13 @@ public:
     if (!allocation)
       return E_INVALIDARG;
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-    auto registered_owner = va_registry_.Remove(allocation->gpuAddress());
+    auto removal = va_registry_.Remove(allocation->gpuAddress(), allocation);
+    if (!removal.removed) return S_FALSE; // e.g. destruction after rejected registration
+    if (removal.remaining) {
+      owned_graphics::Trace("placed_va_alias_unregister", ",\"address\":", allocation->gpuAddress(),
+          ",\"remaining\":", removal.remaining, ",\"sidecar_identity_retained\":1");
+      return S_OK; // Equivalent placed owners use heap residency; the VA and sidecar key are still live.
+    }
     /*
      * Every acceleration structure that lived in this allocation dies with it, so each of its
      * versions is released here: this is D3D12's own lifetime rule (the application may not free
@@ -3235,7 +3258,7 @@ public:
     bool released_sidecars = false;
     std::vector<raytracing::ArenaKey> dying;
     rtas_.ForEachKey([&](const raytracing::ArenaKey &key) {
-      if (key.allocationIdentity == allocation)
+      if (key.allocationIdentity == removal.retired_identity.ptr())
         dying.push_back(key);
     });
     for (const auto &key : dying) {
@@ -3266,6 +3289,10 @@ public:
     return LookupBufferRangeByVA(VA, pOffset, &begin, &end, &generation);
   }
 
+  std::vector<Rc<BufferAllocation>> SnapshotBufferAllocations() override {
+    return va_registry_.Snapshot();
+  }
+
   Rc<BufferAllocation>
   LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin, uint64_t *pEnd,
                         uint64_t *pGeneration) {
@@ -3282,11 +3309,26 @@ public:
   HRESULT
   QueryRTASSizes(const raytracing::BuildInputs &inputs, raytracing::NativeSizes &sizes) {
     if (uint32_t(inputs.type) == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY) { sizes = {}; return S_OK; }
+    raytracing::NativeSizeKey key;
+    const bool cacheable = raytracing::MakeNativeSizeKey(inputs, key);
+    if (cacheable) {
+      std::lock_guard lock(rtas_sizes_lock_);
+      if (rtas_sizes_.Find(key, sizes)) {
+        owned_graphics::Trace("rtas_size_cache", ",\"hit\":1,\"cacheable\":1");
+        return S_OK;
+      }
+    }
+    // A native query may allocate. Keep it outside both cache and residency locks.
     raytracing::NativeDescriptor descriptor;
     const HRESULT hr = raytracing::CreateNativeDescriptor(GetMTLDevice(), inputs, {}, descriptor);
     if (FAILED(hr))
       return hr;
     sizes = descriptor.sizes;
+    owned_graphics::Trace("rtas_size_cache", ",\"hit\":0,\"cacheable\":", cacheable ? 1 : 0);
+    if (cacheable) {
+      std::lock_guard lock(rtas_sizes_lock_);
+      rtas_sizes_.Insert(std::move(key), sizes);
+    }
     return S_OK;
   }
 
@@ -3297,6 +3339,16 @@ public:
     if (!recorded)
       return false;
     state = *recorded;
+    return true;
+  }
+
+  bool
+  FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state) final {
+    std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
+    const auto *encoded = rtas_.FindEncoded(key, queue);
+    if (!encoded || !encoded->info || !encoded->execution.resourceID)
+      return false;
+    state = *encoded;
     return true;
   }
 
@@ -3367,35 +3419,42 @@ public:
   }
 
   void
-  HoldRTASLease(const raytracing::ArenaKey &key, uint32_t token) {
+  RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue,
+      const raytracing::ShadowMetadata *metadata) final {
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     rtas_.HoldLease(key, token);
+    auto *encoded = rtas_.RecordEncoding(key, token, queue);
+    if (!encoded)
+      return;
+    encoded->execution = {};
+    if (metadata && encoded->info && encoded->sidecar) {
+      encoded->execution.metadata = *metadata;
+      encoded->execution.resourceID = encoded->sidecar.resourceID();
+      encoded->execution.nativeSize = encoded->sidecar.size();
+      encoded->execution.instanceCount = encoded->sidecar.instanceCount();
+    }
   }
 
   void
-  ObserveRTAS(const raytracing::ArenaKey &key) {
+  CompleteRTASSubmission(uint64_t id,
+      std::span<const std::pair<raytracing::ArenaKey, uint32_t>> leases, bool observe_gpu) {
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-    auto found = rtas_slots_.find(key);
-    if (found == rtas_slots_.end())
-      return;
     /*
      * The token the GPU published for this address is the only authority on which native
      * structure a dispatch will read. A zero slot means no build has executed yet, so nothing has
      * been superseded. Residency needs no work here: every published version is registered at
      * publication, so the live version is already resident by the time any dispatch can run.
+     * Keep all observations and lease drops ahead of retirement, then sweep/commit only once.
      */
-    const uint32_t token = rtas_mirror_.Load(found->second);
-    if (!token)
-      return;
-    if (!rtas_.Observe(key, token))
-      return;
-    ReleaseSupersededRTASLocked();
-  }
-
-  /** Release every version no in-flight submission can still read. Caller holds residency_lock_. */
-  void
-  ReleaseSupersededRTASLocked() {
-    auto released = rtas_.Sweep();
+    auto released = rtas_.CompleteSubmission(id, leases, [&](const raytracing::ArenaKey &key) -> uint32_t {
+      if (!observe_gpu)
+        return 0;
+      auto found = rtas_slots_.find(key);
+      return found == rtas_slots_.end() ? 0 : rtas_mirror_.Load(found->second);
+    });
+    if (!leases.empty() || !released.empty())
+      owned_graphics::Trace("rtas_retirement_batch", ",\"submission\":", id, ",\"leases\":", leases.size(),
+          ",\"sweeps\":1,\"released\":", released.size(), ",\"residency_commits\":", released.empty() ? 0 : 1);
     if (released.empty())
       return;
     for (auto &[key, state] : released)
@@ -3450,13 +3509,6 @@ public:
   BeginRTASSubmission() {
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     return rtas_.BeginSubmission();
-  }
-
-  void
-  RetireRTASSubmission(uint64_t id) {
-    std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-    rtas_.RetireSubmission(id);
-    ReleaseSupersededRTASLocked();
   }
 
   /*

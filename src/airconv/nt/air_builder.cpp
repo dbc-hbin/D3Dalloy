@@ -10,6 +10,23 @@
 #include <format>
 
 namespace llvm::air {
+namespace {
+bool usesModernTextureABI(const Module &module) {
+  auto *version = module.getNamedMetadata("air.version");
+  if (!version || !version->getNumOperands() || version->getOperand(0)->getNumOperands() < 2)
+    return false;
+  auto *major = mdconst::dyn_extract<ConstantInt>(version->getOperand(0)->getOperand(0));
+  auto *minor = mdconst::dyn_extract<ConstantInt>(version->getOperand(0)->getOperand(1));
+  return major && minor && (major->getZExtValue() > 2 ||
+      (major->getZExtValue() == 2 && minor->getZExtValue() >= 8));
+}
+
+bool textureAtomicHasOffset(const Module &module, Texture::ResourceKind kind) {
+  return usesModernTextureABI(module) &&
+      (kind == Texture::texture2d || kind == Texture::texture2d_array || kind == Texture::texture3d);
+}
+} // namespace
+
 Value *
 AIRBuilder::CreateAtomicPhaseMetadataLoad(Value *base, uint64_t offset, Type *type) {
   auto *bytes = builder.CreateBitCast(base, builder.getInt8Ty()->getPointerTo(1));
@@ -1075,6 +1092,14 @@ AIRBuilder::CreateAtomicRMW(
     Ops.push_back(ArrayIndex);
   }
 
+  // AIR 2.8+ texture atomics place an explicit coordinate offset before the
+  // operand. The legacy signature misidentifies operands during Shader Validation.
+  if (textureAtomicHasOffset(*getModule(), Texture.kind)) {
+    auto *offsetType = getTextureRWPositionType(Texture);
+    Tys.push_back(offsetType);
+    Ops.push_back(Constant::getNullValue(offsetType));
+  }
+
   Tys.push_back(getTexelType(Texture));
   Ops.push_back(ValVec4);
 
@@ -1206,6 +1231,12 @@ AIRBuilder::CreateAtomicCmpXchg(
   if (TexInfo.is_array) {
     Tys.push_back(getIntTy());
     Ops.push_back(ArrayIndex);
+  }
+
+  if (textureAtomicHasOffset(*getModule(), Texture.kind)) {
+    auto *offsetType = getTextureRWPositionType(Texture);
+    Tys.push_back(offsetType);
+    Ops.push_back(Constant::getNullValue(offsetType));
   }
 
   AllocaInst *Alloca = builder.CreateAlloca(TyTexel, 0u);
@@ -1902,9 +1933,7 @@ AIRBuilder::CreateRead(
   // AIR 2.8 reads take the built-in read sampler and explicit offsets.
   // Advertising 2.8 with the legacy signature crashes TextureCheckPass before
   // PSO creation; older AIR modules retain their original intrinsic ABI.
-  auto *airVersion = getModule()->getNamedMetadata("air.version");
-  bool modernRead = airVersion && airVersion->getNumOperands() &&
-      mdconst::extract<ConstantInt>(airVersion->getOperand(0)->getOperand(1))->getZExtValue() >= 8;
+  bool modernRead = usesModernTextureABI(*getModule());
   if (modernRead) {
     auto *samplerType = getSamplerHandleType();
     auto sampler = getModule()->getOrInsertFunction(

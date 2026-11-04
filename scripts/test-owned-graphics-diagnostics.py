@@ -157,6 +157,11 @@ RAYTRACING_COHERENCE_CONTROL_TRACE = ("".join(coherence_control_rows)
     + "OWNED_D3D12_RAYTRACING_HITOBJECT_COHERENCE lanes=64 words=512 scope=reorder wave_max=32 status=PASS\n"
     + "OWNED_D3D12_RAYTRACING_CASE hitobject-reorder-coherence status=PASS\n")
 RAYTRACING_CONTRACT_TRACE += RAYTRACING_COHERENCE_CONTROL_TRACE
+RAYTRACING_TRACE_CONTROL = "".join(
+    f"OWNED_D3D12_RAYTRACING_TRACE_CONTROL path={path} deferred={deferred} rays=16 words=512 status=PASS\n"
+    for path in ("native", "query") for deferred in (0, 1))
+RAYTRACING_TRACE_CONTROL += "OWNED_D3D12_RAYTRACING_CASE trace-control status=PASS\n"
+RAYTRACING_CONTRACT_TRACE += RAYTRACING_TRACE_CONTROL
 
 
 class RunnerFailures(unittest.TestCase):
@@ -1517,13 +1522,15 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
             self.simulate_raytracing(shaders=False)
 
     def test_raytracing_requires_one_completed_hitobject_oracle(self):
-        marker = "OWNED_D3D12_RAYTRACING_CASE hitobject status=PASS\n"
         self.assertTrue(self.simulate_raytracing()["pass"])
-        for replacement in ("", marker + marker, marker.replace("PASS", "FAIL")):
-            with self.subTest(replacement=replacement):
-                report = self.simulate_raytracing(contract_trace=RAYTRACING_CONTRACT_TRACE.replace(marker, replacement))
-                self.assertFalse(report["pass"])
-                self.assertTrue(report["raytracing"]["failures"])
+        markers = ["OWNED_D3D12_RAYTRACING_CASE hitobject status=PASS\n"]
+        markers += RAYTRACING_TRACE_CONTROL.splitlines(keepends=True)
+        for marker in markers:
+            for replacement in ("", marker + marker, marker.replace("PASS", "FAIL")):
+                with self.subTest(marker=marker, replacement=replacement):
+                    report = self.simulate_raytracing(contract_trace=RAYTRACING_CONTRACT_TRACE.replace(marker, replacement))
+                    self.assertFalse(report["pass"])
+                    self.assertTrue(report["raytracing"]["failures"])
 
     def test_raytracing_reorder_scope_requires_all_actual_words_and_multiple_waves(self):
         trace = RAYTRACING_CONTRACT_TRACE
@@ -1556,7 +1563,10 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
                  ("ds", (0, 0, 6, 0, 0, 0), 2), ("gs", (0, 0, 0, 4, 0, 0), 4),
                  ("ds_gs", (0, 0, 6, 4, 0, 0), 4), ("ms_grid", (0, 0, 0, 0, 0, 16), 4),
                  ("as_child1", (0, 0, 0, 0, 8, 8), 2), ("as_child2", (0, 0, 0, 0, 8, 16), 4),
-                 ("as_child3d", (0, 0, 0, 0, 8, 32), 8))
+                 ("as_child3d", (0, 0, 0, 0, 8, 32), 8),
+                 ("vs_indirect", (6, 0, 0, 0, 0, 0), 2), ("hs_indirect", (0, 6, 0, 0, 0, 0), 2),
+                 ("ds_indirect", (0, 0, 6, 0, 0, 0), 2), ("gs_indirect", (0, 0, 0, 4, 0, 0), 4),
+                 ("ds_gs_indirect", (0, 0, 6, 4, 0, 0), 4))
         rows = []
         for name, counts, primitives in cases:
             for samples in (1, 4):
@@ -1572,7 +1582,7 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
                 for index in range(64):
                     rows.append(f"OWNED_D3D12_ATOMIC64_PRODUCERS_PIXEL case={name} samples={samples} index={index} rgba={rgba:08x}\n")
                 rows.append(f"OWNED_D3D12_ATOMIC64_PRODUCERS_CASE case={name} samples={samples} status=PASS\n")
-        summary = "OWNED_D3D12_ATOMIC64_PRODUCERS_PASS cases=18 stages=VS,HS,DS,GS,AS,MS\n"
+        summary = "OWNED_D3D12_ATOMIC64_PRODUCERS_PASS cases=28 stages=VS,HS,DS,GS,AS,MS\n"
         trace = "".join(rows) + summary
         self.assertFalse(runner.atomic64_producers_failures(trace, ""))
         for invalid in (summary, trace.replace(rows[0], ""), trace + rows[0], trace + summary,
@@ -1582,7 +1592,8 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
                         trace.replace("cell=1234567800000009", "cell=1234567800000000", 1),
                         trace.replace("guard=cdcdcdcd", "guard=00000000", 1),
                         trace.replace("rgba=20000800", "rgba=10000400", 1),
-                        trace.replace("rgba=20001400", "rgba=20000800", 1)):
+                        trace.replace("rgba=20001400", "rgba=20000800", 1),
+                        trace.replace("case=vs_indirect", "case=vs", 1)):
             self.assertTrue(runner.atomic64_producers_failures(invalid, ""))
         self.assertTrue(runner.atomic64_producers_failures(trace, "kIOGPUCommandBufferCallbackError"))
         self.assertTrue(runner.atomic64_producers_failures(trace, "OWNED_D3D12_SM6_MISMATCH"))
@@ -1692,7 +1703,7 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
         extended_rows = []
         extended_summaries = []
         shared_rows = []
-        for mode in range(2):
+        for mode in range(3):
             for lane in range(24):
                 kind = lane % 3
                 seed = ((0x24680000 + lane) << 32) | (0xfedc0000 + lane)
@@ -2025,6 +2036,16 @@ class Atomic64PhaseEvidence(unittest.TestCase):
         lines = [prefix + "BACKEND id=owned-graphics-d3d12",
                  prefix + "MAP iteration=0 words=5555555500000000,5555555600000001,8765432100000001,8765432100000001,123456789abcdef0,123456789abcdef0",
                  prefix + "MAP iteration=1 words=1234567800000003,1234567900000004,8765432100000004,8765432100000004,123456789abcdef0,123456789abcdef0"]
+        lines.extend((
+            prefix + "SPARSE iteration=0 tile=0 words=5555555500000000,5555555600000001,8765432100000001,"
+                     "8765432100000001,123456789abcdef0,123456789abcdef0,2222222200000002,a11a11a11a11a11a,b22b22b22b22b22b",
+            prefix + "SPARSE iteration=1 tile=1 words=5555555500000003,123456789abcdef0,5555555600000004,"
+                     "5555555600000004,876543219abcdef0,876543219abcdef0,5555555600000004,a11a11a11a11a11a,b22b22b22b22b22b",
+            prefix + "SPARSE iteration=2 tile=0 words=5555555500000006,5555555600000007,8765432100000007,"
+                     "8765432100000007,123456789abcdef0,123456789abcdef0,5555555600000004,a11a11a11a11a11a,b22b22b22b22b22b",
+            prefix + "SPARSE iteration=3 tile=0 words=5555555500000009,555555560000000a,876543210000000a,"
+                     "876543210000000a,123456789abcdef0,123456789abcdef0,5555555600000004,a11a11a11a11a11a,b22b22b22b22b22b",
+        ))
         names = ("indirect_nonzero", "indirect_count_zero", "indirect_dimension_zero", "indirect_predicate_zero",
                  "crossqueue_atomic_to_ordinary", "crossqueue_ordinary_to_atomic")
         for case, name in enumerate(names):
@@ -2888,6 +2909,85 @@ class DepthBoundsEvidence(unittest.TestCase):
                             for failure in runner.depth_bounds_failures(trace, "")))
 
 
+class RefitChainEvidence(unittest.TestCase):
+    """Controlled public-layout parser inputs; these are not GPU evidence."""
+
+    @staticmethod
+    def stimulus(indexed=False):
+        prefix = "OWNED_D3D12_REFIT_CHAIN"
+        cases = (("chain", (1, 2)), ("replay", (1, 2)), ("cross-queue", (3,)), ("after-cross", (1, 2)))
+        bits = lambda value: struct.unpack("<I", struct.pack("<f", value))[0]
+        words = lambda values: ",".join(f"{value:08x}" for value in values)
+        lines = [prefix + "_SOURCE blas_address=0000000000001000 tlas_address=0000000000002000 "
+                 "blas_prebuild=1280 tlas_prebuild=1280",
+                 prefix + "_RECORDINGS initial_lists=2 r_executions=3 r2_executions=1 "
+                 f"unpublished_builds=2 cross_queue=1 indexed={int(indexed)}"]
+        for name, steps in cases:
+            for step in steps:
+                for lane in range(4):
+                    instance, geometry = divmod(lane, 2)
+                    values = [1, 0, 0x80 + 16 * step + instance, instance, geometry, 0xff,
+                              bits(3 * step + 1), 0, bits(0.25), bits(0.25), 0x1000, 0xffffffff, 0x101]
+                    lines.append(f"{prefix}_RAY case={name} step={step} lane={lane} words={words(values)}")
+            for kind in ("blas", "tlas"):
+                visual, serial, pointers = ((328, 440, 0) if indexed else (296, 408, 0)) \
+                    if kind == "blas" else (136, 264, 2)
+                lines.append(f"{prefix}_SIZE case={name} kind={kind} compacted=1280 visualization={visual} "
+                             f"serialized={serial} pointers={pointers} current=1280 header_serialized={serial} "
+                             f"deserialized=1280 header_pointers={pointers} identifier=1")
+                if kind == "blas":
+                    values = [bits(value) for g in range(2) for value in
+                              (4 * g, 0, 2 * steps[-1], 4 * g + 1, 0, 2 * steps[-1], 4 * g, 1, 2 * steps[-1])]
+                else:
+                    values = []
+                    for instance in range(2):
+                        values.extend(bits(value) for value in
+                                      (1, 0, 0, 0, 0, 1, 0, 4 * instance, 0, 0, 1, steps[-1]))
+                        values.extend((0xff000080 + 16 * steps[-1] + instance, 0, 0x1000, 0))
+                lines.append(f"{prefix}_SHADOW case={name} kind={kind} type={int(kind == 'blas')} "
+                             f"descriptors=2 descriptor_mismatches=0 words={words(values)}")
+            lines.append(f"{prefix}_CASE case={name} steps={len(steps)} status=PASS")
+        lines.extend((prefix + "_RESULT cases=4 refits=14 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
+                      prefix + "_PASS"))
+        stderr = "\n".join(f"{prefix}_EXECUTE case={name} {boundary}" for name in
+                           ("chain", "replay", "cross-return") for boundary in ("begin", "end"))
+        return "\n".join(lines), stderr
+
+    def test_refit_indexed_and_default_modes_have_distinct_exact_sizes(self):
+        for indexed in (False, True):
+            with self.subTest(indexed=indexed):
+                stdout, stderr = self.stimulus(indexed)
+                self.assertEqual(runner.raytracing_refit_chain_failures(stdout, stderr), [])
+        stdout, stderr = self.stimulus(False)
+        self.assertEqual(runner.raytracing_refit_chain_failures(stdout.replace(" indexed=0", ""), stderr), [])
+
+    def test_refit_wrong_mode_or_mixed_sizes_cannot_pass(self):
+        plain, stderr = self.stimulus(False)
+        indexed, _ = self.stimulus(True)
+        corruptions = (
+            plain.replace(" indexed=0", " indexed=1"),
+            indexed.replace(" indexed=1", " indexed=0"),
+            indexed.replace(" indexed=1", ""),
+            indexed.replace("visualization=328", "visualization=296", 1),
+            indexed.replace("serialized=440", "serialized=408", 1),
+            plain.replace("visualization=296", "visualization=328", 1),
+            indexed.replace("descriptor_mismatches=0", "descriptor_mismatches=1", 1),
+        )
+        for number, stdout in enumerate(corruptions):
+            with self.subTest(number=number):
+                self.assertTrue(runner.raytracing_refit_chain_failures(stdout, stderr))
+
+    def test_refit_mode_marker_must_be_unique_and_well_formed(self):
+        stdout, stderr = self.stimulus(True)
+        marker = next(line for line in stdout.splitlines() if "_RECORDINGS " in line)
+        for replacement in ("", marker + "\n" + marker,
+                            marker + "\n" + marker.replace("indexed=1", "indexed=0"),
+                            marker.replace("indexed=1", "indexed=2"),
+                            marker.replace("indexed=1", "indexed=01"), marker + " extra=1"):
+            with self.subTest(replacement=replacement):
+                self.assertTrue(runner.raytracing_refit_chain_failures(stdout.replace(marker, replacement), stderr))
+
+
 class RTExecutableCacheEvidence(unittest.TestCase):
     def test_real_native_link_counts_and_live_clear_required(self):
         names=("concurrent-cold","warm","local-root-variant","clear-live")
@@ -2922,32 +3022,125 @@ class RTExecutableCacheEvidence(unittest.TestCase):
 
 class SubmissionFoundationEvidence(unittest.TestCase):
     def test_actual_resolved_execution_and_reuse_required(self):
-        names=["volatile_replay","retired_icb_reuse","placed_alias_clears","query_fanout","sparse_mapping_positive","cpu_strip_transfer"]
+        names=["volatile_replay","descriptor_cache_reuse","retired_icb_reuse","placed_alias_clears",
+               "placed_disjoint_ranges","placed_sparse_range_replay","query_fanout","sparse_mapping_positive","cpu_strip_transfer",
+               "dispatch_independence"]
         output="".join(f"OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case={name} proof=exact\n" for name in names)
-        output+="OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=6\n"
+        output=output.replace("case=placed_disjoint_ranges proof=exact", "case=placed_disjoint_ranges textures=2 buffer=1 pixels=185 words=64 exact=1")
+        output=output.replace("case=placed_sparse_range_replay proof=exact", "case=placed_sparse_range_replay executions=4 close_count=1 mapping=unmapped,disjoint,overlap,null pixels=64 words=256 exact=1")
+        output=output.replace("case=dispatch_independence proof=exact",
+            "case=dispatch_independence phases=7 table_replays=3 potential_raw_war_waw=serial "
+            "budget=65 roots=8 all_words_and_guards=exact")
+        output+="OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10\n"
         records=[dict(event="recording_plan_sealed",passes=3,descriptor_values_captured=0),
             dict(event="residency_add_batch",allocations=5,commits=1)]
         records += [dict(event="indirect_buffer_reuse",count=1,capacity=2) for _ in range(2)]
         records += [dict(event="sparse_publication_elided",proof="no_sparse_heap_or_opaque_access") for _ in range(4)]
-        records += [dict(event="submission_heap_clear_in_place") for _ in range(2)]
         records += [dict(event="submission_access_opaque",reason="sparse_alias")]
         records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,reset=0),
                     dict(event="query_fanout_batch",targets=1,native_encoders=1,reset=0),
                     dict(event="submit",queue=1,submission=1),dict(event="complete",queue=1,submission=1,status=4)]
+        for name,hit in [("cold",False),("payload",True),("unrelated",True),("copy",False),
+                         ("copy_payload",True),("null",False),("null_replay",True),("restore",False),
+                         ("va_epoch",False),("va_replay",True)]:
+            records.append(dict(event="submission_plan_work",_phase="descriptor_cache_"+name,
+                descriptor_cache_hits=int(hit),descriptor_cache_misses=int(not hit),
+                descriptor_cache_builds=int(not hit),descriptor_resolutions=int(not hit)))
+        for ordinal,name in enumerate(("placed_alias_clears","placed_disjoint_ranges"),1):
+            rows=[dict(event="execute_list",queue=2,list=10+ordinal,recording=1,submission=ordinal)]
+            rows += [dict(event="submission_heap_clear_in_place",encoder=100*ordinal+i) for i in (1,2)]
+            for i in (1,2):
+                rows += [dict(event="native_clear_begin",encoder=100*ordinal+i,members=1,begin_count=1),
+                         dict(event="native_clear_end",encoder=100*ordinal+i,end_count=1)]
+            if name=="placed_disjoint_ranges":
+                rows += [dict(event="native_fence_wait_skipped",encoder=100*ordinal+i,
+                              reason="no_known_hazard",skip_count=1) for i in (1,2)]
+            rows += [dict(event="submit",queue=2,submission=ordinal),
+                     dict(event="complete",queue=2,submission=ordinal,status=4)]
+            records += [dict(row,_phase=name) for row in rows]
+        records.append(dict(event="recording_plan_sealed",list=20,recording=7,passes=7,descriptor_values_captured=0))
+        for ordinal,name in enumerate(("placed_sparse_unmapped","placed_sparse_disjoint","placed_sparse_overlap","placed_sparse_null"),1):
+            required=name=="placed_sparse_overlap"
+            fields=dict(queue=3,list=20,mapping_generation=50+ordinal,heap_ranges=4)
+            rows=[dict(event="execute_list",queue=3,list=20,recording=7,submission=ordinal),
+                  dict(event="sparse_publication_proof",required=required,current=not required,**fields)]
+            if required:
+                rows += [dict(event="sparse_publication_required",reason="mapped_heap_or_opaque_access",**fields),
+                         dict(event="sparse_alias_flush",queue=3,value=ordinal)]
+            else:
+                rows += [dict(event="sparse_publication_elided",proof="disjoint_sparse_heap_ranges",**fields)]
+                rows += [dict(event="sparse_barrier_elided",encoder=300+i,**fields) for i in range(4)]
+            rows += [dict(event="submit",queue=3,submission=ordinal),
+                     dict(event="complete",queue=3,submission=ordinal,status=4)]
+            records += [dict(row,_phase=name) for row in rows]
         def check(rows,proof=True,text=output):
-            log="".join("OWNED_GRAPHICS_TRACE "+json.dumps(dict(row,event_id=i+1))+"\n" for i,row in enumerate(rows))
+            lines=[];active=None
+            for i,row in enumerate(rows):
+                record=dict(row,event_id=i+1);phase=record.pop("_phase",None)
+                if phase!=active:
+                    if active:lines.append("OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE end="+active+"\n")
+                    if phase:lines.append("OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE begin="+phase+"\n")
+                    active=phase
+                lines.append("OWNED_GRAPHICS_TRACE "+json.dumps(record)+"\n")
+            if active:lines.append("OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE end="+active+"\n")
+            log="".join(lines)
             return runner.submission_foundation_output_matches(text,log,proof,True)
         self.assertTrue(check(records));self.assertFalse(check(records,False))
+        self.assertFalse(check(records,text=output.replace("dispatch_independence", "missing_dispatch_independence")))
         for kind in ("recording_plan_sealed","residency_add_batch","indirect_buffer_reuse","sparse_publication_elided",
-                     "submission_heap_clear_in_place","query_fanout_batch"):
+                     "submission_heap_clear_in_place","native_clear_begin","native_clear_end",
+                     "query_fanout_batch","submission_plan_work",
+                     "execute_list","native_fence_wait_skipped","sparse_publication_proof",
+                     "sparse_publication_required","sparse_alias_flush","sparse_barrier_elided"):
             self.assertFalse(check([row for row in records if row["event"]!=kind]))
         changed=[dict(row) for row in records];changed[0]["descriptor_values_captured"]=1
+        self.assertFalse(check(changed))
+        changed=[dict(row) for row in records]
+        for row in changed:
+            if row["event"]=="native_clear_begin":row["members"]=2
         self.assertFalse(check(changed))
         changed=[dict(row) for row in records]
         for row in changed:
             if row["event"]=="query_fanout_batch":row["native_encoders"]=2
         self.assertFalse(check(changed))
         self.assertFalse(check(records,text=output+"OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=query_fanout duplicate=1\n"))
+        changed=[dict(row) for row in records]
+        for row in changed:
+            if row.get("_phase")=="descriptor_cache_payload":row["descriptor_resolutions"]=1
+        self.assertFalse(check(changed))
+        changed=[dict(row) for row in records]
+        for row in changed:
+            if row.get("_phase")=="descriptor_cache_copy":
+                row.update(descriptor_cache_hits=1,descriptor_cache_misses=0,descriptor_cache_builds=0,descriptor_resolutions=0)
+        self.assertFalse(check(changed))
+        for phase,kind,field,value in (
+            ("placed_disjoint_ranges","native_fence_wait_skipped","reason","queue_barrier"),
+            ("placed_sparse_disjoint","sparse_publication_proof","current",0),
+            ("placed_sparse_disjoint","sparse_publication_proof","mapping_generation",51),
+            ("placed_sparse_overlap","sparse_publication_proof","required",False),
+            ("placed_sparse_overlap","sparse_publication_proof","current",True),
+            ("placed_sparse_null","sparse_publication_proof","heap_ranges",0),
+            ("placed_sparse_disjoint","sparse_barrier_elided","mapping_generation",1),
+            ("placed_sparse_null","execute_list","recording",8),
+            ("placed_sparse_overlap","sparse_publication_required","reason","stale"),
+            ("placed_sparse_overlap","complete","status",5),
+        ):
+            changed=[dict(row) for row in records]
+            for row in changed:
+                if row.get("_phase")==phase and row["event"]==kind:row[field]=value
+            self.assertFalse(check(changed),(phase,kind,field))
+        changed=[dict(row) for row in records]
+        target=next(i for i,row in enumerate(changed) if row.get("_phase")=="placed_sparse_disjoint" and row["event"]=="sparse_publication_proof")
+        changed.insert(target,dict(changed[target]))
+        self.assertFalse(check(changed))
+        changed=[dict(row) for row in records]
+        target=next(i for i,row in enumerate(changed) if row.get("_phase")=="placed_sparse_disjoint" and row["event"]=="execute_list")
+        mapping_flush=dict(event="sparse_alias_flush",queue=3,value=90,_phase="placed_sparse_disjoint")
+        changed.insert(target,mapping_flush)
+        self.assertTrue(check(changed))  # A preceding mapping task is outside the consumer's proof.
+        changed.pop(target);changed.insert(target+1,mapping_flush)
+        self.assertFalse(check(changed))
+        self.assertFalse(check(records,text=output.replace("pixels=185","pixels=184")))
 
 
 class WorkGraphBatchEvidence(unittest.TestCase):
@@ -2994,6 +3187,22 @@ class WideWaveFocusedEvidence(unittest.TestCase):
 
 
 class TemporalFailures(unittest.TestCase):
+    def test_sampled_sr_must_observe_native_retirement_counters(self):
+        row = ("D3DALLOY_SR_GPU_PHASE sample=6 generation=1 input=624x360 capacity=624x360 "
+               "output=1280x720 sharpen=0 reset=0 slots=12 prefix_fold=0 direct_center=0 "
+               "pre_us=0.000 native_us=615.042 alpha_us=0.000 finish_us=0.000 copy_us=0.000")
+        samples, errors = runner.sr_timing_evidence(row, 3)
+        self.assertEqual(errors, [])
+        self.assertEqual((samples[0]["sample"], samples[0]["native_us"]), (6, 615.042))
+        for broken in ("", row.replace("sample=6", "sample=5"),
+                       row.replace("slots=12", "slots=8"), row.replace("pre_us=0.000", "pre_us=1.000"),
+                       row.replace("615.042", "nan")):
+            with self.subTest(broken=broken):
+                self.assertTrue(runner.sr_timing_evidence(broken, 3)[1])
+        for suite, period in (("smoke", 1), ("temporal", 0), ("sr-alpha", 1 << 32)):
+            with self.subTest(suite=suite, period=period), self.assertRaisesRegex(ValueError, "SR suite"):
+                runner.run(argparse.Namespace(suite=suite, sr_gpu_timing_period=period))
+
     def setUp(self):
         self.events = example_trace()
 
@@ -3379,6 +3588,31 @@ class Phase3QueryIntervals(unittest.TestCase):
         self.assertTrue(runner.query_interval_failures(out.replace(guard,str(int(guard)+1),1),err))
 
 
+def controlled_msaa_tile_rows(encoder, list_id, producer, *, queue=2, tasks=1, execute=True,
+                              released_buffers=11):
+    # Normalized synthetic stimuli from final-multisample-capabilities-55-02's
+    # 4x4 fallback/query/volatile GPU task traces. These are parser controls,
+    # never new GPU evidence and never generated from runner expectations.
+    rows = [dict(event="execute_list",queue=queue,submission=producer,list=list_id,recording=1)] if execute else []
+    rows.append(dict(event="msaa_tile_begin",queue=queue,encoder=encoder,list=list_id,recording=1,
+        submission=producer,source="gpu",capacity=tasks,first_budget=1,quantum_budget=64,
+        host_interop="native_scissor",descriptor_capacity=64,descriptor_bytes=1088))
+    rows += [dict(event="submit",queue=queue,submission=producer),
+             dict(event="complete",queue=queue,submission=producer,status=4),
+             dict(event="msaa_tile_ready",queue=queue,encoder=encoder,producer=producer,
+                  ready=1,status=0,width=4,height=4,viewports=1,layers=1)]
+    for quantum in range(1,tasks+1):
+        rows += [dict(event="submit",queue=queue,submission=producer+quantum),
+                 dict(event="complete",queue=queue,submission=producer+quantum,status=4),
+                 dict(event="msaa_tile_quantum",queue=queue,encoder=encoder,producer=producer+quantum,
+                      quantum=quantum,budget=1,count=1,task_done=quantum,status=int(quantum==tasks),
+                      ready=int(quantum!=tasks),scissors=1)]
+    rows.append(dict(event="msaa_tile_release",queue=queue,encoder=encoder,producer=producer+tasks,
+        released_buffers=released_buffers,released_textures=1,released_markers=0,
+        retained_buffers=0,retained_textures=0,retained_markers=0))
+    return rows
+
+
 class Phase3NativeMSAA(unittest.TestCase):
     def control(self):
         out, err, serial, encoder, submission = [], [], 0, 100, 0
@@ -3404,13 +3638,15 @@ class Phase3NativeMSAA(unittest.TestCase):
                                     label=f"{'captured_sample_frequency_query' if captured else 'native_sample_frequency'}_count{count}_quality{quality}_mask{mask:08x}_replay{replay}"
                                     submission+=1
                                     err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
-                                    event("execute_list",queue=1,submission=submission,list=captured_list if captured else native_list,recording=1)
+                                    producer=10000+submission*16
+                                    event("execute_list",queue=2 if captured else 1,
+                                          submission=producer if captured else submission,
+                                          list=captured_list if captured else native_list,recording=1)
                                     if captured:
-                                        producer=10000+submission*4
                                         event("native_compute_encode",encoder=encoder+4,submission=producer)
-                                        event("submit",submission=producer)
-                                        event("msaa_producer_wait",encoder=encoder+3,producer=producer,queue=2,wait_count=1)
-                                        event("complete",submission=producer,status=4)
+                                        for row in controlled_msaa_tile_rows(encoder+3,captured_list,producer,
+                                                                            execute=False,released_buffers=10):
+                                            event(row.pop("event"),**row)
                                     else:
                                         for id in native_ids:
                                             event("native_render_begin",encoder=id,native_msaa_sample_count=count,submission=submission)
@@ -3443,10 +3679,9 @@ class Phase3NativeMSAA(unittest.TestCase):
                             submission+=1
                             err.append(f"{prefix}_SUBMISSION_BEGIN id={submission} label={label}")
                             for draw in range(4 if mixed else 1):
-                                producer=10000+submission*4+draw
-                                event("submit",submission=producer)
-                                event("msaa_producer_wait",encoder=encoder+draw,producer=producer,queue=2,wait_count=1)
-                                event("complete",submission=producer,status=4)
+                                producer=10000+submission*16+draw*3
+                                for row in controlled_msaa_tile_rows(encoder+draw,encoder+1000,producer,tasks=2):
+                                    event(row.pop("event"),**row)
                             event("submit",submission=submission)
                             event("complete",submission=submission,status=4)
                             err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
@@ -3463,10 +3698,11 @@ class Phase3NativeMSAA(unittest.TestCase):
                             event("native_render_begin",encoder=id,native_msaa_sample_count=count,submission=submission)
                             event("native_render_end",encoder=id,submission=submission)
                             if mixed and (resource=="free" and (quality==4294967294 or native_index==2) or resource=="static" and native_index==0):
-                                producer=10000+submission*4+native_index
-                                event("submit",submission=producer)
-                                event("msaa_producer_wait",encoder=encoder+(3 if resource=="free" and quality!=4294967294 else 1),producer=producer,queue=2,wait_count=1)
-                                event("complete",submission=producer,status=4)
+                                producer=10000+submission*16+native_index*3
+                                for row in controlled_msaa_tile_rows(
+                                        encoder+(3 if resource=="free" and quality!=4294967294 else 1),
+                                        encoder+1000,producer):
+                                    event(row.pop("event"),**row)
                         event("submit",submission=submission)
                         event("complete",submission=submission,status=4)
                         err.append(f"{prefix}_SUBMISSION_END id={submission} label={label}")
@@ -3479,11 +3715,16 @@ class Phase3NativeMSAA(unittest.TestCase):
         for old,new in (("edge=2","edge=3"),("owners_released=1","owners_released=0"),("mask=00000000","mask=00000001")):
             self.assertIn(old,out)
             self.assertTrue(runner.native_msaa_failures(out.replace(old,new,1),err))
-        for old,new in (('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0'),('"wait_count": 1','"wait_count": 0'),("_SUBMISSION_END","_SUBMISSION_BEGIN")):
+        for old,new in (('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0'),('"budget": 1','"budget": 0'),("_SUBMISSION_END","_SUBMISSION_BEGIN")):
             self.assertIn(old,err)
             self.assertTrue(runner.native_msaa_failures(out,err.replace(old,new,1)))
-        first_wait=next(json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in err.splitlines() if '"event": "msaa_producer_wait"' in line)
-        self.assertTrue(runner.native_msaa_failures(out,err.replace(f'"producer": {first_wait["producer"]}','"producer": 99999',1)))
+        first_ready=next(json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in err.splitlines() if '"event": "msaa_tile_ready"' in line)
+        self.assertTrue(runner.native_msaa_failures(out,err.replace(f'"producer": {first_ready["producer"]}','"producer": 99999',1)))
+        for kind in ("msaa_tile_begin","msaa_tile_ready","msaa_tile_quantum","msaa_tile_release"):
+            tile_line=next(line for line in err.splitlines() if f'"event": "{kind}"' in line)
+            self.assertTrue(runner.native_msaa_failures(out,err.replace(tile_line,tile_line.replace(kind,"ignored_task"),1)))
+        self.assertTrue(runner.native_msaa_failures(out,err.replace('"event": "msaa_tile_ready"',
+            '"event": "msaa_producer_wait", "wait_count": 1',1)))
         line=next(line for line in err.splitlines() if '"event": "native_msaa_draw_record"' in line)
         self.assertTrue(runner.native_msaa_failures(out,err.replace(line+"\n","",1)))
         self.assertTrue(runner.native_msaa_failures(out,err.replace(line,line+"\n"+line,1)))
@@ -3537,11 +3778,12 @@ class Phase3NativeMSAA(unittest.TestCase):
         self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: events+[dict(event="native_compute_encode",encoder=99999)])))
         self.assertTrue(runner.native_msaa_failures(out,change_group(native_label,lambda events: events+[dict(event="msaa_producer_wait",encoder=99999,queue=2,producer=1,wait_count=1)])))
         self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: events+[dict(event="native_render_begin",encoder=99999,native_msaa_sample_count=2)])))
-        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [e for e in events if e["event"]!="msaa_producer_wait"])))
-        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: events+[dict(next(e for e in events if e["event"]=="msaa_producer_wait"))])))
-        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [dict(e,producer=e["producer"]+1) if e["event"]=="msaa_producer_wait" else e for e in events])))
-        self.assertTrue(runner.native_msaa_failures(out,change_group(labels[1]+"_replay1",lambda events: [dict(e,encoder=99999) if e["event"]=="msaa_producer_wait" else e for e in events])))
-        native_first=next(json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]) for line in err.splitlines() if '"event": "execute_list"' in line)
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [e for e in events if e["event"]!="msaa_tile_ready"])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: events+[dict(next(e for e in events if e["event"]=="msaa_tile_ready"))])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(query_label,lambda events: [dict(e,producer=e["producer"]+1) if e["event"]=="msaa_tile_ready" else e for e in events])))
+        self.assertTrue(runner.native_msaa_failures(out,change_group(labels[1]+"_replay1",lambda events: [dict(e,encoder=99999) if e["event"]=="msaa_tile_begin" else e for e in events])))
+        native_first=next(e for line in err.splitlines() if "OWNED_GRAPHICS_TRACE " in line and
+            (e:=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]))["event"]=="native_msaa_record" and "list" in e)
         native_records=[e for line in err.splitlines() if "OWNED_GRAPHICS_TRACE " in line and (e:=json.loads(line.split("OWNED_GRAPHICS_TRACE ",1)[1]))["event"] in ("native_msaa_record","native_msaa_draw_record") and e.get("list")==native_first["list"]]
         self.assertTrue(runner.native_msaa_failures(out,change_group(labels[0]+"_replay1",lambda events: [dict(e,encoder=e["encoder"]+100000) for e in native_records]+[dict(e,encoder=e["encoder"]+100000) if e["event"] in ("native_render_begin","native_render_end") else e for e in events])))
         for kind,field,value in (("native_msaa_draw_record","indexed",1),("native_msaa_draw_record","index_pull",1),("native_msaa_draw_record","count",6),("native_msaa_draw_record","instances",2),("native_msaa_draw_record","event","ignored_work"),("native_msaa_record","sample_count",4),("native_msaa_record","index_pull",1)):
@@ -3851,17 +4093,21 @@ class Phase3PipelineMSAA(unittest.TestCase):
         out="\n".join(f"{prefix}_GPU case={case} texels=16 value=ff332211" for case in ("captured_layout_first","captured_layout_reuse","ordinary_native2x"))
         events=[dict(event="native_msaa_draw_record",encoder=1,count=3,instances=1),dict(event="native_render_begin",encoder=1,native_msaa_sample_count=2,submission=4),dict(event="native_render_end",encoder=1),dict(event="complete",submission=4,status=4)]
         err=f"{prefix}_NATIVE_MSAA_BEGIN count=2\n"+"\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in events)+f"\n{prefix}_NATIVE_MSAA_END count=2 resolved=ff332211"
-        for phase in ("captured_layout_cold","captured_layout_hit"):
-            capture=[dict(event="submit",queue=6,submission=10),dict(event="msaa_producer_wait",encoder=3,queue=6,producer=10,wait_count=1),dict(event="complete",queue=6,submission=10,status=4)]
+        for ordinal,phase in enumerate(("captured_layout_cold","captured_layout_hit")):
+            capture=[dict(row,event_id=index+1) for index,row in enumerate(
+                controlled_msaa_tile_rows(3,5,10+ordinal*2,queue=6))]
             err+=f"\n{prefix}_ARTIFACT_PHASE begin={phase}\n"+"\n".join("OWNED_GRAPHICS_TRACE "+json.dumps(e) for e in capture)+f"\n{prefix}_ARTIFACT_PHASE end={phase} air={5 if phase.endswith('cold') else 0} libraries_max={5 if phase.endswith('cold') else 0}"
         self.assertEqual(runner.pipeline_native_msaa_failures(out,err),[])
         self.assertTrue(runner.pipeline_native_msaa_failures(out.replace("value=ff332211","value=ff332212",1),err))
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"status": 4','"status": 5')))
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"native_msaa_sample_count": 2','"native_msaa_sample_count": 0')))
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "native_render_end"','"event": "msaa_producer_wait"')))
-        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"wait_count": 1','"wait_count": 0',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"budget": 1','"budget": 0',1)))
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"producer": 10','"producer": 11',1)))
-        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "msaa_producer_wait"','"event": "native_render_begin"',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "msaa_tile_ready"','"event": "native_render_begin"',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "msaa_tile_ready"',
+            '"event": "msaa_producer_wait", "wait_count": 1',1)))
+        self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"retained_buffers": 0','"retained_buffers": 1',1)))
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace('"event": "submit"','"event": "fake_submit"',1)))
         malformed=next(line for line in err.splitlines() if '"event": "native_msaa_draw_record"' in line)
         self.assertTrue(runner.pipeline_native_msaa_failures(out,err.replace(malformed,"OWNED_GRAPHICS_TRACE []",1)))

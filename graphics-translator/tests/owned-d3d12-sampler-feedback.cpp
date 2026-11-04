@@ -971,6 +971,8 @@ int run() {
        0.31f, 1.0f, 3.0f},
       {D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
        D3D12_TEXTURE_ADDRESS_MODE_MIRROR, -0.77f},
+      {D3D12_FILTER_ANISOTROPIC, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+       0, 0, D3D12_FLOAT32_MAX, 16},
   };
   const auto static_sampler_state = c.sampler_states[4];
   D3D12_STATIC_SAMPLER_DESC static_sampler{};
@@ -1036,7 +1038,7 @@ int run() {
                              {32, 32, 6, 3, 4, 4, false}, {32, 32, 6, 3, 4, 4, true}};
   const char *shape_names[] = {"pow2_minmip", "pow2_used", "npot_minmip", "npot_used", "array_minmip", "array_used"};
   for (int sh = 0; sh < 6; ++sh)
-    for (UINT si = 0; si < c.sampler_states.size(); ++si)
+    for (UINT si = 0; si < 6; ++si)
       runCompute(c, std::string("cs_") + shape_names[sh] + "_" + sampler_names[si], shapes[sh], si, {},
                  writePattern(shapes[sh]));
   // Tier 1.0: any SRV (a mip/slice subrange and a ResourceMinLODClamp), any address mode, static samplers.
@@ -1045,6 +1047,16 @@ int run() {
   runCompute(c, "cs_srv_array_subrange_used", shapes[5], 1, {1, 4, 1, 2, 0}, writePattern(shapes[5]));
   runCompute(c, "cs_static_sampler_used", shapes[3], 4, {}, writePattern(shapes[3]), true);
   runCompute(c, "cs_null_paired_texture_drops_writes", shapes[1], 1, {}, writePattern(shapes[1]), false, true);
+  // Maximum anisotropy with adjacent duplicate and distinct feedback cells,
+  // projected NPOT grids, two mip passes, border holes and a nonzero array view.
+  for (bool used : {false, true}) {
+    const MapShape shape{127, 61, 7, 3, 8, 4, used};
+    auto writes = writePattern(shape);
+    writes.push_back({0.6137f, 0.2719f, 0.2f, 29.3f / 127, 13.1f / 61,
+                      0.19f / 127, -0.27f / 61, 0, -D3D12_FLOAT32_MAX, false});
+    runCompute(c, used ? "cs_aniso16_window_used" : "cs_aniso16_window_minmip", shape, 6,
+               {1, 5, 1, 2, 0.25f}, writes);
+  }
   for (int sh : {0, 1, 4, 5})
     for (UINT si : {1u, 2u, 4u}) {
       const std::string base = std::string(shape_names[sh]) + "_" + sampler_names[si];

@@ -12,6 +12,8 @@
 
 namespace d3dalloy {
 
+class Atomic64PhaseCache;
+
 class MTLD3D12WorkGraph final : public MTLD3D12DeviceChild<ID3D12StateObject, ID3D12StateObjectProperties1,
                                                        ID3D12WorkGraphProperties> {
 public:
@@ -138,13 +140,16 @@ HRESULT CreateWorkGraphStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJ
                                  ID3D12StateObject *parent, REFIID riid, void **object);
 bool IsWorkGraphCollection(const D3D12_STATE_OBJECT_DESC *desc);
 // Queue-owned texture transfers and scratch survive every native graph buffer.
-// Callbacks run under the executor admission, without a nested queue commit.
+// begin/end run under the executor admission, without a nested queue commit.
+// needs_publication only inspects retained descriptor/view metadata at Execute.
 struct WorkGraphTexturePublisher {
+  std::function<bool(std::span<const StandardSwizzleTableUse>,
+      std::span<const StandardSwizzleTableUse>)> needs_publication;
   std::function<HRESULT(WMT::MTL4CommandBuffer, WMT::Fence,
       std::span<const StandardSwizzleTableUse>, std::span<const StandardSwizzleTableUse>)> begin;
   std::function<HRESULT(WMT::MTL4CommandBuffer, WMT::Fence)> end;
 };
 HRESULT ExecuteWorkGraph(MTLD3D12Device *device, WMT::MTL4CommandQueue queue, const WorkGraphDispatch &dispatch,
-                        const WorkGraphTexturePublisher &textures);
+                        const WorkGraphTexturePublisher &textures, std::shared_ptr<Atomic64PhaseCache> &atomic_cache);
 
 } // namespace d3dalloy

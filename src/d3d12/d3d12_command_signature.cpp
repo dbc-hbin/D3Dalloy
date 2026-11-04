@@ -334,6 +334,8 @@ public:
         if (!arg.Constant.Num32BitValuesToSet)
           return E_INVALIDARG;
         UpdateRootArguments = true;
+        root_constant_ranges.push_back({arg.Constant.RootParameterIndex, arg.Constant.DestOffsetIn32BitValues,
+                                        arg.Constant.Num32BitValuesToSet});
         packed_size += sizeof(uint32_t) * arg.Constant.Num32BitValuesToSet;
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
           source << "uint constant_" << i << "_" << j << ";\n";
@@ -633,6 +635,9 @@ public:
       source << "kernel void resolve_graphics_arguments(uint i [[thread_position_in_grid]], "
                 "constant d3dalloy_render_command_data &command_data [[buffer(30)]]) {\n"
                 "if (i >= command_data.max_count) return;\n"
+                "if (command_data.max_count_buffer && i >= *command_data.max_count_buffer) return;\n"
+                "if (command_data.predicate && (command_data.predicate_op ? *command_data.predicate != 0 "
+                ": *command_data.predicate == 0)) return;\n"
                 "device d3d12_arguments &arg = *reinterpret_cast<device d3d12_arguments *>("
                 "command_data.argument_buffer + ulong(i) * " << pDesc->ByteStride << ");\n"
                 "device ulong *roots = command_data.rootsig_qwords ? command_data.rootsig_qwords + "

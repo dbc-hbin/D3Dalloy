@@ -30,8 +30,9 @@
  *        reported attributes, run the hit group's any-hit shader for the candidate,
  *        commit the hit when it is the closest accepted one so far, and return the
  *        acceptance flag to the DXIL body. `reportHit` is a value-producing call
- *        that may run any number of times in one intersection invocation; it is
- *        never a whole-shader return.
+ *        that may run any number of times in one intersection invocation; it
+ *        returns to the body unless an accepted hit ends the search, in which
+ *        case the intersection shader exits immediately.
  *
  * Invocation block layout. Every region a callback touches lives inside the single
  * per-invocation block the tracing shader allocates, because the hardware traversal
@@ -141,7 +142,8 @@ struct RtCandidateControl {
    */
   uint32_t Committed;
   /**
-   * Set once an any-hit shader ended the search. Sticky, because `Decision` is
+   * Set once an any-hit shader or an accepted first-hit report ended the search.
+   * Sticky, because `Decision` is
    * cleared for every new candidate and the end-search must outlive that.
    */
   uint32_t EndSearch;
@@ -366,6 +368,12 @@ llvm::Value *CandidateControlPointer(
 llvm::Value *EmitIntersectionResult(
   llvm::Module &module, const RaytracingExportContext &context, llvm::Value *block,
   llvm::Value *accept, llvm::IRBuilder<> &builder
+);
+
+/** Return the committed procedural result, or end its query-visible body. */
+void EmitIntersectionReturn(
+  llvm::Module &module, const RaytracingExportContext &context, llvm::Value *block,
+  llvm::IRBuilder<> &builder
 );
 
 /* -------------------------------------------------------------------------- */

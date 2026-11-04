@@ -1,6 +1,8 @@
 #include "air_signature.hpp"
 #include "airconv_error.hpp"
 #include "dxbc_converter.hpp"
+#include "capture_frontier.hpp"
+#include "mesh_index_buffer_view.hpp"
 #include "nt/air_builder.hpp"
 #include "nt/dxbc_converter_base.hpp"
 #include "llvm/IR/Constants.h"
@@ -30,8 +32,10 @@ struct TessMeshWorkload {
   int outer_factor_23;
   char inner_factor_23_i;
   char outer_factor_23_i;
-  short patch_index;
+  uint8_t patch_index;
+  uint8_t rank;
 };
+static_assert(sizeof(TessMeshWorkload) == 56);
 
 TessellatorPartitioning
 get_partitioning(SM50ShaderInternal *pHullStage) {
@@ -224,6 +228,7 @@ convert_dxbc_vertex_hull_shader(
   args_get_data<SM50_SHADER_D3D12_PIPELINE_STATS, SM50_SHADER_COMPILATION_ARGUMENT_DATA>(pArgs, &stats);
 
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
+  const bool gpu_index_view = ia_layout && ia_layout->index_buffer_format == SM50_INDEX_BUFFER_FORMAT_GPU_VIEW;
 
   IREffect prologue_vs([](auto) { return std::monostate(); });
   IREffect prologue_hs([](auto) { return std::monostate(); });
@@ -323,8 +328,11 @@ convert_dxbc_vertex_hull_shader(
       .raster_order_group = {}
   });
 
+  const uint32_t frontier_idx = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   uint32_t index_buffer_idx = ~0u;
-  if (is_indexed_draw) {
+  if (gpu_index_view) {
+    index_buffer_idx = define_mesh_index_buffer_view(func_signature, context);
+  } else if (is_indexed_draw) {
     index_buffer_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = {},
         .location_index = SM50_BINDING_INDEX_INDEX_BUFFER,
@@ -396,12 +404,20 @@ convert_dxbc_vertex_hull_shader(
     auto active = llvm::BasicBlock::Create(context, "active_vertex", function);
 
     auto threadgroup_position_in_grid = function->getArg(tg_id_idx);
+    auto group_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)0);
+    instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
+    if (frontier_idx != ~0u) {
+      auto *frontier = function->getArg(frontier_idx);
+      group_id = builder.CreateAdd(group_id, load_capture_frontier(
+          builder, frontier, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, object_group_base)));
+      instance_id = builder.CreateAdd(instance_id, load_capture_frontier(
+          builder, frontier, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, instance_base)));
+    }
     batched_patch_start = builder.CreateMul(
-        builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)0),
+        group_id,
         builder.getInt32(32 / threads_per_patch)
     );
     patch_id = builder.CreateAdd(batched_patch_start, patch_offset_in_group);
-    instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
     auto control_point_index = builder.CreateAdd(
         builder.CreateMul(patch_id, builder.getInt32(pHullStage->input_control_point_count)), control_point_id_in_patch
     );
@@ -461,7 +477,17 @@ convert_dxbc_vertex_hull_shader(
       increment_pipeline_statistics(builder, air, function, stats_arg, 4); // VSInvocations
     }
 
-    if (index_buffer_idx != ~0u) {
+    if (gpu_index_view) {
+      auto start_index = builder.CreateExtractValue(draw_arguments, 2);
+      if (frontier_idx != ~0u) {
+        auto *view = function->getArg(index_buffer_idx);
+        auto *words = builder.CreateBitCast(view, types._int->getPointerTo(
+            llvm::cast<llvm::PointerType>(view->getType())->getAddressSpace()));
+        start_index = builder.CreateLoad(types._int, builder.CreateConstGEP1_32(types._int, words, 4));
+      }
+      resource_map.vertex_id = load_mesh_index_buffer_view(
+          builder, function->getArg(index_buffer_idx), builder.CreateAdd(start_index, control_point_index));
+    } else if (index_buffer_idx != ~0u) {
       auto start_index = builder.CreateExtractValue(draw_arguments, 2);
       auto index_buffer = function->getArg(index_buffer_idx);
       auto index_buffer_element_type = index_buffer->getType()->getNonOpaquePointerElementType();
@@ -993,6 +1019,7 @@ convert_dxbc_tesselator_domain_shader(
     }
   }
 
+  const uint32_t frontier_idx = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   if (!capture && pShaderInternal->clip_distance_scalars.size() > 0) {
     func_signature.DefineMeshVertexOutput(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
@@ -1055,6 +1082,14 @@ convert_dxbc_tesselator_domain_shader(
   auto patch_index = dxbc.DomainGetPatchIndex(workload_index, data);
 
   resource_map.patch_id = builder.CreateAdd(batched_patch_start, patch_index);
+  llvm::Value *frontier_slot = nullptr;
+  if (frontier_idx != ~0u) {
+    auto *first_patch = load_capture_frontier(builder, function->getArg(frontier_idx),
+        offsetof(SM50_CAPTURE_FRONTIER_CONTROL, first_patch));
+    frontier_slot = builder.CreateAdd(
+        builder.CreateMul(builder.CreateSub(resource_map.patch_id, first_patch), builder.getInt32(max_workload_count)),
+        dxbc.DomainGetWorkloadRank(workload_index, data));
+  }
   llvm::Value *so_key = nullptr, *so_valid = nullptr, *so_base = nullptr, *so_count = nullptr;
   if (so) {
     auto *control = function->getArg(so_control_idx);
@@ -1066,6 +1101,8 @@ convert_dxbc_tesselator_domain_shader(
     so_key = builder.CreateAdd(builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, patch_count),
         resource_map.patch_id), builder.getInt32(max_workload_count)),
         dxbc.DomainGetWorkloadRank(workload_index, data));
+    if (frontier_slot)
+      so_key = frontier_slot;
     so_count = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(
         types._int, control, offsetof(SM50_SO_CAPTURE_CONTROL, record_count) / 4));
     so_valid = builder.CreateICmpULT(so_key, so_count);
@@ -1080,10 +1117,16 @@ convert_dxbc_tesselator_domain_shader(
         builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, patch_count), resource_map.patch_id),
                           builder.getInt32(max_workload_count)),
         dxbc.DomainGetWorkloadRank(workload_index, data));
+    auto *valid = builder.CreateICmpULT(resource_map.patch_id, patch_count);
+    if (frontier_slot) {
+      slot = frontier_slot;
+      valid = builder.CreateICmpULT(slot, load_capture_frontier(builder, function->getArg(frontier_idx),
+          offsetof(SM50_CAPTURE_FRONTIER_CONTROL, local_key_count)));
+    }
     auto marker = module.getOrInsertFunction("d3dalloy.msaa.mesh.slot",
         llvm::FunctionType::get(builder.getVoidTy(), {types._int}, false));
     builder.CreateCall(marker, {builder.CreateSelect(
-        builder.CreateICmpULT(resource_map.patch_id, patch_count), slot, builder.getInt32(~0u))});
+        valid, slot, builder.getInt32(~0u))});
   }
 
   /* TS->GS capture slot (tsgs-design §1): s = (instance * patch_count + patch_id) * W + rank. */
@@ -1107,6 +1150,8 @@ convert_dxbc_tesselator_domain_shader(
         ),
         rank
     );
+    if (frontier_slot)
+      capture_slot = frontier_slot;
     capture_valid = builder.CreateICmpULT(capture_slot, slot_count);
     capture_scratch = function->getArg(capture_scratch_idx);
     // A = align_up(slot_count, 4); B = A + slot_count * V * R * 4
@@ -1298,9 +1343,8 @@ convert_dxbc_tesselator_domain_shader(
 
   builder.SetInsertPoint(generate_primitive_pre);
   if (so) air.CreateBarrier(llvm::air::MemFlags::Device);
-  builder.CreateCondBr(
-      builder.CreateICmp(llvm::CmpInst::ICMP_EQ, thread_index, builder.getInt32(0)), generate_primitive, real_return
-  );
+  auto *leader = builder.CreateICmpEQ(thread_index, builder.getInt32(0));
+  builder.CreateBr(generate_primitive);
   builder.SetInsertPoint(generate_primitive);
   llvm::Value *so_generated_primitives = nullptr;
   if (so) {
@@ -1312,15 +1356,16 @@ convert_dxbc_tesselator_domain_shader(
     auto *scratch = function->getArg(so_scratch_idx);
     auto *indices = builder.CreateGEP(types._int, scratch, {builder.CreateAdd(so_base,
         builder.getInt64(uint64_t(so_expanded + mesh_max_vertices) * so_stride))});
-    auto *count = dxbc.DomainGeneratePrimitivesCapture(workload_index, data, get_output_primitive(pHullStage), indices);
+    auto *count = dxbc.DomainGeneratePrimitivesCapture(workload_index, data, get_output_primitive(pHullStage), indices, thread_index);
+    air.CreateBarrier(llvm::air::MemFlags::Device);
     auto *vertices = builder.CreateMul(count, builder.getInt32(primitive_vertices));
     auto *head = builder.GetInsertBlock();
     auto *loop = llvm::BasicBlock::Create(context, "so_expand", function);
     auto *end = llvm::BasicBlock::Create(context, "so_expand_end", function);
-    builder.CreateCondBr(builder.CreateICmpUGT(vertices, builder.getInt32(0)), loop, end);
+    builder.CreateCondBr(builder.CreateICmpULT(thread_index, vertices), loop, end);
     builder.SetInsertPoint(loop);
     auto *v = builder.CreatePHI(types._int, 2);
-    v->addIncoming(builder.getInt32(0), head);
+    v->addIncoming(thread_index, head);
     auto *index = builder.CreateLoad(types._int, builder.CreateGEP(types._int, indices, {v}));
     air.CreateSetMeshIndex(v, index);
     auto *source = builder.CreateAdd(so_base, builder.CreateMul(builder.CreateZExt(
@@ -1333,10 +1378,13 @@ convert_dxbc_tesselator_domain_shader(
           {builder.CreateAdd(dest, builder.getInt64(c))}));
     builder.CreateStore(builder.CreateURem(v, builder.getInt32(primitive_vertices)), builder.CreateGEP(types._int,
         scratch, {builder.CreateAdd(dest, builder.getInt64(so->record_dwords))}));
-    auto *next = builder.CreateAdd(v, builder.getInt32(1));
+    auto *next = builder.CreateAdd(v, builder.getInt32(32));
     v->addIncoming(next, loop);
     builder.CreateCondBr(builder.CreateICmpULT(next, vertices), loop, end);
     builder.SetInsertPoint(end);
+    auto *publish = llvm::BasicBlock::Create(context, "so_publish", function);
+    builder.CreateCondBr(leader, publish, real_return);
+    builder.SetInsertPoint(publish);
     auto *header = builder.CreateAdd(builder.CreateMul(builder.CreateZExt(so_count, builder.getInt64Ty()),
         builder.getInt64(uint64_t(so_records) * so_stride)), builder.CreateZExt(so_key, builder.getInt64Ty()));
     builder.CreateStore(vertices, builder.CreateGEP(types._int, scratch, {header}));
@@ -1344,8 +1392,11 @@ convert_dxbc_tesselator_domain_shader(
     builder.SetInsertPoint(done);
     auto *generated = builder.CreatePHI(types._int, 2);
     generated->addIncoming(builder.getInt32(0), empty);
-    generated->addIncoming(count, end);
+    generated->addIncoming(count, publish);
     so_generated_primitives = generated;
+    auto *finish = llvm::BasicBlock::Create(context, "so_finish", function);
+    builder.CreateCondBr(leader, finish, real_return);
+    builder.SetInsertPoint(finish);
     air.CreateSetMeshPrimitiveCount(generated);
   }
 
@@ -1355,7 +1406,10 @@ convert_dxbc_tesselator_domain_shader(
     builder.CreateCondBr(capture_valid, capture_primitive, real_return);
     builder.SetInsertPoint(capture_primitive);
     auto indices = builder.CreateGEP(types._int, capture_scratch, {capture_index_base});
-    auto count = dxbc.DomainGeneratePrimitivesCapture(workload_index, data, get_output_primitive(pHullStage), indices);
+    auto count = dxbc.DomainGeneratePrimitivesCapture(workload_index, data, get_output_primitive(pHullStage), indices, thread_index);
+    auto *publish = llvm::BasicBlock::Create(context, "capture_publish", function);
+    builder.CreateCondBr(leader, publish, real_return);
+    builder.SetInsertPoint(publish);
     builder.CreateStore(count, builder.CreateGEP(types._int, capture_scratch, {capture_slot}));
     builder.CreateBr(real_return);
     builder.SetInsertPoint(real_return);
@@ -1366,7 +1420,12 @@ convert_dxbc_tesselator_domain_shader(
   }
 
   auto generated_primitives = so ? so_generated_primitives
-      : dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage));
+      : dxbc.DomainGeneratePrimitives(workload_index, data, get_output_primitive(pHullStage), thread_index);
+  if (!so && (statistics_key || (stats_arg != ~0u && !rasterization_disabled))) {
+    auto *statistics = llvm::BasicBlock::Create(context, "primitive_statistics", function);
+    builder.CreateCondBr(leader, statistics, real_return);
+    builder.SetInsertPoint(statistics);
+  }
   if (statistics_key) {
     /* PRIMITIVE_CLAIM key of primitive p: (patch id, draw instance, workload * P + p + 1); the HS object stores the
      * instance in payload field 4. */

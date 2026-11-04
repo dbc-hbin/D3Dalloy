@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 49
+#define AIRCONV_VERSION 57
 
 #ifdef __cplusplus
 #include <string>
@@ -36,6 +36,8 @@ enum SM50_BINDING_INDEX: uint32_t {
   SM50_BINDING_INDEX_TESS_CAPTURE = 8,
   SM50_BINDING_INDEX_TESS_CAPTURE_LIST = 9,
   SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL = 10,
+  /* D3D12 bounded capture: original application coordinates and private local record coordinates. */
+  SM50_BINDING_INDEX_CAPTURE_FRONTIER = 11,
   /* Fragment stage, SM50_SHADER_D3D12_PIPELINE_STATS_PRIMITIVE_CLAIM: SM50_STATISTICS_CLAIM_HEADER and the
    * per-pixel key entries (raster_order_group(0)). */
   SM50_BINDING_INDEX_STATISTICS_CLAIM = 7,
@@ -404,6 +406,8 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   /* Ordinary pixel-frequency native PS, non-full SampleMask: uint function constant index0.
    * Coverage signature is retained; captured/sample-frequency paths must not request this. */
   SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT = 45,
+  /* Header-only D3D12 variant: bind SM50_CAPTURE_FRONTIER_CONTROL at buffer 11. */
+  SM50_SHADER_D3D12_CAPTURE_FRONTIER = 46,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -508,8 +512,43 @@ struct SM50_SHADER_D3D12_GS_STREAMS_DATA {
   struct SM50_GS_STREAM_CAPTURE streams[4];
 };
 
+/* GPU-selected IB control. The first 16 bytes match the application's IBV;
+ * assembly kernels additionally use first_index, while object/vertex shaders
+ * add their draw's StartIndexLocation before the guarded view fetch. */
+struct SM50_GPU_INDEX_BUFFER_VIEW {
+  uint64_t address;
+  uint32_t size_in_bytes;
+  uint32_t format;
+  uint32_t first_index;
+  uint32_t padding[3];
+};
+
+/* One bounded producer/consumer step, always within one logical draw instance.
+ * The application argument buffer and the recorded templates remain immutable.
+ * first_position is the first newly shaded IA ordinal; carried records precede
+ * producer_record_base and are never shaded again. Native shader start bases are
+ * supplied separately by the resolved draw/SO arguments, never by these offsets.
+ * object_group_base is a GS object-warp or HS patch-group base. TS->GS uses
+ * child_primitive_first within its bounded parent list and keeps primitive_prefix
+ * as the original per-instance flat primitive rank. Local record keys never
+ * flatten the original draw instance into the bounded scratch allocation. */
+struct SM50_CAPTURE_FRONTIER_CONTROL {
+  uint32_t object_group_base;
+  uint32_t instance_base;
+  uint32_t first_position;
+  uint32_t local_key_count;
+  uint64_t primitive_prefix;
+  uint32_t child_primitive_first;
+  uint32_t producer_record_base;
+  uint32_t producer_count;
+  uint32_t local_primitive_count;
+  uint32_t first_patch;
+  uint32_t reserved[5];
+};
+
 /* Index size 0 preserves native vertex IDs; 2/4 pulls a R16/R32 application
- * index. index_first is in 16-bit words relative to the bound index buffer.
+ * index. Size 8 reads SM50_GPU_INDEX_BUFFER_VIEW instead of raw index storage.
+ * index_first is in 16-bit words for size 2/4, or in indices for size 8.
  * Native non-indexed draws start at vertex 0; BaseVertexLocation affects
  * vertex fetching, never SV_VertexID. */
 struct SM50_INDEX_PULL_CONTROL {
@@ -524,8 +563,8 @@ struct SM50_SO_CAPTURE_CONTROL {
   uint32_t positions_per_instance;
   uint32_t first_position;
   uint32_t record_count;
-  uint32_t index_size;  /* 0: non-indexed, 2: R16_UINT, 4: R32_UINT */
-  uint32_t index_first; /* first index, in 16-bit words from the bound index buffer */
+  uint32_t index_size;  /* 0: non-indexed, 2/4: raw R16/R32, 8: SM50_GPU_INDEX_BUFFER_VIEW */
+  uint32_t index_first; /* 16-bit words for raw storage; StartIndexLocation for a GPU view */
   int32_t base_vertex;  /* BaseVertexLocation of an indexed draw */
   uint32_t padding[2];
 };
@@ -551,9 +590,16 @@ enum SM50_MSAA_VARIANT {
   SM50_MSAA_SAMPLE_APP = 6,
   SM50_MSAA_OBJECT_CAPTURE = 7,
   SM50_MSAA_OBJECT_REPLAY = 8,
+  /* Private native-return transport for bounded SO; replay preserves the
+   * original vertex return and linkage without MSAA helper varyings. */
+  SM50_CAPTURE_VERTEX_NATIVE = 9,
+  SM50_REPLAY_VERTEX_NATIVE = 10,
   /* OR into pixel roles only: execute application fragments on a physical 8x8
    * surface, retaining logical helper state and captured sample outputs. */
   SM50_MSAA_ATOMIC_HELPERS = 0x100,
+  /* OR with captured vertex replay and fragment roles. Coverage is an array texture and the GPU supplies
+   * the tile control. Capture and exact native transport roles retain their original ABI. */
+  SM50_MSAA_GPU_TILE_TASKS = 0x200,
 };
 
 enum SM50_MSAA_LINE_MODE {
@@ -594,6 +640,15 @@ struct SM50_MSAA_TILE_CONTROL {
   uint32_t programmable_sample_count;
   float programmable_sample_positions[8][2];
   uint32_t depth_bounds_enabled;
+  /* GPU task route only. Appended so every legacy tile-control offset remains stable. */
+  uint32_t target_layer;
+  uint32_t render_width;
+  uint32_t render_height;
+  uint32_t scissor_left;
+  uint32_t scissor_top;
+  uint32_t scissor_right;
+  uint32_t scissor_bottom;
+  uint32_t task_active;
 };
 
 struct SM50_MSAA_PIXEL_LAYOUT {
@@ -635,6 +690,7 @@ enum SM50_MSAA_PIXEL_FLAG {
   /* Compiled with SM50_SHADER_D3D12_COARSE_SHADING and eligible: tile.shading_rate is honored. */
   SM50_MSAA_PIXEL_COARSE = 1 << 8,
   SM50_MSAA_PIXEL_ATOMIC_HELPERS = 1 << 9,
+  SM50_MSAA_PIXEL_GPU_TILE_TASKS = 1 << 10,
 };
 
 struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
@@ -675,6 +731,14 @@ struct SM50_MSAA_VERTEX_LAYOUT {
   uint32_t primitive_id_offset_dwords; /* ~0u when the stage does not export a primitive ID. */
   uint32_t spill_count; /* Whole user fields reconstructed from capture rather than native interpolants. */
   struct SM50_MSAA_CAPTURED_USER users[128];
+  uint32_t flags;
+  uint32_t clip_distance_count; /* Original native clip planes; task replay preserves them unchanged. */
+};
+
+enum SM50_MSAA_VERTEX_FLAG {
+  /* Captured replay supports GPU-generated task batches with the original native geometry. Task scissoring
+   * does not add clip planes or wireframe edges, so all original native clip distances remain available. */
+  SM50_MSAA_VERTEX_GPU_TILE_TASKS_SUPPORTED = 1 << 0,
 };
 
 struct SM50_SHADER_D3D12_MSAA_VERTEX_DATA {
@@ -712,7 +776,7 @@ struct SM50_MSAA_MESH_CONTROL {
 struct SM50_SHADER_D3D12_MSAA_MESH_DATA {
   void *next;
   enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
-  uint32_t variant; /* SM50_MSAA_VERTEX_CAPTURE or SM50_MSAA_VERTEX_REPLAY */
+  uint32_t variant; /* MSAA vertex roles 4/5, or exact native transport roles 9/10. */
   struct SM50_MSAA_VERTEX_LAYOUT *layout_out;
   struct SM50_MSAA_MESH_LAYOUT *mesh_layout_out;
   uint32_t line_mode;
@@ -731,8 +795,13 @@ static_assert(sizeof(void *) != 8 || (sizeof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA) 
   offsetof(SM50_SHADER_D3D12_MSAA_PIXEL_DATA, depth_bounds_emulated) == 89));
 static_assert(sizeof(SM50_MSAA_PIXEL_LAYOUT) == 76 &&
   offsetof(SM50_MSAA_PIXEL_LAYOUT, depth_bounds_mask_dword) == 72);
-static_assert(sizeof(SM50_MSAA_TILE_CONTROL) == 140 &&
-  offsetof(SM50_MSAA_TILE_CONTROL, depth_bounds_enabled) == 136);
+static_assert(sizeof(SM50_MSAA_TILE_CONTROL) == 172 &&
+  offsetof(SM50_MSAA_TILE_CONTROL, depth_bounds_enabled) == 136 &&
+  offsetof(SM50_MSAA_TILE_CONTROL, target_layer) == 140 &&
+  offsetof(SM50_MSAA_TILE_CONTROL, task_active) == 168);
+static_assert(sizeof(SM50_MSAA_VERTEX_LAYOUT) == 3120 &&
+  offsetof(SM50_MSAA_VERTEX_LAYOUT, flags) == 3112 &&
+  offsetof(SM50_MSAA_VERTEX_LAYOUT, clip_distance_count) == 3116);
 static_assert(sizeof(void *) != 4 || (sizeof(SM50_SHADER_D3D12_MSAA_VERTEX_DATA) == 32 &&
   offsetof(SM50_SHADER_D3D12_MSAA_VERTEX_DATA, front_counter_clockwise) == 29));
 static_assert(sizeof(void *) != 4 || (sizeof(SM50_SHADER_D3D12_MSAA_MESH_DATA) == 40 &&
@@ -877,6 +946,8 @@ enum SM50_INDEX_BUFFER_FORMAT {
   SM50_INDEX_BUFFER_FORMAT_NONE = 0,
   SM50_INDEX_BUFFER_FORMAT_UINT16 = 1,
   SM50_INDEX_BUFFER_FORMAT_UINT32 = 2,
+  /* Object-stage binding 3 is a GPU-produced {uint64 address, uint32 size, uint32 DXGI format} view. */
+  SM50_INDEX_BUFFER_FORMAT_GPU_VIEW = 3,
 };
 
 struct SM50_SHADER_IA_INPUT_LAYOUT_DATA {

@@ -36,6 +36,9 @@ struct d3dalloy_as_prepass_params {
   /* 32-bit version token this build publishes into live_mirror[live_mirror_slot]. */
   uint32_t version_token;
   uint32_t live_mirror_slot;
+  /* WMTASPrepassWriteShadow and header bytes 16..63; matches WMTASPrepassInfo. */
+  uint32_t flags;
+  uint64_t shadow_metadata[6];
 };
 
 /* Returned objects have +1 ownership. All input Metal handles are borrowed; descriptors retain

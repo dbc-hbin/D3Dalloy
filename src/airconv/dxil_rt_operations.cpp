@@ -78,14 +78,12 @@
  * the lower bit, AIR puts *front* facing at 1). Constant flag operands are folded
  * at compile time, so a shader that passes a literal emits no arithmetic at all.
  *
- *   ACCEPT_FIRST_HIT_AND_END_SEARCH is deliberately NOT mapped onto
- *   accept_any_intersection. D3D12 runs the any-hit shader for every candidate
- *   even with that flag, and only the IgnoreHit exception lets the search
- *   continue; `accept_any_intersection` would instead let the traversal commit the
- *   first candidate *without* running the per-candidate hook at all. The flag is
- *   expressed by the per-candidate callback's `[[continue_search]]` result (see
- *   dxil_rt_callbacks.cpp), so operand 19 is pinned false and the D3D12 exception
- *   is decided where the any-hit shader actually runs.
+ *   ACCEPT_FIRST_HIT_AND_END_SEARCH maps to accept_any_intersection. Public MSL
+ *   defines this as ending on a committed hit; it does not bypass a rejecting
+ *   intersection callback (MSL 2026-06-04, section 5.2.3.8). This also covers
+ *   opaque triangles which invoke no callback. A procedural ReportHit must end
+ *   its intersection shader immediately after accepting the first report, so
+ *   dxil_rt_callbacks.cpp handles that earlier boundary separately.
  *
  *   Micromap-enabled pipelines use explicit query traversal and the shared
  *   classifier in dxil_rt_omm.hpp; FORCE_OMM_2_STATE resolves unknown states
@@ -1981,7 +1979,6 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
    * survive the erasure of the call that named it.
    */
   Value *payload_operand = call.getArgOperand(15);
-  copyPayloadInto(builder, child, payload_operand);
   /*
    * The shaders this trace runs are visible functions, so the state every stage of
    * the pipeline shares - the dispatch constants' address, the two function tables
@@ -2004,8 +2001,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
    * Visible shader calls still receive the user payload within this block.
    */
 
-  /* D3D12 ray flags -> traversal configuration. See the file comment for the bit
-   * mapping and for why ACCEPT_FIRST_HIT_AND_END_SEARCH is not lowered here. */
+  /* D3D12 ray flags -> traversal configuration. */
   Value *forced_opacity = flagField(builder, ray_flags, 0);
   Value *triangle_cull = triangleCullMode(builder, ray_flags);
   Value *opacity_cull = flagField(builder, ray_flags, 6);
@@ -2072,6 +2068,9 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
    * decision word is cleared so a stale decision cannot be mistaken for this one's.
    */
   storeCandidateWord(builder, child, kRtCandidateDecision, builder.getInt32(kRtCandidateNone));
+  storeCandidateWord(builder, child, kRtCandidateEndSearch, builder.getInt32(0));
+  storeCandidateWord(builder, child, kRtCandidateCommitted, builder.getInt32(0));
+  storeCandidateField(builder, child, kRtCandidateDistance, t_max);
   storeCandidateWord(builder, child, kRtCandidateHitGroupBase, contribution);
   storeCandidateWord(builder, child, kRtCandidateGeometryMultiplier, geometry_multiplier);
   /*
@@ -2121,6 +2120,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
 
   Error failure = Error::success();
   auto emitTraversal = [&](IRBuilder<> &b) {
+    copyPayloadInto(b, child, payload_operand);
     auto issueTraversal = [&](IRBuilder<> &tb) -> Value * {
       if (context.query_callbacks || (context.pipeline_flags & 0x400))
         return emitQueryTraversal(tb, child, acceleration_structure, origin, direction, t_min, t_max,
@@ -2143,8 +2143,8 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
        tb.getInt32(kNoCurveBasis),
        tb.getInt32(0),
        tb.getInt1(false),
-       /* accept_any_intersection is pinned false: see the file comment. */
-       tb.getInt1(false)}
+       /* Rejected callbacks do not commit and therefore do not end the search. */
+       tb.CreateICmpNE(tb.CreateAnd(ray_flags, tb.getInt32(4)), tb.getInt32(0))}
       );
     };
     /*
@@ -2163,200 +2163,138 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
       : issueTraversal(b);
 
     Value *type = b.CreateExtractValue(result, 0);
-    Value *distance = b.CreateExtractValue(result, 1);
-    Value *primitive = b.CreateExtractValue(result, 2);
-    Value *geometry = b.CreateExtractValue(result, 3);
-    Value *instance_index = b.CreateExtractValue(result, 5);
-    Value *instance_id = b.CreateExtractValue(result, 6);
-    Value *barycentrics = b.CreateExtractValue(result, 7);
-    Value *front_facing = b.CreateExtractValue(result, 8);
-    Value *is_triangle = b.CreateICmpEQ(type, b.getInt32(kIntersectionTypeTriangle));
-    /* A traversal result that names no intersection is a miss. */
     Value *hit = b.CreateICmpNE(type, b.getInt32(kIntersectionTypeNone));
 
-    /* A miss observes RayTCurrent() == the ray's TMax. */
-    storeHitState(b, child, kRtHitTCurrent, b.CreateSelect(hit, distance, t_max));
-    storeHitState(b, child, kRtHitPrimitiveIndex, primitive);
-    storeHitState(b, child, kRtHitInstanceID, instance_id);
-    storeHitState(b, child, kRtHitInstanceIndex, instance_index);
-    storeHitState(b, child, kRtHitGeometryIndex, geometry);
-    /*
-     * HitKind of the hit this trace committed. A fixed-function triangle hit reports
-     * it from its facing. A procedural hit's kind is the `hitKind` operand of the
-     * `dx.op.reportHit` that won: the intersection shader the traversal called ran on
-     * this very block while the traversal was still running, so the kind the callback
-     * layer recorded in this candidate's control area *is* this invocation's. The
-     * traversal result carries no kind for a procedural hit, so reading the committed
-     * one is the only correct source - selecting 0 there would make a closest-hit
-     * shader read a value no shader ever reported.
-     */
-    Value *triangle_kind = b.CreateSelect(
-      front_facing, b.getInt32(kHitKindTriangleFrontFace),
-      b.getInt32(kHitKindTriangleBackFace)
-    );
-    Value *committed_kind = loadCandidateWord(b, child, kRtCandidateHitKind);
-    if (committed_kind)
-      storeHitState(
-        b, child, kRtHitKind, b.CreateSelect(is_triangle, triangle_kind, committed_kind)
-      );
-    else
-      emitConditional(b, is_triangle, "rt.hitkind", [&](IRBuilder<> &inner) {
-        storeHitState(inner, child, kRtHitKind, triangle_kind);
+    // Only the selected continuation reads an SBT record. A skipped closest-hit
+    // keeps any-hit payload writes, but needs no final hit state or hit-table lookup.
+    auto runContinuation = [&](IRBuilder<> &g, Value *record, Value *local_entry) {
+      storeFrameWord(g, child, offsetof(SM50_RT_FRAME, RecordIndex), record);
+      storeFrameField(g, child, offsetof(SM50_RT_FRAME, LocalRootEntry), local_entry);
+      if (!deferred)
+        emitConditional(g, g.CreateICmpNE(record, g.getInt32(kRtRecordIndexNone)), "rt.run",
+                        [&](IRBuilder<> &inner) {
+          if (!callVisibleFunction(inner, child, record, next_depth))
+            failure = createError("dxil: dx.op.traceRay could not reach the visible function table");
+        });
+    };
+    auto prepareHit = [&](IRBuilder<> &g) {
+      Value *distance = g.CreateExtractValue(result, 1);
+      Value *primitive = g.CreateExtractValue(result, 2);
+      Value *geometry = g.CreateExtractValue(result, 3);
+      Value *instance_index = g.CreateExtractValue(result, 5);
+      Value *instance_id = g.CreateExtractValue(result, 6);
+      Value *barycentrics = g.CreateExtractValue(result, 7);
+      Value *front_facing = g.CreateExtractValue(result, 8);
+      Value *is_triangle = g.CreateICmpEQ(type, g.getInt32(kIntersectionTypeTriangle));
+      storeHitState(g, child, kRtHitTCurrent, distance);
+      storeHitState(g, child, kRtHitPrimitiveIndex, primitive);
+      storeHitState(g, child, kRtHitInstanceID, instance_id);
+      storeHitState(g, child, kRtHitInstanceIndex, instance_index);
+      storeHitState(g, child, kRtHitGeometryIndex, geometry);
+      // The native result has no procedural HitKind; the winning ReportHit owns it.
+      Value *triangle_kind = g.CreateSelect(front_facing, g.getInt32(kHitKindTriangleFrontFace),
+                                           g.getInt32(kHitKindTriangleBackFace));
+      Value *kind = emitGuardedValue(g, g.CreateNot(is_triangle), triangle_kind, "rt.procedural.kind",
+                                    [&](IRBuilder<> &inner) -> Value * {
+        return loadCandidateWord(inner, child, kRtCandidateHitKind);
       });
-    storeHitState(b, child, kRtHitBarycentric, barycentrics);
-    storeHitState(b, child, kRtHitFrontFace, b.CreateZExt(front_facing, b.getInt32Ty()));
-    if (deferred && layout.attribute_size >= 8)
-      emitConditional(b, is_triangle, "rt.hitobject.barycentrics", [&](IRBuilder<> &g) {
-        Value *attributes = g.CreateGEP(g.getInt8Ty(), bytePointerOf(g, child), g.getInt32(layout.attribute));
-        g.CreateAlignedStore(barycentrics, g.CreateBitCast(attributes, barycentrics->getType()->getPointerTo()), Align(1));
-      });
-    /*
-     * The committed instance's transforms, and the ray in its object space. A miss leaves
-     * them unspecified in D3D12 (no shader can read them), so they are stored unconditionally.
-     */
-    Value *object_origin = nullptr, *object_direction = nullptr;
-    for (unsigned column = 0; column < 4; ++column) {
-      Value *w2o = b.CreateExtractValue(result, 9 + column);
-      Value *o2w = b.CreateExtractValue(result, 13 + column);
-      storeHitState(b, child, kRtHitObjectToWorld + column * 12, o2w);
-      storeHitState(b, child, kRtHitWorldToObject + column * 12, w2o);
-      /* object = W2O * (world, 1) for the origin and W2O * (world, 0) for the direction. */
-      if (column < 3) {
-        Value *origin_term = b.CreateFMul(w2o, b.CreateVectorSplat(3, b.CreateExtractElement(origin, uint64_t(column))));
-        Value *direction_term = b.CreateFMul(w2o, b.CreateVectorSplat(3, b.CreateExtractElement(direction, uint64_t(column))));
-        object_origin = object_origin ? b.CreateFAdd(object_origin, origin_term) : origin_term;
-        object_direction = object_direction ? b.CreateFAdd(object_direction, direction_term) : direction_term;
-      } else {
-        object_origin = b.CreateFAdd(object_origin, w2o);
+      storeHitState(g, child, kRtHitKind, kind);
+      storeHitState(g, child, kRtHitBarycentric, barycentrics);
+      storeHitState(g, child, kRtHitFrontFace, g.CreateZExt(front_facing, g.getInt32Ty()));
+      if (deferred && layout.attribute_size >= 8)
+        emitConditional(g, is_triangle, "rt.hitobject.barycentrics", [&](IRBuilder<> &inner) {
+          Value *attributes = inner.CreateGEP(inner.getInt8Ty(), bytePointerOf(inner, child),
+                                              inner.getInt32(layout.attribute));
+          inner.CreateAlignedStore(barycentrics,
+            inner.CreateBitCast(attributes, barycentrics->getType()->getPointerTo()), Align(1));
+        });
+      // Misses and ordinary skip-closest-hit rays never publish these 120 bytes.
+      Value *object_origin = nullptr, *object_direction = nullptr;
+      for (unsigned column = 0; column < 4; ++column) {
+        Value *w2o = g.CreateExtractValue(result, 9 + column);
+        Value *o2w = g.CreateExtractValue(result, 13 + column);
+        storeHitState(g, child, kRtHitObjectToWorld + column * 12, o2w);
+        storeHitState(g, child, kRtHitWorldToObject + column * 12, w2o);
+        if (column < 3) {
+          Value *origin_term = g.CreateFMul(w2o,
+            g.CreateVectorSplat(3, g.CreateExtractElement(origin, uint64_t(column))));
+          Value *direction_term = g.CreateFMul(w2o,
+            g.CreateVectorSplat(3, g.CreateExtractElement(direction, uint64_t(column))));
+          object_origin = object_origin ? g.CreateFAdd(object_origin, origin_term) : origin_term;
+          object_direction = object_direction ? g.CreateFAdd(object_direction, direction_term) : direction_term;
+        } else {
+          object_origin = g.CreateFAdd(object_origin, w2o);
+        }
       }
-    }
-    storeHitState(b, child, kRtHitObjectOrigin, object_origin);
-    storeHitState(b, child, kRtHitObjectDirection, object_direction);
+      storeHitState(g, child, kRtHitObjectOrigin, object_origin);
+      storeHitState(g, child, kRtHitObjectDirection, object_direction);
 
-    /*
-     * D3D12 selects the hit group as
-     *   InstanceContributionToHitGroupIndex + RayContributionToHitGroupIndex
-     *     + GeometryIndex * MultiplierForGeometryContributionToHitGroupIndex
-     * and the miss shader by its index in the miss table.
-     *
-     * The instance contribution is the application's per-instance
-     * D3D12_INSTANCE_DESC::InstanceContributionToHitGroupIndex, which Metal has no
-     * instance field for: the runtime's AS prepass writes it into the acceleration
-     * structure's 64 byte header at +8 as a `uint32_t` array indexed by instance
-     * index (rt_as_prepass.metal: `contributions[tid] = contribution`), and that
-     * address is `AccelerationStructureHeader::contributionsAddress`. The header is
-     * the same one the structure itself was loaded through, so it is read from the
-     * trace's own structure, not from a pipeline-wide slot.
-     *
-     * The ray and geometry halves are the trace's own operands. The runtime's
-     * preparation pass then turns the sum into the export index of the record to run.
-     */
-    /* The instance contribution of the traced structure was published into the
-     * frame before the traversal (a per-candidate callback reads it while the
-     * traversal runs), so the hit group index is computed from the frame's own copy
-     * rather than from a second read of the structure. */
-    Value *instance_contribution = loadInstanceContribution(b, child, instance_index);
-    Value *hit_group_index = b.CreateAdd(
-      b.CreateAdd(contribution, b.CreateMul(geometry, geometry_multiplier)),
-      instance_contribution
-    );
-    if (deferred)
-      hit_group_index = b.CreateAnd(hit_group_index, b.getInt32(0x0fffffff));
-    RtShaderRecord hit_lookup, miss_lookup;
-    if (!shaderRecord(b, RtShaderTable::HitGroup, hit_group_index, hit_lookup) ||
-        !shaderRecord(b, RtShaderTable::Miss, miss_index, miss_lookup)) {
+      Value *instance_contribution = loadInstanceContribution(g, child, instance_index);
+      Value *hit_group_index = g.CreateAdd(
+        g.CreateAdd(contribution, g.CreateMul(geometry, geometry_multiplier)), instance_contribution);
+      if (deferred)
+        hit_group_index = g.CreateAnd(hit_group_index, g.getInt32(0x0fffffff));
+      RtShaderRecord lookup;
+      if (!shaderRecord(g, RtShaderTable::HitGroup, hit_group_index, lookup)) {
+        failure = createError("dxil: the raytracing dispatch arguments are not bound");
+        return;
+      }
+      if (!context.hit_group_continuations || !context.hit_group_continuation_count) {
+        failure = createError("dxil: missing hit-group continuation map");
+        return;
+      }
+      // Keep the validated minimum table size: smaller dynamically indexed constant
+      // tables fault the AGX linker with shader validation enabled.
+      constexpr uint32_t kMinContinuationEntries = 8;
+      const uint32_t count = context.hit_group_continuation_count;
+      const uint32_t entries = std::max(count, kMinContinuationEntries);
+      auto *table_type = ArrayType::get(g.getInt32Ty(), entries);
+      GlobalVariable *table = module.getGlobalVariable("d3dalloy.rt.continuations", true);
+      if (!table) {
+        std::vector<uint32_t> indices(context.hit_group_continuations, context.hit_group_continuations + count);
+        indices.resize(entries, kRtRecordIndexNone);
+        table = new GlobalVariable(module, table_type, true, GlobalValue::PrivateLinkage,
+          ConstantDataArray::get(module.getContext(), indices), "d3dalloy.rt.continuations", nullptr,
+          GlobalValue::NotThreadLocal, 2);
+      }
+      Value *record = emitGuardedValue(g, g.CreateICmpULT(lookup.export_index, g.getInt32(count)),
+        g.getInt32(kRtRecordIndexNone), "rt.continuation", [&](IRBuilder<> &inner) -> Value * {
+          return inner.CreateLoad(inner.getInt32Ty(),
+            inner.CreateGEP(table_type, table, {inner.getInt32(0), lookup.export_index}));
+        });
+      if (deferred) {
+        storeFrameField(g, child, layout.block_size, g.getInt32(1));
+        storeFrameField(g, child, layout.block_size + 4, hit_group_index);
+      }
+      runContinuation(g, record, lookup.local_entry);
+    };
+
+    Function *function = b.GetInsertBlock()->getParent();
+    BasicBlock *hit_block = BasicBlock::Create(llvm_context, "rt.selected.hit", function, tail);
+    BasicBlock *miss_block = BasicBlock::Create(llvm_context, "rt.selected.miss", function, tail);
+    BasicBlock *join = BasicBlock::Create(llvm_context, "rt.selected.done", function, tail);
+    b.CreateCondBr(hit, hit_block, miss_block);
+    b.SetInsertPoint(hit_block);
+    if (deferred || (!skip_value && !skip_closest_hit))
+      prepareHit(b);
+    else if (skip_value)
+      emitConditional(b, b.CreateNot(skip_value), "rt.closest.enabled", prepareHit);
+    b.CreateBr(join);
+    b.SetInsertPoint(miss_block);
+    // A miss still invokes its miss shader when SKIP_CLOSEST_HIT_SHADER is set.
+    storeHitState(b, child, kRtHitTCurrent, t_max);
+    RtShaderRecord miss_lookup;
+    if (!shaderRecord(b, RtShaderTable::Miss, miss_index, miss_lookup)) {
       failure = createError("dxil: the raytracing dispatch arguments are not bound");
       return;
     }
-    Value *hit_record = hit_lookup.export_index;
-    Value *miss_record = miss_lookup.export_index;
-    if (!context.hit_group_continuations || !context.hit_group_continuation_count) {
-      failure = createError("dxil: missing hit-group continuation map");
-      return;
-    }
-    /*
-     * The table is padded to at least kMinContinuationEntries with "no record": under
-     * Metal shader validation the AGX linker faults (LinkInfo::initialize, null read) on
-     * a raygen that indexes a 2- or 4-entry addrspace(2) i32 table with a loaded value
-     * and calls through the visible function table (probe:
-     * build/local/p3/dxrstateobj/probes/agxlink: sizes 1, 3, 5..128 link). The guard below still
-     * bounds the index by the real count, so the padding is never read.
-     */
-    constexpr uint32_t kMinContinuationEntries = 8;
-    const uint32_t continuation_entries =
-      std::max<uint32_t>(context.hit_group_continuation_count, kMinContinuationEntries);
-    auto *continuation_type = ArrayType::get(b.getInt32Ty(), continuation_entries);
-    GlobalVariable *continuation_table = module.getGlobalVariable("d3dalloy.rt.continuations", true);
-    if (!continuation_table) {
-      std::vector<uint32_t> indices(context.hit_group_continuations,
-                                    context.hit_group_continuations + context.hit_group_continuation_count);
-      indices.resize(continuation_entries, kRtRecordIndexNone);
-      continuation_table = new GlobalVariable(module, continuation_type, true, GlobalValue::PrivateLinkage,
-        ConstantDataArray::get(module.getContext(), indices), "d3dalloy.rt.continuations", nullptr,
-        GlobalValue::NotThreadLocal, 2);
-    }
-    Value *hit_continuation = emitGuardedValue(b,
-      b.CreateAnd(hit, b.CreateICmpULT(hit_record, b.getInt32(context.hit_group_continuation_count))),
-      b.getInt32(kRtRecordIndexNone), "rt.continuation", [&](IRBuilder<> &inner) -> Value * {
-        return inner.CreateLoad(inner.getInt32Ty(), inner.CreateGEP(continuation_type, continuation_table,
-          {inner.getInt32(0), hit_record}));
-      });
-    Value *record = b.CreateSelect(hit, hit_continuation, miss_record);
-    /* The frame's record index describes the shader about to run, which is only
-     * known now; the depth and the recursion flag were published before the
-     * traversal for the per-candidate callbacks. */
-    storeFrameWord(b, child, offsetof(SM50_RT_FRAME, RecordIndex), record);
-
-    /*
-     * The local root arguments the shader about to run reads: the bytes after the
-     * identifier of the record this trace selected, i.e. the hit group's record
-     * (whose position is `hit_group_index`, the instance contribution included) for
-     * a hit and the miss shader's record for a miss. It is published before the
-     * call because the callee cannot compute it: what it receives is its *export*
-     * index, which is its visible function table slot, and the two differ for every
-     * table but the raygen's. A record that resolved to no export publishes zero,
-     * which the callee's resource lowering reads as "no local root arguments"
-     * rather than as the global ones.
-     */
-    storeFrameField(
-      b, child, offsetof(SM50_RT_FRAME, LocalRootEntry),
-      b.CreateSelect(hit, hit_lookup.local_entry, miss_lookup.local_entry)
-    );
     if (deferred) {
-      storeFrameField(b, child, layout.block_size, b.CreateSelect(hit, b.getInt32(1), b.getInt32(2)));
-      storeFrameField(b, child, layout.block_size + 4, b.CreateSelect(hit,
-        b.CreateAnd(hit_group_index, b.getInt32(0x0fffffff)), b.CreateAnd(miss_index, b.getInt32(0xffff))));
-      copyPayloadBack(b, child, payload_operand);
-      b.CreateBr(tail);
-      return;
+      storeFrameField(b, child, layout.block_size, b.getInt32(2));
+      storeFrameField(b, child, layout.block_size + 4, b.CreateAnd(miss_index, b.getInt32(0xffff)));
     }
-
-    /*
-     * Run the hit group / miss shader, exactly as D3D12 does after the traversal,
-     * with two exceptions the flags and the runtime's record sentinel demand:
-     * a record the runtime could not resolve to an export must be skipped rather
-     * than run (slot 0 of the table is the null entry), and SKIP_CLOSEST_HIT_SHADER
-     * leaves a committed hit without a closest-hit invocation while still letting a
-     * miss run the miss shader.
-     */
-    Value *should_call = b.CreateICmpNE(record, b.getInt32(kRtRecordIndexNone));
-    if (skip_value)
-      should_call = b.CreateAnd(
-        should_call, b.CreateOr(b.CreateNot(hit), b.CreateNot(skip_value))
-      );
-    else if (skip_closest_hit)
-      should_call = b.CreateAnd(should_call, b.CreateNot(hit));
-
-    emitConditional(b, should_call, "rt.run", [&](IRBuilder<> &inner) {
-      if (!callVisibleFunction(inner, child, record, next_depth))
-        failure = createError("dxil: dx.op.traceRay could not reach the visible function table");
-    });
-    /*
-     * The shaders of this trace have written the payload through the child block, so
-     * its bytes are copied back into the object the shader named. This is what makes
-     * the payload observable after the trace returns without the caller's own
-     * payload object ever being shared with a nested trace.
-     */
+    runContinuation(b, miss_lookup.export_index, miss_lookup.local_entry);
+    b.CreateBr(join);
+    b.SetInsertPoint(join);
     copyPayloadBack(b, child, payload_operand);
     b.CreateBr(tail);
   };
@@ -2398,7 +2336,6 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
    * per-call-site block a trace uses - whose payload is copied in and back out.
    */
   Value *child = allocateInvocationBlock(builder, "rt.callable");
-  copyPayloadInto(builder, child, call.getArgOperand(2), false);
   Value *callable_index = call.getArgOperand(1);
   RtShaderRecord callable;
   if (!shaderRecord(builder, RtShaderTable::Callable, callable_index, callable))
@@ -2425,10 +2362,11 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
   emitConditional(
     builder, builder.CreateICmpNE(record, builder.getInt32(kRtRecordIndexNone)),
     "rt.run_callable", [&](IRBuilder<> &inner) {
+      copyPayloadInto(inner, child, call.getArgOperand(2), false);
       callVisibleFunction(inner, child, record, depth);
+      copyPayloadBack(inner, child, call.getArgOperand(2), false);
     }
   );
-  copyPayloadBack(builder, child, call.getArgOperand(2), false);
   call.eraseFromParent();
   return Error::success();
 }
@@ -2653,7 +2591,6 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       if (call.arg_size() != 3)
         return createError("dxil: HitObject Invoke expects object and payload");
       Value *payload = call.getArgOperand(2);
-      copyPayloadInto(b, block, payload);
       Value *depth = b.CreateAdd(entry.depth ? entry.depth : b.getInt32(0), b.getInt32(1));
       Value *limit = loadDispatchField(b, kRtRecursionDepth, b.getInt32Ty());
       if (!limit)
@@ -2669,6 +2606,7 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       storeFrameWord(b, block, offsetof(SM50_RT_FRAME, Flags), b.CreateSelect(within_depth,
         b.getInt32(0), b.getInt32(kRtFrameFlagRecursionExceeded)));
       emitConditional(b, allowed, "rt.hitobject.invoke", [&](IRBuilder<> &g) {
+        copyPayloadInto(g, block, payload);
         callVisibleFunction(g, block, record, depth);
         copyPayloadBack(g, block, payload);
       });
@@ -2692,8 +2630,12 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       uint64_t size = module.getDataLayout().getTypeStoreSize(attributes);
       if (size > layout.attribute_size)
         return createError("dxil: HitObject attribute type exceeds configured attribute size");
-      emitMemcpy(module, b, call.getArgOperand(2),
-        b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(layout.attribute)), size);
+      Value *value = emitGuardedValue(b, b.CreateICmpEQ(type, b.getInt32(1)),
+        Constant::getNullValue(attributes), "rt.hitobject.attributes", [&](IRBuilder<> &g) -> Value * {
+          Value *source = g.CreateGEP(g.getInt8Ty(), bytePointerOf(g, block), g.getInt32(layout.attribute));
+          return g.CreateAlignedLoad(attributes, g.CreateBitCast(source, attributes->getPointerTo()), Align(1));
+        });
+      b.CreateAlignedStore(value, call.getArgOperand(2), Align(1));
     } else {
       uint32_t offset = 0;
       switch (opcode) {
@@ -2713,6 +2655,7 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       case 285: offset = kRtHitKind; break;
       default: return createError("dxil: invalid HitObject state opcode");
       }
+      Value *non_hit = Constant::getNullValue(call.getType());
       if (opcode >= 275 && opcode <= 280) {
         auto *component = dyn_cast<ConstantInt>(call.getArgOperand(2));
         if (!component || component->getZExtValue() > 2)
@@ -2723,9 +2666,22 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
           if (!column || column->getZExtValue() > 3)
             return createError("dxil: HitObject matrix column must be constant 0..3");
           offset += uint32_t(column->getZExtValue()) * 12;
+          non_hit = ConstantFP::get(call.getType(), component->getZExtValue() == column->getZExtValue() ? 1.0 : 0.0);
+        } else if (opcode == 277 || opcode == 278) {
+          const uint32_t world = opcode == 277 ? kRtHitWorldOrigin : kRtHitWorldDirection;
+          non_hit = readHitState(b, block, world + uint32_t(component->getZExtValue()) * 4, call.getType());
+          non_hit = b.CreateSelect(b.CreateICmpEQ(type, b.getInt32(2)), non_hit,
+                                  Constant::getNullValue(call.getType()));
         }
       }
       replacement = readHitState(b, block, offset, call.getType());
+      // Candidate callbacks may have published a rejected hit into the snapshot.
+      // DXR defines miss/NOP query defaults independently of that scratch state:
+      // miss object rays equal world rays, non-hit transforms are identity, and
+      // hit-only values are zero. NOP ray values are also zero.
+      replacement = b.CreateSelect(opcode <= 276 ? b.CreateICmpNE(type, b.getInt32(0))
+                                                : b.CreateICmpEQ(type, b.getInt32(1)),
+                                   replacement, non_hit);
     }
   }
   if (replacement)

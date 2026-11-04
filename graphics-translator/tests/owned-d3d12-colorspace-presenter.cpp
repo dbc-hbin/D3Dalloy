@@ -188,7 +188,8 @@ struct Probe {
     require(cmd, "command buffer");
     require(allocator, "Metal4 command allocator");
     cmd.begin(allocator);
-    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata, [](auto) {}, [](auto) {});
+    d3dalloy::Presenter::PresentWork work;
+    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata, {}, work);
     require(drawable && drawable.texture() && drawable.texture().width() == size &&
             drawable.texture().height() == size, "drawable dimensions");
     wmtcmd_blit_copy_from_texture_to_buffer copy{};
@@ -391,8 +392,8 @@ int main(int argc, char **argv) {
   WMT::Reference<WMT::MTL4Submission> submission;
   {
     auto accepted = probe.presenter.synchronizeLayerProperties(true);
-    gatedDrawable = probe.presenter.encodeCommandsMetal4(command, probe.input, accepted.metadata,
-                                                   [](auto) {}, [](auto) {});
+    d3dalloy::Presenter::PresentWork work;
+    gatedDrawable = probe.presenter.encodeCommandsMetal4(command, probe.input, accepted.metadata, {}, work);
     require(gatedDrawable && gatedDrawable.texture(), "gated drawable");
     command.end();
     probe.queue.waitForDrawable(gatedDrawable);

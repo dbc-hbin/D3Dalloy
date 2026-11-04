@@ -46,8 +46,8 @@ id<MTLTexture> makeTexture(id<MTLDevice> device, MTLPixelFormat format, unsigned
     if (data) [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:data bytesPerRow:w * pixel];
     return texture;
 }
-void run(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, const FgParams& params,
-         std::initializer_list<std::pair<id<MTLTexture>, unsigned>> textures) {
+double run(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, const FgParams& params,
+           std::initializer_list<std::pair<id<MTLTexture>, unsigned>> textures, bool sourceGrid = false) {
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
@@ -55,11 +55,13 @@ void run(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, const 
     // Unused declared slots bind the first texture, as production computePass does.
     for (unsigned i = 0; i < 7; ++i) [encoder setTexture:textures.begin()->first atIndex:i];
     for (const auto& [texture, index] : textures) [encoder setTexture:texture atIndex:index];
-    [encoder dispatchThreads:MTLSizeMake(params.extent[0], params.extent[1], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    const auto* grid = sourceGrid ? params.depthSourceExtent : params.extent;
+    [encoder dispatchThreads:MTLSizeMake(grid[0], grid[1], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     [encoder endEncoding];
     [command commit];
     [command waitUntilCompleted];
     require(command.status == MTLCommandBufferStatusCompleted, "command");
+    return (command.GPUEndTime - command.GPUStartTime) * 1e6;
 }
 std::array<unsigned, 2> sourcePosition(unsigned x, unsigned y, const unsigned extent[2], const unsigned source[2]) {
     return {std::min(unsigned((x + .5f) * source[0] / extent[0]), source[0] - 1),
@@ -85,7 +87,7 @@ bool sameHalf(__fp16 actual, float value) {
 }
 
 int main(int argc, char** argv) {
-    require(argc == 2, "usage-kernel-source");
+    require(argc == 2 || (argc == 3 && !std::strcmp(argv[2], "--timing")), "usage-kernel-source");
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         require(device != nil, "device");
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
         id<MTLComputePipelineState> depthPipeline = pipeline(@"yaagl_fg_resample_depth");
         id<MTLComputePipelineState> motionPipeline = pipeline(@"yaagl_fg_normalize_motion");
         id<MTLComputePipelineState> fusedPipeline = pipeline(@"yaagl_fg_normalize_depth_motion");
+        id<MTLComputePipelineState> sourcePipeline = pipeline(@"yaagl_fg_normalize_depth_motion_2x");
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         // Half-store rounding: RG16Float float-typed stores may truncate on Apple GPUs.
@@ -226,6 +229,49 @@ int main(int argc, char** argv) {
                     ++fusedCases;
                 }
         std::printf("OWNED_FG_NORMALIZATION_FUSED cases=%u pixels=%u mismatches=%u\n", fusedCases, ow * oh, fusedMismatches);
+        // Differentially check every output of the source-grid path, including
+        // offset inputs and target-coordinate camera reconstruction.
+        for (bool camera : {false,true}) for (bool inverted : {false,true}) {
+            const unsigned w = argc == 3 ? 960 : 17, h = argc == 3 ? 540 : 13;
+            const unsigned width = w*2, height = h*2;
+            std::vector<float> z((w+1)*(h+2));
+            std::vector<std::array<float,2>> v((w+2)*(h+1));
+            for (unsigned i = 0; i < z.size(); ++i) z[i] = argc == 2 && i%31 == 0 ? NAN : float(i%7)/8;
+            for (unsigned i = 0; i < v.size(); ++i) v[i] = {float(i%41)/7, -float(i%23)/9};
+            auto srcZ = makeTexture(device,MTLPixelFormatR32Float,w+1,h+2,z.data(),4);
+            auto srcM = makeTexture(device,MTLPixelFormatRG32Float,w+2,h+1,v.data(),8);
+            FgParams m{};
+            m.extent[0] = m.outputExtent[0] = width; m.extent[1] = m.outputExtent[1] = height;
+            m.depthSourceExtent[0] = m.motionTargetExtent[0] = w; m.sourceExtent[0] = w+1;
+            m.depthSourceExtent[1] = m.motionTargetExtent[1] = m.sourceExtent[1] = h;
+            m.sceneOrigin[0] = 1; m.sceneOrigin[1] = 2; m.sourceOrigin[0] = m.sourceOrigin[1] = 1;
+            m.depthDilation = 1; m.depthInverted = inverted; m.reconstructCameraMotion = camera;
+            m.motionScale[0] = 1.1f; m.motionScale[1] = .75f;
+            m.clipToPreviousClip[0] = .9f; m.clipToPreviousClip[5] = 1.25f;
+            m.clipToPreviousClip[9] = .125f; m.clipToPreviousClip[15] = 1;
+            id<MTLTexture> depths[2], motions[2];
+            std::vector<uint32_t> a(width*height), b(width*height);
+            for (auto& t : depths) t = makeTexture(device,MTLPixelFormatR32Float,width,height,nullptr,4);
+            for (auto& t : motions) t = makeTexture(device,MTLPixelFormatRG16Float,width,height,nullptr,4);
+            std::array<std::vector<double>,2> times;
+            for (unsigned i = 0; i < (argc == 3 ? 16u : 1u); ++i) for (unsigned j = 0; j < 2; ++j) {
+                auto mode = (i+j)&1u;
+                double us = run(queue,mode ? sourcePipeline : fusedPipeline,m,
+                    {{srcM,0},{motions[mode],1},{depths[mode],2},{srcZ,4}},mode);
+                if (i >= 3) times[mode].push_back(us);
+            }
+            for (auto pair : {depths,motions}) {
+                auto region = MTLRegionMake2D(0,0,width,height);
+                [pair[0] getBytes:a.data() bytesPerRow:width*4 fromRegion:region mipmapLevel:0];
+                [pair[1] getBytes:b.data() bytesPerRow:width*4 fromRegion:region mipmapLevel:0];
+                require(a == b,"source-grid-differential");
+            }
+            if (argc == 3) {
+                for (auto& values : times) std::sort(values.begin(),values.end());
+                std::printf("FG_SOURCE_GRID_US camera=%d inverted=%d baseline=%.3f candidate=%.3f\n",
+                    camera,inverted,times[0][6],times[1][6]);
+            }
+        }
         failures = roundingMismatches + dilationMismatches + fusedMismatches;
     }
     if (failures) { std::fprintf(stderr, "OWNED_FG_NORMALIZATION_FAIL mismatches=%u\n", failures); return 1; }

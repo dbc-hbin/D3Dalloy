@@ -343,6 +343,7 @@ typedef struct {
   MTL4AccelerationStructureDescriptor *descriptor;
   NSMutableArray *geometries;
   NSMutableSet *inputs;
+  id<MTLDevice> device;
   id<MTLBuffer> placeholder;
   NSMutableIndexSet *unresolvedGeometries;
   BOOL unresolvedInstances;
@@ -350,7 +351,7 @@ typedef struct {
 @end
 @implementation D3DALLOYM4ASDescriptor
 - (void)dealloc {
-  [descriptor release]; [geometries release]; [inputs release]; [placeholder release]; [unresolvedGeometries release]; [super dealloc];
+  [descriptor release]; [geometries release]; [inputs release]; [placeholder release]; [device release]; [unresolvedGeometries release]; [super dealloc];
 }
 @end
 
@@ -591,6 +592,8 @@ static void m4_stage_barrier(D3DALLOYM4ComputeEncoder *context, MTLStages stage)
     }
     if (after) {
       [context->encoder barrierAfterEncoderStages:after beforeEncoderStages:stage visibilityOptions:MTL4VisibilityOptionDevice];
+      if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_STAGE_BARRIER encoder=%llu after=%llu before=%llu implicit=1\n",
+          (unsigned long long)(uintptr_t)context->encoder,(unsigned long long)after,(unsigned long long)stage);
       m4_record_barrier(context,after,stage);
       if (stage==MTLStageBlit) context->blitAccessCount=0;
     }
@@ -888,18 +891,24 @@ static int32_t m4_blit_commands(D3DALLOYM4ComputeEncoder *context, const struct 
 static MTL4BufferRange m4_buffer_range(id<MTLBuffer> buffer, uint64_t offset) {
   return buffer && offset<=buffer.length ? MTL4BufferRangeMake(buffer.gpuAddress+offset,buffer.length-offset) : MTL4BufferRangeMake(0,0);
 }
+static id<MTLBuffer> m4_as_placeholder(D3DALLOYM4ASDescriptor *owner) {
+  if (!owner->placeholder) {
+    owner->placeholder=[owner->device newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+    if (owner->placeholder) [owner->inputs addObject:owner->placeholder];
+  }
+  return owner->placeholder;
+}
 static D3DALLOYM4ASDescriptor *m4_as_new(id<MTLDevice> device, BOOL topLevel, uint32_t geometryCount) {
   D3DALLOYM4ASDescriptor *owner=[D3DALLOYM4ASDescriptor new];
   owner->inputs=[NSMutableSet new];
-  owner->placeholder=[device newBufferWithLength:256 options:MTLResourceStorageModePrivate];
-  if (!owner->placeholder) { [owner release]; return nil; }
-  [owner->inputs addObject:owner->placeholder];
+  owner->device=[device retain];
   if (topLevel) owner->descriptor=[MTL4InstanceAccelerationStructureDescriptor new];
   else {
     owner->descriptor=[MTL4PrimitiveAccelerationStructureDescriptor new];
     owner->geometries=[[NSMutableArray alloc] initWithCapacity:MAX(geometryCount,1u)];
     for (uint32_t i=0;i<geometryCount;++i) [owner->geometries addObject:[NSNull null]];
     if (!geometryCount) {
+      if (!m4_as_placeholder(owner)) { [owner release]; return nil; }
       MTL4AccelerationStructureTriangleGeometryDescriptor *empty=[MTL4AccelerationStructureTriangleGeometryDescriptor new];
       empty.vertexBuffer=m4_buffer_range(owner->placeholder,0); empty.vertexStride=12; empty.triangleCount=0;
       [owner->geometries addObject:empty]; [empty release];
@@ -941,8 +950,10 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
     if (!descriptor->geometries || a[1]>=descriptor->geometries.count) return M4_INVALID;
     id<MTLBuffer> vertices=m4obj(a[2]),indices=m4obj(a[5]),transform=m4obj(a[8]);
     if ((vertices && a[3]>vertices.length) || (indices && a[6]>indices.length) || (transform && a[9]>transform.length)) return M4_INVALID;
+    id<MTLBuffer> vertexInput=vertices?:m4_as_placeholder(descriptor);
+    if (!vertexInput) return M4_FAILED;
     MTL4AccelerationStructureTriangleGeometryDescriptor *geometry=[MTL4AccelerationStructureTriangleGeometryDescriptor new];
-    geometry.vertexBuffer=m4_buffer_range(vertices?:descriptor->placeholder,vertices?a[3]:0); geometry.vertexStride=a[4];
+    geometry.vertexBuffer=m4_buffer_range(vertexInput,vertices?a[3]:0); geometry.vertexStride=a[4];
     geometry.vertexFormat=(MTLAttributeFormat)a[13];
     if (a[7]!=UINT32_MAX && a[10]) { geometry.indexBuffer=m4_buffer_range(indices,a[6]); geometry.indexType=(MTLIndexType)a[7]; }
     geometry.transformationMatrixBuffer=m4_buffer_range(transform,a[9]); geometry.triangleCount=a[10];
@@ -956,8 +967,10 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
   case WMTMetal4ASBoxes: {
     if (!descriptor->geometries || a[1]>=descriptor->geometries.count) return M4_INVALID;
     id<MTLBuffer> buffer=m4obj(a[2]); if (buffer && a[3]>buffer.length) return M4_INVALID;
+    id<MTLBuffer> boxInput=buffer?:m4_as_placeholder(descriptor);
+    if (!boxInput) return M4_FAILED;
     MTL4AccelerationStructureBoundingBoxGeometryDescriptor *geometry=[MTL4AccelerationStructureBoundingBoxGeometryDescriptor new];
-    geometry.boundingBoxBuffer=m4_buffer_range(buffer?:descriptor->placeholder,buffer?a[3]:0); geometry.boundingBoxStride=a[4]; geometry.boundingBoxCount=a[5];
+    geometry.boundingBoxBuffer=m4_buffer_range(boxInput,buffer?a[3]:0); geometry.boundingBoxStride=a[4]; geometry.boundingBoxCount=a[5];
     geometry.intersectionFunctionTableOffset=a[6]; geometry.opaque=(a[7]&1)!=0; geometry.allowDuplicateIntersectionFunctionInvocation=(a[7]&2)==0;
     descriptor->geometries[a[1]]=geometry; [geometry release]; m4_as_unresolved(descriptor,a[1],!buffer && a[5]);
     m4_as_input(descriptor,buffer); call->ret[0]=1; return M4_SUCCESS;
@@ -965,8 +978,10 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
   case WMTMetal4ASInstances: {
     if (descriptor->geometries) return M4_INVALID;
     id<MTLBuffer> buffer=m4obj(a[1]); if (buffer && a[2]>buffer.length) return M4_INVALID;
+    id<MTLBuffer> instanceInput=buffer?:m4_as_placeholder(descriptor);
+    if (!instanceInput) return M4_FAILED;
     MTL4InstanceAccelerationStructureDescriptor *instances=(MTL4InstanceAccelerationStructureDescriptor *)descriptor->descriptor;
-    instances.instanceDescriptorBuffer=m4_buffer_range(buffer?:descriptor->placeholder,buffer?a[2]:0);
+    instances.instanceDescriptorBuffer=m4_buffer_range(instanceInput,buffer?a[2]:0);
     instances.instanceDescriptorStride=sizeof(MTLIndirectAccelerationStructureInstanceDescriptor);
     instances.instanceDescriptorType=MTLAccelerationStructureInstanceDescriptorTypeIndirect; instances.instanceCount=a[3];
     descriptor->unresolvedInstances=!buffer && a[3];
@@ -1312,6 +1327,8 @@ int32_t winemetal_metal4_call(void *params) {
       context->concurrent=a[1]!=0;
       context->encoder=[[owner->command computeCommandEncoder] retain];
       if (!context->encoder) { [context release]; return M4_FAILED; }
+      if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_COMPUTE_BEGIN context=%llu encoder=%llu concurrent=%u\n",
+          (unsigned long long)(uintptr_t)context,(unsigned long long)(uintptr_t)context->encoder,context->concurrent?1:0);
       [owner->recording->encoders addObject:context]; call->ret[0]=(uint64_t)context; [context release]; return M4_SUCCESS;
     }
     case WMTMetal4EndEncoding: [((D3DALLOYM4Encoder *)m4obj(a[0]))->encoder endEncoding]; return M4_SUCCESS;
@@ -2051,6 +2068,3 @@ static int32_t m4_blit_commands(D3DALLOYM4ComputeEncoder *context, const struct 
   }
   return context->recording->error ? M4_FAILED : M4_SUCCESS;
 }
-
-
-

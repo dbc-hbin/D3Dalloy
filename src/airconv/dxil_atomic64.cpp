@@ -34,6 +34,8 @@ void cooperateAtomic64(Function &function, ReturnInst &returned) {
       FunctionType::get(i64, {i1}, false), attributes);
   auto lane_index = module.getOrInsertFunction("air.get_thread_index_in_simdgroup.i32",
       FunctionType::get(i32, false), attributes);
+  auto shuffle = module.getOrInsertFunction("air.simd_shuffle.u.i32",
+      FunctionType::get(i32, {i32, builder.getInt16Ty()}, false), attributes);
   auto *body = &function.getEntryBlock();
   auto *head = BasicBlock::Create(ctx, "atomic64.cooperative", &function, body);
   auto *vote = BasicBlock::Create(ctx, "atomic64.vote", &function, body);
@@ -43,6 +45,7 @@ void cooperateAtomic64(Function &function, ReturnInst &returned) {
   function.addFnAttr(Attribute::Convergent);
   builder.SetInsertPoint(head);
   auto *lane = builder.CreateCall(lane_index);
+  auto *rootWord = builder.CreateLShr(builder.CreatePtrToInt(function.getArg(1), i32), 2);
   builder.CreateBr(vote);
   builder.SetInsertPoint(vote);
   auto *pending = builder.CreatePHI(i1, 2);
@@ -51,9 +54,13 @@ void cooperateAtomic64(Function &function, ReturnInst &returned) {
   result->addIncoming(builder.getInt64(0), head);
   auto *mask = builder.CreateTrunc(builder.CreateCall(ballot, {pending}), i32);
   auto *leader = air.CreateCountZero(mask, true);
-  auto *mine = builder.CreateAnd(pending, builder.CreateICmpEQ(lane, leader));
   builder.CreateCondBr(builder.CreateICmpNE(mask, builder.getInt32(0)), elected, done);
   builder.SetInsertPoint(elected);
+  // Map 32 root banks bijectively onto lanes, rotated so the first pending
+  // lane always advances. Equal roots share a bank and never retry together.
+  auto *firstWord = builder.CreateCall(shuffle, {rootWord, builder.CreateTrunc(leader, builder.getInt16Ty())});
+  auto *owner = builder.CreateAnd(builder.CreateAdd(leader, builder.CreateSub(rootWord, firstWord)), 31);
+  auto *mine = builder.CreateAnd(pending, builder.CreateICmpEQ(lane, owner));
   builder.CreateCondBr(mine, body, next);
   auto *completed = returned.getParent();
   auto *value = returned.getReturnValue();
@@ -124,9 +131,8 @@ Value *bitsScalar(IRBuilderBase &builder, Value *value, Type *type) {
   return type->isIntegerTy() ? value : builder.CreateBitCast(value, type);
 }
 
-// A binary search is unnecessary for the small dynamic resource set. Unmapped
-// scratch/counter resources retain their normal native operations; a mapped sparse
-// hole yields a null root and therefore D3D12 zero-read/drop-write semantics.
+// The phase uploads disjoint intervals in address order; alias precedence is
+// already resolved. A mapped sparse hole still produces a null root.
 Value *findRawRoot(IRBuilderBase &builder, Value *pointer) {
   auto *module = builder.GetInsertBlock()->getModule();
   auto *context = EmitAtomic64Context(builder);
@@ -151,10 +157,13 @@ Value *findRawRoot(IRBuilderBase &builder, Value *pointer) {
   builder.SetInsertPoint(start);
   builder.CreateBr(loop);
   builder.SetInsertPoint(loop);
-  auto *index = builder.CreatePHI(i32, 2);
-  index->addIncoming(builder.getInt32(0), start);
-  builder.CreateCondBr(builder.CreateICmpULT(index, count), test, tail);
+  auto *low = builder.CreatePHI(i32, 2);
+  auto *high = builder.CreatePHI(i32, 2);
+  low->addIncoming(builder.getInt32(0), start);
+  high->addIncoming(count, start);
+  builder.CreateCondBr(builder.CreateICmpULT(low, high), test, tail);
   builder.SetInsertPoint(test);
+  auto *index = builder.CreateAdd(low, builder.CreateLShr(builder.CreateSub(high, low), 1));
   auto *range = builder.CreateInBoundsGEP(builder.getInt8Ty(), ranges, builder.CreateMul(builder.CreateZExt(index, i64), builder.getInt64(24)));
   auto readRange = [&](unsigned offset) {
     auto *at = builder.CreateInBoundsGEP(builder.getInt8Ty(), range, builder.getInt64(offset));
@@ -163,7 +172,8 @@ Value *findRawRoot(IRBuilderBase &builder, Value *pointer) {
   auto *begin = readRange(0);
   auto *length = readRange(8);
   auto *relative = builder.CreateSub(address, begin);
-  builder.CreateCondBr(builder.CreateAnd(builder.CreateICmpUGE(address, begin), builder.CreateICmpULT(relative, length)), found, next);
+  auto *before = builder.CreateICmpULT(address, begin);
+  builder.CreateCondBr(builder.CreateAnd(builder.CreateNot(before), builder.CreateICmpULT(relative, length)), found, next);
   builder.SetInsertPoint(found);
   auto *map = builder.CreateIntToPtr(readRange(16), rootType);
   auto *cell = builder.CreateLoad(i32, builder.CreateInBoundsGEP(i32, map, builder.CreateLShr(relative, builder.getInt64(3))));
@@ -172,7 +182,8 @@ Value *findRawRoot(IRBuilderBase &builder, Value *pointer) {
   builder.CreateBr(tail);
   builder.SetInsertPoint(next);
   auto *following = builder.CreateAdd(index, builder.getInt32(1));
-  index->addIncoming(following, next);
+  low->addIncoming(builder.CreateSelect(before, low, following), next);
+  high->addIncoming(builder.CreateSelect(before, index, high), next);
   builder.CreateBr(loop);
   builder.SetInsertPoint(tail, tail->getFirstInsertionPt());
   // UINT64_MAX sentinel distinguishes no phase mapping from a mapped sparse hole.
@@ -182,9 +193,8 @@ Value *findRawRoot(IRBuilderBase &builder, Value *pointer) {
   return result;
 }
 
-Value *nativeOrCell(IRBuilderBase &builder, Value *pointer, function_ref<Value *()> native,
+Value *nativeOrCell(IRBuilderBase &builder, Value *root, function_ref<Value *()> native,
                     function_ref<Value *(Value *)> cell) {
-  auto *root = findRawRoot(builder, pointer);
   auto *start = builder.GetInsertBlock();
   auto *tail = start->splitBasicBlock(builder.GetInsertPoint(), "atomic64.access.tail");
   start->getTerminator()->eraseFromParent();
@@ -376,21 +386,25 @@ Error LowerAtomic64Phase(Module &module) {
     if ((rmw || cas) && vector) return createError("atomic64 phase: vector atomic cannot be lowered");
     Value *result = vector && !store ? UndefValue::get(type) : nullptr;
     const unsigned components = vector ? vector->getNumElements() : 1;
+    const uint64_t alignment = load ? load->getAlign().value() : store ? store->getAlign().value() : scalarWidth / 8;
+    const unsigned groupBytes = std::min<uint64_t>(8, alignment);
+    Value *root = nullptr;
     for (unsigned component = 0; component < components; ++component) {
       // Ordinary DXIL raw accesses can be less aligned than their value width.
       // Split only at the declared alignment, never truncate a value which spans
       // two canonical cells. Returning atomics retain one naturally aligned cell.
-      const unsigned alignmentBits = load ? load->getAlign().value() * 8 :
-        store ? store->getAlign().value() * 8 : scalarWidth;
-      const unsigned width = std::min(scalarWidth, alignmentBits);
+      const unsigned width = std::min(scalarWidth, 8 * groupBytes);
       auto *fragmentType = width == scalarWidth ? scalar : IntegerType::get(builder.getContext(), width);
       Value *assembled = builder.getInt64(0);
       for (unsigned fragment = 0; fragment < scalarWidth / width; ++fragment) {
       auto *bytes = builder.CreateBitCast(pointer, PointerType::get(builder.getInt8Ty(), 1));
-      auto *at = builder.CreateInBoundsGEP(builder.getInt8Ty(), bytes,
-        builder.getInt64(component * (scalarWidth / 8) + fragment * (width / 8)));
+      const unsigned offset = component * (scalarWidth / 8) + fragment * (width / 8);
+      auto *at = builder.CreateInBoundsGEP(builder.getInt8Ty(), bytes, builder.getInt64(offset));
       auto *address = builder.CreatePtrToInt(at, builder.getInt64Ty());
-      auto *aligned = builder.CreateIntToPtr(builder.CreateAnd(address, builder.getInt64(~uint64_t(7))), PointerType::get(builder.getInt64Ty(), 1));
+      if (offset % groupBytes == 0) {
+        auto *aligned = builder.CreateIntToPtr(builder.CreateAnd(address, builder.getInt64(~uint64_t(7))), PointerType::get(builder.getInt64Ty(), 1));
+        root = findRawRoot(builder, aligned);
+      }
       auto *shift = builder.CreateTrunc(builder.CreateMul(builder.CreateAnd(address, builder.getInt64(7)), builder.getInt64(8)), builder.getInt64Ty());
       auto *scalarPointer = builder.CreateBitCast(at, PointerType::get(fragmentType, 1));
       Value *input = store ? store->getValueOperand() : rmw ? rmw->getValOperand() : cas ? cas->getNewValOperand() : nullptr;
@@ -421,7 +435,7 @@ Error LowerAtomic64Phase(Module &module) {
         auto *bits = builder.CreateShl(builder.CreateZExtOrTrunc(scalarBits(builder, desired), builder.getInt64Ty()), shift);
         return builder.CreateOr(builder.CreateAnd(cell, builder.CreateNot(mask)), builder.CreateAnd(bits, mask));
       };
-      auto *value = nativeOrCell(builder, aligned, [&]() -> Value * {
+      auto *value = nativeOrCell(builder, root, [&]() -> Value * {
         if (load) {
           auto *operation = builder.CreateLoad(fragmentType, scalarPointer, load->isVolatile());
           operation->setAlignment(Align(width / 8));

@@ -84,15 +84,22 @@ inline llvm::Value *emitOmmClassification(llvm::IRBuilder<> &caller, llvm::Modul
     Value *even = b.CreateAnd(b.CreateNot(b.CreateXor(iu, iw)), mask);
     Value *turns = b.CreateAnd(b.CreateXor(iu, iv), even);
     // OC1 bird-curve parity is the suffix parity of the discrete barycentric turns.
-    // A fixed 12-step unrolled bit walk covers all levels without data-dependent loops.
-    Value *parity = b.getInt32(0), *microIndex = b.getInt32(0);
-    for (int bit = 11; bit >= 0; --bit) {
-      Value *turn = b.CreateAnd(b.CreateLShr(turns, bit), b.getInt32(1));
-      parity = b.CreateXor(parity, turn);
-      Value *e = b.CreateAnd(b.CreateLShr(even, bit), b.getInt32(1));
-      Value *odd = b.CreateOr(b.CreateAnd(b.CreateXor(parity, b.CreateLShr(iu, bit)), b.CreateXor(e, b.getInt32(1))), turn);
-      microIndex = b.CreateOr(microIndex, b.CreateShl(b.CreateOr(e, b.CreateShl(b.CreateAnd(odd, b.getInt32(1)), 1)), bit * 2));
-    }
+    // Compute all twelve suffix parities in four XORs, then interleave the even/odd bits.
+    Value *parity = turns;
+    for (unsigned shift : {1u, 2u, 4u, 8u})
+      parity = b.CreateXor(parity, b.CreateLShr(parity, shift));
+    Value *odd = b.CreateOr(b.CreateAnd(b.CreateXor(parity, iu), b.CreateNot(even)), turns);
+    auto spread = [&](Value *x) {
+      auto step = [&](unsigned shift, uint32_t mask) {
+        x = b.CreateAnd(b.CreateOr(x, b.CreateShl(x, shift)), b.getInt32(mask));
+      };
+      step(8, 0x00ff00ff);
+      step(4, 0x0f0f0f0f);
+      step(2, 0x33333333);
+      step(1, 0x55555555);
+      return x;
+    };
+    Value *microIndex = b.CreateOr(spread(even), b.CreateShl(spread(odd), 1));
     Value *bitOffset = b.CreateMul(microIndex, format);
     Value *data = b.CreateAdd(array, b.CreateAdd(load(map, 32, i64), b.CreateZExt(b.CreateLShr(bitOffset, 3), i64)));
     Value *byte = b.CreateZExt(load(data, 0, b.getInt8Ty()), i32);

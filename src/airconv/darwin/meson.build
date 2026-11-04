@@ -88,6 +88,15 @@ volume_sample_test = executable('airconv-volume-sample-test',
 )
 test('airconv-volume-sample', volume_sample_test)
 
+texture_atomic_abi_test = executable('airconv-texture-atomic-abi-test',
+  files('../../../graphics-translator/tests/airconv-texture-atomic-abi.test.cpp'),
+  include_directories: [d3dalloy_include_path, llvm_include_path_darwin],
+  cpp_args: [airconv_args],
+  dependencies: [airconv_dep_darwin, dxbc_parser_native_dep],
+  native: d3dalloy_crossbuild,
+)
+test('airconv-texture-atomic-abi', texture_atomic_abi_test)
+
 root_status_test = executable('airconv-root-status-test',
   files('../../../graphics-translator/tests/airconv-root-status.test.cpp'),
   include_directories: [d3dalloy_include_path, llvm_include_path_darwin],

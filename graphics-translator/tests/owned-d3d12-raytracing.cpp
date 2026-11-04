@@ -1481,6 +1481,7 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
 #include "owned-d3d12-raytracing-linkage.inc"
 #include "owned-d3d12-raytracing-hitobject.inc"
 #include "owned-d3d12-raytracing-paq.inc"
+#include "owned-d3d12-raytracing-refit-chain.inc"
 
 namespace {
 
@@ -1684,11 +1685,131 @@ int testCollectionStaticSamplers(ID3D12Device5 *device5, Context &ctx, const std
   return bad ? 1 : 0;
 }
 
+// Two 36 KiB AS table snapshots exceed one 64 KiB upload block. The following TLAS
+// uses a nonzero slice in the second block. Read the public visualization payload
+// too: native traversal alone does not prove the geometry/job shadow copies survived.
+int testMetadataArena(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &dxil) {
+  constexpr UINT geometryCount = 256;
+  constexpr UINT triangleWords = 9;
+  contract::Runner run(device5, ctx, dxil);
+  std::array<std::vector<float>, 2> vertices;
+  std::array<ComPtr<ID3D12Resource>, 2> bottom;
+  std::array<D3D12_RAYTRACING_INSTANCE_DESC, 2> instances{};
+  std::vector<contract::LaneRay> rays;
+  std::vector<contract::Expect> expects;
+  const auto identity = contract::translateScale(1, 0, 0, 0);
+  for (UINT b = 0; b < bottom.size(); ++b) {
+    const float y = 4.0f * b, z = 2.0f * b;
+    vertices[b].resize(geometryCount * triangleWords);
+    for (UINT g = 0; g < geometryCount; ++g) {
+      const float x = 4.0f * g;
+      const float triangle[] = {x, y, z, x + 1, y, z, x, y + 1, z};
+      std::memcpy(vertices[b].data() + g * triangleWords, triangle, sizeof(triangle));
+    }
+    auto input = run.upload(vertices[b].data(), vertices[b].size() * sizeof(float));
+    std::array<D3D12_RAYTRACING_GEOMETRY_DESC, geometryCount> geometries{};
+    for (UINT g = 0; g < geometryCount; ++g)
+      geometries[g] = contract::triangles(input->GetGPUVirtualAddress() + g * triangleWords * sizeof(float),
+          12, 3, DXGI_FORMAT_R32G32B32_FLOAT, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE);
+    bottom[b] = run.build(contract::blasInputs(geometries.data(), geometryCount), "metadata arena: BLAS");
+    instances[b] = contract::instanceDesc(identity.m, 0x70 + b, 0xff, 0, 0, bottom[b]->GetGPUVirtualAddress());
+    for (const UINT g : {0u, geometryCount - 1}) {
+      rays.push_back(contract::ray(4.0f * g + 0.25f, y + 0.25f, -1, 0, 0, 1, 0, 0xff, 0, 0));
+      expects.push_back(contract::triangleHit(z + 1, 0.25f, 0.25f, contract::kHitGroupTagBase, 0x70 + b, b, g));
+    }
+  }
+  auto instanceBuffer = run.upload(instances.data(), sizeof(instances));
+  auto top = run.build(contract::tlasInputs(instanceBuffer->GetGPUVirtualAddress(), UINT(instances.size())),
+      "metadata arena: TLAS");
+  const auto words = run.trace("metadata-arena", top->GetGPUVirtualAddress(), rays);
+  int bad = 0;
+  constexpr UINT observedFields[] = {0, 1, 2, 3, 4, 5, 6, 7, 45, 46, 47, 48, 62};
+  for (UINT lane = 0; lane < rays.size(); ++lane) {
+    bad += run.expect("metadata-arena", words, lane, expects[lane]);
+    std::printf("OWNED_D3D12_RAYTRACING_METADATA_ARENA_RAY lane=%u words=", lane);
+    for (UINT i = 0; i < std::size(observedFields); ++i)
+      std::printf("%s%08x", i ? "," : "", words[lane * contract::kSlotWords + observedFields[i]]);
+    std::putchar('\n');
+  }
+  for (UINT b = 0; b < bottom.size(); ++b) {
+    auto output = run.uavBuffer(asserialize::query(run, bottom[b].Get(), 1));
+    ctx.list->CopyRaytracingAccelerationStructure(output->GetGPUVirtualAddress(), bottom[b]->GetGPUVirtualAddress(),
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS);
+    uavBarrier(ctx.list.Get(), output.Get());
+    const auto bytes = asserialize::read(run, output.Get(), output->GetDesc().Width);
+    require(bytes.size() >= 8 + geometryCount * sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+        "metadata arena: truncated visualization");
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_TOOLS_VISUALIZATION_HEADER header{};
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    int descriptorsBad = header.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL ||
+        header.NumDescs != geometryCount;
+    std::vector<uint32_t> observed(geometryCount * triangleWords, contract::kFill);
+    const auto base = output->GetGPUVirtualAddress();
+    for (UINT g = 0; g < geometryCount; ++g) {
+      D3D12_RAYTRACING_GEOMETRY_DESC desc{};
+      std::memcpy(&desc, bytes.data() + 8 + g * sizeof(desc), sizeof(desc));
+      const auto &tri = desc.Triangles;
+      descriptorsBad += desc.Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES ||
+          desc.Flags != D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE || tri.Transform3x4 != 0 ||
+          tri.IndexFormat != DXGI_FORMAT_UNKNOWN || tri.VertexFormat != DXGI_FORMAT_R32G32B32_FLOAT ||
+          tri.IndexCount != 0 || tri.VertexCount != 3 || tri.IndexBuffer != 0 || tri.VertexBuffer.StrideInBytes != 12;
+      const auto address = tri.VertexBuffer.StartAddress;
+      const UINT size = triangleWords * sizeof(float);
+      if (address < base || address - base > bytes.size() || size > bytes.size() - (address - base)) {
+        ++descriptorsBad;
+        continue;
+      }
+      std::memcpy(observed.data() + g * triangleWords, bytes.data() + (address - base), size);
+    }
+    bad += descriptorsBad;
+    bad += std::memcmp(observed.data(), vertices[b].data(), vertices[b].size() * sizeof(float)) != 0;
+    std::printf("OWNED_D3D12_RAYTRACING_METADATA_ARENA_SHADOW blas=%u descriptors=%u descriptor_mismatches=%d words=",
+        b, geometryCount, descriptorsBad);
+    for (UINT i = 0; i < observed.size(); ++i)
+      std::printf("%s%08x", i ? "," : "", observed[i]);
+    std::putchar('\n');
+  }
+  // TLAS native traversal reads sourceInstances separately. Its public shadow
+  // copy is the consumer that proves the nonzero-offset job table was bound.
+  auto topOutput = run.uavBuffer(asserialize::query(run, top.Get(), 1));
+  ctx.list->CopyRaytracingAccelerationStructure(topOutput->GetGPUVirtualAddress(), top->GetGPUVirtualAddress(),
+      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_VISUALIZATION_DECODE_FOR_TOOLS);
+  uavBarrier(ctx.list.Get(), topOutput.Get());
+  const auto topBytes = asserialize::read(run, topOutput.Get(), topOutput->GetDesc().Width);
+  require(topBytes.size() >= 8 + sizeof(instances), "metadata arena: truncated TLAS visualization");
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_TOOLS_VISUALIZATION_HEADER topHeader{};
+  std::memcpy(&topHeader, topBytes.data(), sizeof(topHeader));
+  bad += topHeader.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL ||
+      topHeader.NumDescs != instances.size();
+  bad += std::memcmp(topBytes.data() + 8, instances.data(), sizeof(instances)) != 0;
+  std::printf("OWNED_D3D12_RAYTRACING_METADATA_ARENA_TOP type=%u descriptors=%u\n",
+      UINT(topHeader.Type), topHeader.NumDescs);
+  for (UINT b = 0; b < instances.size(); ++b) {
+    std::array<uint32_t, sizeof(D3D12_RAYTRACING_INSTANCE_DESC) / sizeof(uint32_t)> observed{};
+    std::memcpy(observed.data(), topBytes.data() + 8 + b * sizeof(D3D12_RAYTRACING_INSTANCE_DESC), sizeof(observed));
+    // Visualization preserves the source BLAS addresses; they are not rebased
+    // into topOutput like the BLAS visualization's vertex payload addresses.
+    std::printf("OWNED_D3D12_RAYTRACING_METADATA_ARENA_INSTANCE index=%u blas_address=%016llx words=",
+        b, static_cast<unsigned long long>(bottom[b]->GetGPUVirtualAddress()));
+    for (UINT i = 0; i < observed.size(); ++i)
+      std::printf("%s%08x", i ? "," : "", observed[i]);
+    std::putchar('\n');
+  }
+  std::printf("OWNED_D3D12_RAYTRACING_METADATA_ARENA_RESULT rays=4 blas=2 geometries=512 vertex_bytes=18432 "
+      "instances=2 instance_bytes=128 failures=%d\n", bad);
+  if (!bad) std::puts("OWNED_D3D12_RAYTRACING_METADATA_ARENA_PASS");
+  return bad ? 1 : 0;
+}
+
 int run(int argc, wchar_t **argv) {
-  if (argc < 4 && !(argc == 3 && std::wcscmp(argv[1], L"--collection-samplers") == 0)) {
+  if (argc < 4 && !(argc == 3 && (std::wcscmp(argv[1], L"--collection-samplers") == 0 ||
+                                std::wcscmp(argv[1], L"--refit-chain") == 0 ||
+                                std::wcscmp(argv[1], L"--metadata-arena") == 0))) {
     std::fprintf(stderr, "usage: owned-d3d12-raytracing.exe <raytracing.dxil> <raytracing-contract.dxil> "
                          "<raytracing-stateobj.dxil> [further suite DXIL]\n"
-                         "       owned-d3d12-raytracing.exe --collection-samplers <raytracing-rootargs.dxil>\n");
+                         "       owned-d3d12-raytracing.exe --collection-samplers <raytracing-rootargs.dxil>\n"
+                         "       owned-d3d12-raytracing.exe --metadata-arena <raytracing-contract.dxil>\n"
+                         "       owned-d3d12-raytracing.exe --refit-chain <raytracing-contract.dxil>\n");
     return 2;
   }
 
@@ -1723,6 +1844,10 @@ int run(int argc, wchar_t **argv) {
   check(device.As(&device5), "QueryInterface(ID3D12Device5)");
 
   Context context(device.Get());
+  if (argc == 3 && std::wcscmp(argv[1], L"--refit-chain") == 0)
+    return refitchain::runAll(device5.Get(), context, readFile(argv[2]));
+  if (argc == 3 && std::wcscmp(argv[1], L"--metadata-arena") == 0)
+    return testMetadataArena(device5.Get(), context, readFile(argv[2]));
   if (argc == 3 && std::wcscmp(argv[1], L"--collection-samplers") == 0)
     return testCollectionStaticSamplers(device5.Get(), context, readFile(argv[2]));
   if (argc == 4 && std::wcscmp(argv[1], L"--hitobject") == 0) {

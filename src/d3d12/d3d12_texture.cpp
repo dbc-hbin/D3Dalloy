@@ -809,6 +809,15 @@ public:
       texture->rename(texture->allocate(flags));
     if (!texture->current() || !texture->current()->texture())
       return shared && share ? E_INVALIDARG : E_OUTOFMEMORY;
+    if (pHeap && texture->current()->canonicalHeap) {
+      // Native tiled storage includes padding/metadata not derivable from texels.
+      // Cache the created object's extent before publishing descriptors; replay
+      // must not pay a native size query or infer a footprint from the D3D format.
+      const auto size = texture->current()->texture().allocatedSize();
+      const auto heap_size = pHeap->GetDesc().SizeInBytes;
+      if (size && HeapOffset <= heap_size && size <= heap_size - HeapOffset)
+        texture->current()->canonicalHeapSize = size;
+    }
     if (shared) {
       HRESULT hr = PublishSharedTexture();
       if (FAILED(hr))

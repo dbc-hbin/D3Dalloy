@@ -232,14 +232,16 @@ MDNode *lineEndpointInput(unsigned index, StringRef name, LLVMContext &context) 
 }
 
 MDNode *textureMetadata(unsigned index, LLVMContext &context, bool multisampled,
-                        unsigned binding = SM50_BINDING_INDEX_MSAA_COVERAGE) {
+                        unsigned binding = SM50_BINDING_INDEX_MSAA_COVERAGE, bool array = false) {
   return MDTuple::get(context, {
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), index)),
     MDString::get(context, "air.texture"), MDString::get(context, "air.location_index"),
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), binding)),
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), 1)),
     MDString::get(context, "air.read"), MDString::get(context, "air.arg_type_name"),
-    MDString::get(context, multisampled ? "texture2d_ms<uint, read>" : "texture2d<uint, read>"),
+    MDString::get(context, multisampled
+      ? array ? "texture2d_ms_array<uint, read>" : "texture2d_ms<uint, read>"
+      : array ? "texture2d_array<uint, read>" : "texture2d<uint, read>"),
     MDString::get(context, "air.arg_name"), MDString::get(context, "msaa_coverage")
   });
 }
@@ -325,10 +327,30 @@ struct PulledInput {
   bool perspective;
   unsigned offset[4] = {~0u, ~0u, ~0u, ~0u};
   unsigned anchor[4] = {~0u, ~0u, ~0u, ~0u};
+  SmallVector<unsigned, 4> snapped_slots; // Empty uses the dynamic 16 x 16 lookup.
   unsigned vertex_offset = ~0u;
   unsigned vertex_bytes = 0;
   bool flat = false;
 };
+
+static unsigned constantSnappedSlot(Value *value) {
+  auto *offset = dyn_cast<Constant>(value);
+  if (!offset) return ~0u;
+  unsigned slot = 0;
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    auto *component = dyn_cast_or_null<ConstantFP>(offset->getAggregateElement(axis));
+    if (!component) return ~0u;
+    double scaled = component->getValueAPF().convertToDouble() * 16.0;
+    if (!(scaled >= 0 && scaled < 16) || scaled != unsigned(scaled)) return ~0u;
+    slot |= unsigned(scaled) << (4 * axis);
+  }
+  return slot;
+}
+
+static unsigned pullCount(const PulledInput &input, unsigned location, unsigned samples) {
+  if (location == PullOffset) return input.snapped_slots.empty() ? 256u : unsigned(input.snapped_slots.size());
+  return location == PullSample ? samples : location == PullCentroid ? samples + 1 : 1;
+}
 
 struct LineInput {
   unsigned argument;
@@ -606,7 +628,7 @@ Value *centroidSlot(IRBuilder<> &builder, Value *primitiveCoverage, Value *psoMa
 
 Value *recordPointer(IRBuilder<> &builder, Value *scratch, Value *pixel, unsigned stride, unsigned offset);
 
-Value *pullIndex(IRBuilder<> &builder, CallInst &call, unsigned location, unsigned sampleCount,
+Value *pullIndex(IRBuilder<> &builder, CallInst &call, const PulledInput &input, unsigned location, unsigned sampleCount,
                  Value *scratch, Value *pixel, Value *control, unsigned inputWords) {
   switch (location) {
   case PullCenter: return builder.getInt32(0);
@@ -619,6 +641,12 @@ Value *pullIndex(IRBuilder<> &builder, CallInst &call, unsigned location, unsign
   }
   case PullSample: return builder.CreateAnd(call.getArgOperand(1), builder.getInt32(sampleCount - 1));
   case PullOffset: {
+    if (!input.snapped_slots.empty()) {
+      unsigned slot = constantSnappedSlot(call.getArgOperand(1));
+      auto position = std::find(input.snapped_slots.begin(), input.snapped_slots.end(), slot);
+      if (position == input.snapped_slots.end()) return nullptr;
+      return builder.getInt32(unsigned(position - input.snapped_slots.begin()));
+    }
     // Slot zero represents D3D -8/16, or 0/16 relative to Metal's pixel corner.
     auto *offset = call.getArgOperand(1);
     Value *components[2];
@@ -657,6 +685,23 @@ Value *inTile(IRBuilder<> &builder, Value *position, Value *control) {
   auto *originY = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(builder.getInt32Ty(), control, 1));
   return builder.CreateAnd(builder.CreateICmpULT(builder.CreateSub(x, originX), builder.getInt32(8)),
                            builder.CreateICmpULT(builder.CreateSub(y, originY), builder.getInt32(8)));
+}
+
+Value *inTaskScissor(IRBuilder<> &builder, Value *position, Value *control) {
+  auto load = [&](unsigned offset) {
+    return capturedLoad(builder, builder.getInt32Ty(),
+      builder.CreateConstGEP1_32(builder.getInt32Ty(), control, offset / 4));
+  };
+  Value *inside = builder.getTrue();
+  for (unsigned axis = 0; axis < 2; ++axis) {
+    auto *coordinate = builder.CreateExtractElement(position, builder.getInt32(axis));
+    auto *low = builder.CreateUIToFP(load(offsetof(SM50_MSAA_TILE_CONTROL, scissor_left) + axis * 4), builder.getFloatTy());
+    auto *high = builder.CreateUIToFP(load(offsetof(SM50_MSAA_TILE_CONTROL, scissor_right) + axis * 4), builder.getFloatTy());
+    auto *extent = builder.CreateUIToFP(load(offsetof(SM50_MSAA_TILE_CONTROL, render_width) + axis * 4), builder.getFloatTy());
+    inside = builder.CreateAnd(inside, builder.CreateAnd(builder.CreateFCmpOGE(coordinate, low),
+      builder.CreateAnd(builder.CreateFCmpOLT(coordinate, high), builder.CreateFCmpOLT(coordinate, extent))));
+  }
+  return inside;
 }
 
 Value *quadShuffle(IRBuilder<> &builder, Module &module, Value *value, unsigned lane) {
@@ -726,7 +771,8 @@ void conditionalStore(IRBuilder<> &builder, Function &entry, Value *predicate, V
   builder.SetInsertPoint(join);
 }
 
-Value *readUintTexture(IRBuilder<> &b, Module &module, Value *texture, Value *xy, Value *sample = nullptr) {
+Value *readUintTexture(IRBuilder<> &b, Module &module, Value *texture, Value *xy, Value *sample = nullptr,
+                       Value *layer = nullptr) {
   auto *version = module.getNamedMetadata("air.version");
   auto *minor = mdconst::extract<ConstantInt>(version->getOperand(0)->getOperand(1));
   const bool extended = minor->getZExtValue() >= 8;
@@ -742,19 +788,22 @@ Value *readUintTexture(IRBuilder<> &b, Module &module, Value *texture, Value *xy
     types.push_back(sampler->getPointerTo(2)); args.push_back(b.CreateCall(getter));
   }
   types.push_back(xy->getType()); args.push_back(xy);
+  if (layer) { types.push_back(b.getInt32Ty()); args.push_back(layer); }
   if (extended && !sample) {
     types.push_back(xy->getType()); args.push_back(Constant::getNullValue(xy->getType()));
   }
   types.append({b.getInt32Ty(), b.getInt32Ty()});
   args.append({sample ? sample : b.getInt32(0), b.getInt32(1)});
   auto *response = StructType::get(module.getContext(), {FixedVectorType::get(b.getInt32Ty(), 4), b.getInt8Ty()});
-  auto read = module.getOrInsertFunction(sample ? "air.read_texture_2d_ms.u.v4i32" : "air.read_texture_2d.u.v4i32",
+  auto read = module.getOrInsertFunction(sample
+    ? layer ? "air.read_texture_2d_ms_array.u.v4i32" : "air.read_texture_2d_ms.u.v4i32"
+    : layer ? "air.read_texture_2d_array.u.v4i32" : "air.read_texture_2d.u.v4i32",
     FunctionType::get(response, types, false));
   return b.CreateExtractValue(b.CreateCall(read, args), 0);
 }
 
 Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *position,
-                unsigned sampleCount, bool boundHelpers) {
+                unsigned sampleCount, bool boundHelpers, Value *layer = nullptr, Value *taskControl = nullptr) {
   Value *xy = UndefValue::get(FixedVectorType::get(builder.getInt32Ty(), 2));
   for (unsigned i = 0; i < 2; ++i)
     xy = builder.CreateInsertElement(xy, builder.CreateFPToUI(
@@ -764,14 +813,18 @@ Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *pos
   if (boundHelpers) {
     // Logical helpers at a partial last tile still execute the complete app
     // quad. They have zero raster coverage, not an out-of-bounds scratch read.
-    Value *inside = builder.getTrue();
+    Value *inside = taskControl ? inTaskScissor(builder, position, taskControl)
+                                : static_cast<Value *>(builder.getTrue());
     for (unsigned axis = 0; axis < 2; ++axis) {
       SmallVector<Type *, 2> types{texture->getType()};
       SmallVector<Value *, 2> arguments{texture};
       if (sampleCount == 1) { types.push_back(builder.getInt32Ty()); arguments.push_back(builder.getInt32(0)); }
-      auto query = module.getOrInsertFunction(sampleCount == 1
-        ? axis ? "air.get_height_texture_2d" : "air.get_width_texture_2d"
-        : axis ? "air.get_height_texture_2d_ms" : "air.get_width_texture_2d_ms",
+      const char *name = sampleCount == 1
+        ? layer ? axis ? "air.get_height_texture_2d_array" : "air.get_width_texture_2d_array"
+                : axis ? "air.get_height_texture_2d" : "air.get_width_texture_2d"
+        : layer ? axis ? "air.get_height_texture_2d_ms_array" : "air.get_width_texture_2d_ms_array"
+                : axis ? "air.get_height_texture_2d_ms" : "air.get_width_texture_2d_ms";
+      auto query = module.getOrInsertFunction(name,
         FunctionType::get(builder.getInt32Ty(), types, false));
       auto *extent = builder.CreateCall(query, arguments);
       inside = builder.CreateAnd(inside, builder.CreateICmpULT(
@@ -784,12 +837,12 @@ Value *postMask(IRBuilder<> &builder, Module &module, Value *texture, Value *pos
   }
   Value *mask = builder.getInt32(0);
   if (sampleCount == 1) {
-    auto *value = readUintTexture(builder, module, texture, xy);
+    auto *value = readUintTexture(builder, module, texture, xy, nullptr, layer);
     mask = builder.CreateSelect(builder.CreateICmpNE(builder.CreateExtractElement(
       value, builder.getInt32(0)), builder.getInt32(0)),
       builder.getInt32(1), builder.getInt32(0));
   } else for (unsigned sample = 0; sample < sampleCount; ++sample) {
-    auto *value = readUintTexture(builder, module, texture, xy, builder.getInt32(sample));
+    auto *value = readUintTexture(builder, module, texture, xy, builder.getInt32(sample), layer);
     auto *covered = builder.CreateICmpNE(builder.CreateExtractElement(value,
                                              builder.getInt32(0)), builder.getInt32(0));
     mask = builder.CreateOr(mask, builder.CreateSelect(covered, builder.getInt32(1u << sample), builder.getInt32(0)));
@@ -915,7 +968,8 @@ Error maskSampleFrequency(Module &module, uint32_t sampleMask) {
 Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &options, bool coarseRequested,
                      bool conservative) {
   const bool promoted = options.variant & SM50_MSAA_ATOMIC_HELPERS;
-  const unsigned variant = options.variant & ~SM50_MSAA_ATOMIC_HELPERS;
+  const bool gpuTileTasks = options.variant & SM50_MSAA_GPU_TILE_TASKS;
+  const unsigned variant = options.variant & ~(SM50_MSAA_ATOMIC_HELPERS | SM50_MSAA_GPU_TILE_TASKS);
   const bool promotedApp = promoted && (variant == SM50_MSAA_PIXEL || variant == SM50_MSAA_SAMPLE_APP);
   if (options.sample_count != 1 && options.sample_count != 2 &&
       options.sample_count != 4 && options.sample_count != 8 && options.sample_count != 16)
@@ -992,6 +1046,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   SmallVector<unsigned, 24> offsets(original->arg_size(), ~0u);
   unsigned inputWords = 2;
   unsigned flags = promoted ? SM50_MSAA_PIXEL_ATOMIC_HELPERS : 0;
+  if (gpuTileTasks) flags |= SM50_MSAA_PIXEL_GPU_TILE_TASKS;
   for (unsigned i = 0; i < original->arg_size(); ++i) {
     auto *md = cast<MDNode>(oldInputs->getOperand(i));
     auto type = kind(*md);
@@ -1098,6 +1153,8 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     pulled.push_back({.argument = i, .perspective = perspective});
     if (coarseShading) planes.inputs.push_back({.argument = i, .perspective = perspective});
     auto &plan = pulled.back();
+    bool used[4]{};
+    bool dynamicOffset = false;
     if (auto *field = spilledField(md)) {
       plan.vertex_offset = field->offset_dwords;
       plan.vertex_bytes = field->size_bytes;
@@ -1113,15 +1170,26 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (location == ~0u) return invalid("opaque interpolant escapes native interpolation");
       if (callee->getName().contains("no_perspective") == perspective)
         return invalid("native pull perspective mode differs from AIR metadata");
-      // Coarse variants evaluate every pull from the primitive's planes instead of per-pixel records.
-      if (plan.offset[location] == ~0u && !coarseShading) {
-        plan.offset[location] = inputWords;
-        unsigned count = location == PullOffset ? 256 : location == PullSample ? options.sample_count :
-                         location == PullCentroid ? options.sample_count + 1 : 1;
-        inputWords += 4 * count;
-        plan.anchor[location] = inputWords;
-        inputWords += 8 * count;
+      used[location] = true;
+      if (!coarseShading && location == PullOffset && !dynamicOffset) {
+        unsigned slot = constantSnappedSlot(call->getArgOperand(1));
+        if (slot == ~0u) dynamicOffset = true;
+        else if (std::find(plan.snapped_slots.begin(), plan.snapped_slots.end(), slot) == plan.snapped_slots.end()) {
+          if (plan.snapped_slots.size() == 8) dynamicOffset = true;
+          else plan.snapped_slots.push_back(slot);
+        }
       }
+    }
+    if (dynamicOffset) plan.snapped_slots.clear();
+    else std::sort(plan.snapped_slots.begin(), plan.snapped_slots.end());
+    // Coarse variants evaluate pulls from the primitive planes.
+    for (unsigned location = 0; !coarseShading && location < 4; ++location) {
+      if (!used[location]) continue;
+      unsigned count = pullCount(plan, location, options.sample_count);
+      plan.offset[location] = inputWords;
+      inputWords += 4 * count;
+      plan.anchor[location] = inputWords;
+      inputWords += 8 * count;
     }
   }
   SmallVector<DistanceInput, 8> distanceInputs;
@@ -1293,11 +1361,14 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
   }
   if (variant != SM50_MSAA_COVERAGE) {
     textureArg = parameters.size();
-    StringRef textureName = options.sample_count == 1 ? "struct._texture_2d_t" : "struct._texture_2d_ms_t";
+    StringRef textureName = options.sample_count == 1
+      ? gpuTileTasks ? "struct._texture_2d_array_t" : "struct._texture_2d_t"
+      : gpuTileTasks ? "struct._texture_2d_ms_array_t" : "struct._texture_2d_ms_t";
     auto *textureType = StructType::getTypeByName(context, textureName);
     if (!textureType) textureType = StructType::create(context, textureName);
     parameters.push_back(textureType->getPointerTo(1));
-    metadata.push_back(textureMetadata(textureArg, context, options.sample_count != 1));
+    metadata.push_back(textureMetadata(textureArg, context, options.sample_count != 1,
+      SM50_BINDING_INDEX_MSAA_COVERAGE, gpuTileTasks));
   }
   unsigned positionArg = ~0u, sampleArg = ~0u, coverageArg = ~0u;
   if (variant != SM50_MSAA_COVERAGE || positionOld == ~0u) {
@@ -1405,21 +1476,37 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     nativeHelper->setConvergent();
     tile = builder.CreateAnd(tile, builder.CreateNot(nativeHelper));
   }
+  Value *taskScissor = nullptr;
+  if (gpuTileTasks) {
+    auto *active = capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(
+      builder.getInt32Ty(), control, offsetof(SM50_MSAA_TILE_CONTROL, task_active) / 4));
+    tile = builder.CreateAnd(tile, builder.CreateICmpNE(active, builder.getInt32(0)));
+    taskScissor = inTaskScissor(builder, position, control);
+    // Replay has no application derivatives. Capture and app roles retain all quad lanes until their
+    // coverage mask is known; a fine scissor must not remove inputs needed by another lane's derivatives.
+    if (variant == SM50_MSAA_REPLAY) tile = builder.CreateAnd(tile, taskScissor);
+  }
   auto *valid = BasicBlock::Create(context, "valid_tile_pixel", entry);
   auto *done = BasicBlock::Create(context, "outside_tile", entry);
   builder.CreateCondBr(tile, valid, done);
   builder.SetInsertPoint(done);
-  if (variant == SM50_MSAA_PIXEL || promotedApp) {
+  if (gpuTileTasks || variant == SM50_MSAA_PIXEL || promotedApp) {
     auto discard = module.getOrInsertFunction("air.discard_fragment", FunctionType::get(builder.getVoidTy(), {}, false));
     builder.CreateCall(discard);
+  }
+  if (returnType->isVoidTy())
     builder.CreateRetVoid();
-  } else if (variant == SM50_MSAA_COVERAGE)
+  else if (variant == SM50_MSAA_COVERAGE)
     builder.CreateRet(ConstantAggregateZero::get(returnType));
-  else if (returnType->isVoidTy())
-    builder.CreateRetVoid();
   else
     builder.CreateRet(Constant::getNullValue(returnType));
   builder.SetInsertPoint(valid);
+  Value *taskLayer = gpuTileTasks ? capturedLoad(builder, builder.getInt32Ty(), builder.CreateConstGEP1_32(
+    builder.getInt32Ty(), control, offsetof(SM50_MSAA_TILE_CONTROL, target_layer) / 4)) : nullptr;
+  auto postCoverage = [&](Value *at) {
+    return postMask(builder, module, entry->getArg(textureArg), at, options.sample_count,
+      promotedApp || gpuTileTasks, taskLayer, gpuTileTasks ? control : nullptr);
+  };
   auto *pixel = pixelIndex(builder, position, control);
   // Split 16x has no single native coverage texture: both 8x halves OR their logical coverage into record
   // dword 1 (no depth/stencil is allowed with forced samples), so the post-raster mask is that union & SampleMask.
@@ -1457,6 +1544,19 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     if (lineMaskOffset != ~0u)
       geometricCoverage = capturedLoad(builder, builder.getInt32Ty(),
         recordPointer(builder, scratch, pixel, inputWords, lineMaskOffset));
+    if (gpuTileTasks) {
+      geometricCoverage = builder.CreateSelect(taskScissor, geometricCoverage, builder.getInt32(0));
+      // Fine-scissor lanes still supply pull/quad helper values below. Discard makes every subsequent store
+      // and native output inactive while preserving that helper execution, just like native scissoring.
+      auto *inside = BasicBlock::Create(context, "task_scissor_capture", entry);
+      auto *outside = BasicBlock::Create(context, "task_scissor_helper", entry);
+      builder.CreateCondBr(taskScissor, inside, outside);
+      builder.SetInsertPoint(outside);
+      builder.CreateCall(module.getOrInsertFunction("air.discard_fragment",
+        FunctionType::get(builder.getVoidTy(), {}, false)));
+      builder.CreateBr(inside);
+      builder.SetInsertPoint(inside);
+    }
     // Native coverage of this pass's 8 samples; split 16x maps it to logical samples [sample_base, +8).
     // Line masks are written by the gather pass in logical bits already.
     Value *sampleBase = split ? static_cast<Value *>(capturedLoad(builder, builder.getInt32Ty(),
@@ -1764,8 +1864,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         [&plan](const LineInput &input) { return input.argument == plan.argument; });
       for (unsigned location = 0; location < 4; ++location) {
         if (plan.offset[location] == ~0u) continue;
-        unsigned count = location == PullOffset ? 256 : location == PullSample ? options.sample_count :
-                         location == PullCentroid ? options.sample_count + 1 : 1;
+        unsigned count = pullCount(plan, location, options.sample_count);
         auto *loop = BasicBlock::Create(context, "capture_interpolation", entry);
         auto *after = BasicBlock::Create(context, "interpolation_captured", entry);
         auto *before = builder.GetInsertBlock();
@@ -1782,8 +1881,15 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         if (location == PullSample) {types.push_back(builder.getInt32Ty()); args.push_back(index);}
         if (location == PullOffset) {
           auto *offset = UndefValue::get(FixedVectorType::get(builder.getFloatTy(), 2));
-          auto *x = builder.CreateAnd(index, builder.getInt32(15));
-          auto *y = builder.CreateLShr(index, 4);
+          Value *slot = index;
+          if (!plan.snapped_slots.empty()) {
+            slot = builder.getInt32(plan.snapped_slots.front());
+            for (unsigned j = 1; j < count; ++j)
+              slot = builder.CreateSelect(builder.CreateICmpEQ(index, builder.getInt32(j)),
+                                          builder.getInt32(plan.snapped_slots[j]), slot);
+          }
+          auto *x = builder.CreateAnd(slot, builder.getInt32(15));
+          auto *y = builder.CreateLShr(slot, 4);
           Value *xy = builder.CreateInsertElement(offset,
             builder.CreateUIToFP(x, builder.getFloatTy()), builder.getInt32(0));
           xy = builder.CreateInsertElement(xy,
@@ -1941,7 +2047,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     auto *rate = coarse::load(builder, scratch, inputWords, coarse::kRateRecordDword, builder.getInt32Ty());
     auto grid = coarse::grid(builder, position, control, rate);
     auto coverage = coarse::coverage(builder, grid, control, scratch, inputWords, options.sample_count,
-      [&](Value *at) { return postMask(builder, module, entry->getArg(textureArg), at, options.sample_count, promotedApp); });
+      postCoverage);
     Value *innerMask = builder.getInt32(0);
     if (conservative && innerOld != ~0u) {
       // VRS specifies the same fine-pixel/sample bit order as SV_Coverage, but
@@ -2047,8 +2153,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     builder.CreateRetVoid();
   } else if (variant == SM50_MSAA_PIXEL) {
     auto *scratch = entry->getArg(inputArg);
-    auto *mask = split ? logicalMask(pixel)
-                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count, promotedApp);
+    auto *mask = split ? logicalMask(pixel) : postCoverage(position);
     Value *covered = builder.CreateICmpNE(mask, builder.getInt32(0));
     auto *shade = BasicBlock::Create(context, "shade_once", entry);
     auto *discard = BasicBlock::Create(context, "no_covered_samples", entry);
@@ -2199,9 +2304,10 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
         if (found == pulled.end() || found->offset[location] == ~0u)
           return invalid("unrecognized finite interpolant source");
         IRBuilder<> load(call);
-        auto *index = pullIndex(load, *call, location, options.sample_count,
+        auto *index = pullIndex(load, *call, *found, location, options.sample_count,
           body->getArg(original->arg_size()), body->getArg(original->arg_size() + 1),
           body->getArg(original->arg_size() + 2), inputWords);
+        if (!index) return invalid("finite snapped offset missing from capture");
         auto *base = recordPointer(load, body->getArg(original->arg_size()),
                                     body->getArg(original->arg_size() + 1), inputWords, found->offset[location]);
         auto *array = load.CreateBitCast(base, PointerType::get(call->getType(), unsigned(air::AddressSpace::device)));
@@ -2245,8 +2351,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
     conditionalStore(builder, *entry, covered, recordPointer(builder, out, pixel, outputWords, 0), builder.getInt32(1));
     builder.CreateRetVoid();
   } else {
-    auto *mask = split ? logicalMask(pixel)
-                       : postMask(builder, module, entry->getArg(textureArg), position, options.sample_count, promotedApp);
+    auto *mask = split ? logicalMask(pixel) : postCoverage(position);
     Value *boundsMask = builder.getInt32(~0u);
     if (boundsMaskOffset != ~0u) {
       auto *enabled = capturedLoad(builder, builder.getInt32Ty(),
@@ -2495,9 +2600,10 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           if (found == pulled.end() || found->offset[location] == ~0u)
             return invalid("unrecognized finite sample-frequency interpolant");
           IRBuilder<> load(call);
-          auto *index = pullIndex(load, *call, location, options.sample_count,
+          auto *index = pullIndex(load, *call, *found, location, options.sample_count,
             body->getArg(original->arg_size()), body->getArg(original->arg_size() + 1),
             body->getArg(original->arg_size() + 2), inputWords);
+          if (!index) return invalid("finite sample-frequency snapped offset missing from capture");
           auto *base = recordPointer(load, body->getArg(original->arg_size()),
                                       body->getArg(original->arg_size() + 1), inputWords, found->offset[location]);
           auto *array = load.CreateBitCast(base, PointerType::get(call->getType(), unsigned(air::AddressSpace::device)));

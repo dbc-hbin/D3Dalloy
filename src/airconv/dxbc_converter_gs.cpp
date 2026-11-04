@@ -2,6 +2,8 @@
 #include "air_signature.hpp"
 #include "airconv_error.hpp"
 #include "dxbc_converter.hpp"
+#include "capture_frontier.hpp"
+#include "mesh_index_buffer_view.hpp"
 #include "nt/air_builder.hpp"
 #include "llvm/IR/Constants.h"
 #include "llvm/Support/Alignment.h"
@@ -248,6 +250,7 @@ convert_dxbc_geometry_shader(
   // it's intended to declare a bit more max primitive count
   auto mesh_idx = func_signature.DefineInput(air::InputMesh{(uint32_t)max_vertex_out, (uint32_t)max_vertex_out, topology});
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  const uint32_t frontier_idx = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   SM50_SHADER_D3D12_MSAA_MESH_DATA *msaa_mesh = nullptr;
   const bool msaa_capture = args_get_data<SM50_SHADER_D3D12_MSAA_MESH, SM50_SHADER_D3D12_MSAA_MESH_DATA>(
       pArgs, &msaa_mesh) && msaa_mesh->variant == SM50_MSAA_VERTEX_CAPTURE;
@@ -596,16 +599,26 @@ convert_dxbc_geometry_shader(
   // Flat input primitive index of this invocation.
   auto *flat_primitive =
       builder.CreateAdd(builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count)), primitive_id_in_warp);
+  llvm::Value *local_primitive = flat_primitive;
+  if (frontier_idx != ~0u)
+    local_primitive = builder.CreateAdd(
+        builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 3)),
+        primitive_id_in_warp);
   if (msaa_capture) {
-    auto *per_instance = builder.CreateLoad(types._int, function->getArg(msaa_control_idx));
-    auto *instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+    llvm::Value *per_instance = builder.CreateLoad(types._int, function->getArg(msaa_control_idx));
+    llvm::Value *instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+    if (frontier_idx != ~0u) {
+      per_instance = load_capture_frontier(builder, function->getArg(frontier_idx),
+          offsetof(SM50_CAPTURE_FRONTIER_CONTROL, local_primitive_count));
+      instance = builder.getInt32(0);
+    }
     auto *slot = builder.CreateAdd(
-        builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, per_instance), flat_primitive),
+        builder.CreateMul(builder.CreateAdd(builder.CreateMul(instance, per_instance), local_primitive),
                           builder.getInt32(pShaderInternal->gs_instance_count)), resource_map.gs_instance_id);
     auto marker = module.getOrInsertFunction("d3dalloy.msaa.mesh.slot",
         llvm::FunctionType::get(builder.getVoidTy(), {types._int}, false));
     builder.CreateCall(marker, {builder.CreateSelect(
-        builder.CreateICmpULT(flat_primitive, per_instance), slot, builder.getInt32(~0u))});
+        builder.CreateICmpULT(local_primitive, per_instance), slot, builder.getInt32(~0u))});
   }
   if (tess_input) {
     /* The GS object stores each primitive's DS patch ID after the Wv vertices (see
@@ -620,10 +633,11 @@ convert_dxbc_geometry_shader(
         )
     );
   } else {
-    resource_map.patch_id = flat_primitive;
+    resource_map.patch_id = frontier_idx == ~0u ? flat_primitive
+        : capture_frontier_primitive(builder, function->getArg(frontier_idx), local_primitive);
   }
   if (statistics_key) {
-    statistics_key0 = flat_primitive;
+    statistics_key0 = local_primitive;
     statistics_key1 = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
     statistics_key2 = builder.CreateAdd(builder.CreateMul(resource_map.gs_instance_id, builder.getInt32(1024)), one_const);
   }
@@ -631,17 +645,22 @@ convert_dxbc_geometry_shader(
     /* key = ((draw instance * primitives per instance) + primitive id) * GS instances + GS instance: the D3D
      * stream-output order (SM50_SO_CAPTURE_CONTROL::positions_per_instance bounds the primitive id). With
      * tessellation input the draw instance is 0 and the flat index already spans every instance. */
-    auto *per_instance = builder.CreateLoad(
+    llvm::Value *per_instance = builder.CreateLoad(
         types._int, builder.CreateConstInBoundsGEP1_32(
                         types._int, function->getArg(so_control_idx),
                         offsetof(SM50_SO_CAPTURE_CONTROL, positions_per_instance) / 4));
-    auto *draw_instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
-    auto *primitive = builder.CreateAdd(builder.CreateMul(draw_instance, per_instance), flat_primitive);
+    llvm::Value *draw_instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+    if (frontier_idx != ~0u) {
+      per_instance = load_capture_frontier(builder, function->getArg(frontier_idx),
+          offsetof(SM50_CAPTURE_FRONTIER_CONTROL, local_primitive_count));
+      draw_instance = builder.getInt32(0);
+    }
+    auto *primitive = builder.CreateAdd(builder.CreateMul(draw_instance, per_instance), local_primitive);
     auto *key = builder.CreateAdd(builder.CreateMul(primitive, builder.getInt32(pShaderInternal->gs_instance_count)),
                                   resource_map.gs_instance_id);
     // A primitive id past the per-instance bound belongs to no record (it would alias the next draw instance).
     builder.CreateStore(
-        builder.CreateSelect(builder.CreateICmpULT(flat_primitive, per_instance), key, builder.getInt32(-1)),
+        builder.CreateSelect(builder.CreateICmpULT(local_primitive, per_instance), key, builder.getInt32(-1)),
         so_key);
   }
 
@@ -896,6 +915,7 @@ convert_dxbc_vertex_for_geometry_shader(
 
   bool is_triadj_strip = is_strip && pGeometryStage->gs_input_primitive == D3D10_SB_PRIMITIVE_TRIANGLE_ADJ;
   bool is_indexed_draw = ia_layout && ia_layout->index_buffer_format > 0;
+  const bool gpu_index_view = ia_layout && ia_layout->index_buffer_format == SM50_INDEX_BUFFER_FORMAT_GPU_VIEW;
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue {
@@ -947,8 +967,11 @@ convert_dxbc_vertex_for_geometry_shader(
       .raster_order_group = {}
   });
 
+  const uint32_t frontier_idx = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   uint32_t index_buffer_idx = ~0u;
-  if (is_indexed_draw) {
+  if (gpu_index_view) {
+    index_buffer_idx = define_mesh_index_buffer_view(func_signature, context);
+  } else if (is_indexed_draw) {
     index_buffer_idx = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = {},
         .location_index = SM50_BINDING_INDEX_INDEX_BUFFER,
@@ -988,8 +1011,16 @@ convert_dxbc_vertex_for_geometry_shader(
   auto warp_vertex_id = builder.CreateExtractElement(thread_position_in_group, (uint32_t)0);
 
   auto threadgroup_position_in_grid = function->getArg(tg_id_idx);
-  auto warp_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)0);
+  auto local_warp_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)0);
+  auto warp_id = local_warp_id;
   auto instance_id = builder.CreateExtractElement(threadgroup_position_in_grid, (uint32_t)1);
+  if (frontier_idx != ~0u) {
+    auto *control = function->getArg(frontier_idx);
+    warp_id = builder.CreateAdd(warp_id, load_capture_frontier(
+        builder, control, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, object_group_base)));
+    instance_id = builder.CreateAdd(instance_id, load_capture_frontier(
+        builder, control, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, instance_base)));
+  }
 
   auto draw_arguments = builder.CreateLoad(
     is_indexed_draw ? types._d3dalloy_draw_indexed_arguments
@@ -1082,12 +1113,34 @@ convert_dxbc_vertex_for_geometry_shader(
   // explicit initialization
   air.CreateAtomicRMW(llvm::AtomicRMWInst::BinOp::And, valid_vertex_mask, builder.getInt32(0));
 
-  builder.CreateCondBr(
-      builder.CreateICmp(llvm::CmpInst::ICMP_ULT, global_index_id, vertex_count), index_check, will_dispatch
-  );
+  llvm::Value *valid_position = builder.CreateICmpULT(global_index_id, vertex_count);
+  if (frontier_idx != ~0u) {
+    // The global IA ordinal intentionally uses 32-bit arithmetic. Bound the
+    // local producer separately so a rounded-up tail lane cannot wrap to an
+    // earlier vertex of a draw near UINT32_MAX.
+    auto *local_position = builder.CreateAdd(
+        builder.CreateMul(local_warp_id, builder.getInt32(warp_vertex_count)), warp_vertex_id);
+    valid_position = builder.CreateAnd(valid_position, builder.CreateICmpULT(
+        local_position, load_capture_frontier(builder, function->getArg(frontier_idx),
+            offsetof(SM50_CAPTURE_FRONTIER_CONTROL, producer_count))));
+  }
+  builder.CreateCondBr(valid_position, index_check, will_dispatch);
   builder.SetInsertPoint(index_check);
 
-  if (index_buffer_idx != ~0u) {
+  if (gpu_index_view) {
+    auto start_index = builder.CreateExtractValue(draw_arguments, 2);
+    if (frontier_idx != ~0u) {
+      auto *view = function->getArg(index_buffer_idx);
+      auto *words = builder.CreateBitCast(view, types._int->getPointerTo(
+          llvm::cast<llvm::PointerType>(view->getType())->getAddressSpace()));
+      start_index = builder.CreateLoad(types._int, builder.CreateConstGEP1_32(types._int, words, 4));
+    }
+    resource_map.vertex_id = load_mesh_index_buffer_view(
+        builder, function->getArg(index_buffer_idx), builder.CreateAdd(start_index, global_index_id));
+    // Matching strip cuts are expanded before this variant runs. In all other
+    // cases 0xffff/0xffffffff are ordinary indices, including list topologies.
+    builder.CreateBr(active);
+  } else if (index_buffer_idx != ~0u) {
     auto start_index = builder.CreateExtractValue(draw_arguments, 2);
     auto index_buffer = function->getArg(index_buffer_idx);
     auto index_buffer_element_type = index_buffer->getType()->getNonOpaquePointerElementType();
@@ -1095,20 +1148,27 @@ convert_dxbc_vertex_for_geometry_shader(
         index_buffer_element_type,
         builder.CreateGEP(index_buffer_element_type, index_buffer, {builder.CreateAdd(start_index, global_index_id)})
     );
-    // so 0xFFFF is mapped to 0xFFFFFFFF, other values are zero-extended
-    resource_map.vertex_id = builder.CreateSub(
-      builder.CreateZExt(
-        builder.CreateAdd(
-          vertex_id, llvm::ConstantInt::get(index_buffer_element_type, 1)
+    if (rootsig && !is_strip) {
+      // D3D12 list inputs have no restart value. This also consumes the lists
+      // produced by strip expansion, where matching cuts were already removed.
+      resource_map.vertex_id = builder.CreateZExt(vertex_id, types._int);
+      builder.CreateBr(active);
+    } else {
+      // so 0xFFFF is mapped to 0xFFFFFFFF, other values are zero-extended
+      resource_map.vertex_id = builder.CreateSub(
+        builder.CreateZExt(
+          builder.CreateAdd(
+            vertex_id, llvm::ConstantInt::get(index_buffer_element_type, 1)
+          ),
+          types._int
         ),
-        types._int
-      ),
-      llvm::ConstantInt::get(types._int, 1)
-    );
+        llvm::ConstantInt::get(types._int, 1)
+      );
 
-    builder.CreateCondBr(
-        builder.CreateICmp(llvm::CmpInst::ICMP_NE, builder.getInt32(-1), resource_map.vertex_id), active, will_dispatch
-    );
+      builder.CreateCondBr(
+          builder.CreateICmp(llvm::CmpInst::ICMP_NE, builder.getInt32(-1), resource_map.vertex_id), active, will_dispatch
+      );
+    }
   } else {
     resource_map.vertex_id = global_index_id;
     builder.CreateBr(active);
@@ -1221,6 +1281,9 @@ convert_dxbc_vertex_for_geometry_shader(
   builder.CreateStore(valid_primitive_mask, builder.CreateConstInBoundsGEP1_32(types._int, payload, 1));
 
   builder.CreateStore(warp_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
+  if (frontier_idx != ~0u)
+    builder.CreateStore(builder.CreateMul(local_warp_id, builder.getInt32(warp_primitive_count)),
+                        builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
 
   if (stats_arg != ~0u) {
     /* A warp shades up to 32 lanes but advances by warp_vertex_count (strips overlap the next warp).
@@ -1329,6 +1392,7 @@ convert_dxbc_domain_for_geometry_shader(
       .arg_name = "tess_capture_control",
       .raster_order_group = {}
   });
+  const uint32_t frontier_idx = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
 
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
@@ -1356,14 +1420,23 @@ convert_dxbc_domain_for_geometry_shader(
   auto *i64 = builder.getInt64Ty();
   auto widen = [&](llvm::Value *v) { return builder.CreateZExt(v, i64); };
 
-  auto *total = load_dword(list, builder.getInt32(0));
+  auto *parent_total = load_dword(list, builder.getInt32(0));
+  llvm::Value *total = parent_total;
+  llvm::Value *child_first = builder.getInt32(0);
+  if (frontier_idx != ~0u) {
+    auto *frontier = function->getArg(frontier_idx);
+    total = load_capture_frontier(builder, frontier, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, local_primitive_count));
+    child_first = load_capture_frontier(builder, frontier, offsetof(SM50_CAPTURE_FRONTIER_CONTROL, child_primitive_first));
+  }
   auto *warp_base = builder.CreateMul(warp_id, builder.getInt32(warp_primitive_count));
   auto *q = builder.CreateUDiv(thread_id, builder.getInt32(vertex_per_primitive));
   auto *k = builder.CreateURem(thread_id, builder.getInt32(vertex_per_primitive));
   auto *flat = builder.CreateAdd(warp_base, q);
+  auto *parent_flat = builder.CreateAdd(child_first, flat);
   builder.CreateCondBr(
       builder.CreateAnd(
-          builder.CreateICmpULT(thread_id, builder.getInt32(warp_vertex_count)), builder.CreateICmpULT(flat, total)
+          builder.CreateICmpULT(thread_id, builder.getInt32(warp_vertex_count)),
+          builder.CreateAnd(builder.CreateICmpULT(flat, total), builder.CreateICmpULT(parent_flat, parent_total))
       ),
       fetch_bb, fetched_bb
   );
@@ -1376,7 +1449,7 @@ convert_dxbc_domain_for_geometry_shader(
   auto *index_region = builder.CreateAdd(
       vertex_region, builder.CreateMul(slot_count, builder.getInt64(uint64_t(V) * R * 4))
   );
-  auto *entry = load_dword(list, builder.CreateAdd(builder.getInt32(4), flat));
+  auto *entry = load_dword(list, builder.CreateAdd(builder.getInt32(4), parent_flat));
   auto *slot = builder.CreateUDiv(entry, builder.getInt32(P));
   auto *vertex_index = load_dword(
       scratch, builder.CreateAdd(
@@ -1416,8 +1489,12 @@ convert_dxbc_domain_for_geometry_shader(
   builder.SetInsertPoint(patch_id_bb);
   auto *patch_count =
       load_dword(control, builder.getInt32(offsetof(SM50_TESS_CAPTURE_CONTROL, patch_count) / 4));
+  auto *patch_id = builder.CreateURem(builder.CreateUDiv(slot, builder.getInt32(W)), patch_count);
+  if (frontier_idx != ~0u)
+    patch_id = builder.CreateAdd(builder.CreateUDiv(slot, builder.getInt32(W)),
+        load_capture_frontier(builder, function->getArg(frontier_idx), offsetof(SM50_CAPTURE_FRONTIER_CONTROL, first_patch)));
   builder.CreateStore(
-      builder.CreateURem(builder.CreateUDiv(slot, builder.getInt32(W)), patch_count),
+      patch_id,
       builder.CreateGEP(types._int, payload, {builder.CreateAdd(builder.getInt32(patch_id_dword), q)})
   );
   builder.CreateBr(fetched_bb);
@@ -1437,11 +1514,17 @@ convert_dxbc_domain_for_geometry_shader(
       builder.CreateICmpUGE(valid_count, builder.getInt32(32)), builder.getInt32(-1),
       builder.CreateSub(builder.CreateShl(builder.getInt32(1), valid_count), builder.getInt32(1))
   );
-  // No draw-instance term: the flat primitive index already spans every draw instance.
-  builder.CreateStore(builder.getInt32(0), builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+  // Legacy captures flatten draw instances. A frontier parent belongs to one
+  // original instance and carries that application identity separately.
+  llvm::Value *instance_id = builder.getInt32(0);
+  if (frontier_idx != ~0u)
+    instance_id = load_capture_frontier(builder, function->getArg(frontier_idx),
+        offsetof(SM50_CAPTURE_FRONTIER_CONTROL, instance_base));
+  builder.CreateStore(instance_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
   builder.CreateStore(valid_primitive_mask, builder.CreateConstInBoundsGEP1_32(types._int, payload, 1));
   builder.CreateStore(warp_id, builder.CreateConstInBoundsGEP1_32(types._int, payload, 2));
-  builder.CreateStore(builder.getInt32(0), builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
+  builder.CreateStore(frontier_idx == ~0u ? builder.getInt32(0) : warp_base,
+                      builder.CreateConstInBoundsGEP1_32(types._int, payload, 3));
   // IA/VS/HS/DS statistics were counted by pass 1.
   air.CreateSetMeshProperties(air.getInt3(warp_primitive_count, pGeometryStage->gs_instance_count, 1));
   builder.CreateBr(return_bb);

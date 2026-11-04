@@ -643,6 +643,12 @@ void testPartialRows(Gpu &gpu) {
         for (UINT x = 0; x < 64; ++x)
           EXPECT_EQ(name, "pixel", row * 4096 + y * 64 + x, r.at(t, x, y), x < 32 ? rgba(128, 64, 255, 255) : 0u);
     }
+    for (uint32_t mode : {1u, 2u}) {
+      auto r = gpu.render(pso.Get(), gpu.root.Get(), t, {0, mode, 0, 0}, 1, [](auto *l) { l->DispatchMesh(1, 1, 1); });
+      if (closed(name, r))
+        for (UINT y = 0; y < 64; ++y) for (UINT x = 0; x < 64; ++x)
+          EXPECT_EQ(name, "explicit zero / skip SetMeshOutputCounts", y * 64 + x, r.at(t, x, y), 0u);
+    }
   }
   end(name);
 }

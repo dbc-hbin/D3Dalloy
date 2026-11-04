@@ -6,7 +6,12 @@
 #include "d3dalloy_texture.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include <array>
+#include <mutex>
 #include <unordered_map>
+
+namespace WMT4 {
+class Compiler;
+}
 
 namespace d3dalloy {
 struct TileBarrierPSOKey {
@@ -47,8 +52,12 @@ public:
     return library_;
   }
 
+  WMT::ComputePipelineState getWorkGraphSchedulerPipeline(WMT4::Compiler compiler, WMT::Error &error);
+
 private:
   WMT::Reference<WMT::Library> library_;
+  std::mutex work_graph_pipeline_mutex_;
+  WMT::Reference<WMT::ComputePipelineState> work_graph_pipeline_;
 };
 
 class EmulatedCommandContext {

@@ -1462,7 +1462,6 @@ public:
     auto &present_queue = present_queues_[current_buffer_];
     if (present_history_) {
       composition.history = present_history_;
-      composition.write_index = PresentFlags & DXGI_PRESENT_RESTART ? 0 : history_presents_ & 1;
       composition.has_previous = !(PresentFlags & DXGI_PRESENT_RESTART) && history_presents_ != 0;
       composition.width = backbuffer_desc_.Width;
       composition.height = backbuffer_desc_.Height;

@@ -18,7 +18,9 @@
 
 #include "d3d12.h"
 #include "Metal.hpp"
+#include "Metal4.hpp"
 #include "thread.hpp"
+#include "owned_sparse_heap_index.hpp"
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -39,11 +41,10 @@ class MTLD3D12Device;
  * atlas page, retaining exact independent mapping, NULL writes and shared-heap aliases even when
  * native 3D sparse pages have a different shape. MSAA reserved resources are not offered.
  *
- * Tile mappings are queue operations. A queue applies an update on its submission thread after the
- * GPU work it submitted earlier has completed (unless the caller passed NO_HAZARD), so every command
- * buffer committed before the update observes the old mapping and every later one the new mapping.
- * Metal applies MTL4 mapping updates when they are enqueued, not in event order, which is why the
- * ordering is established on the CPU. The mapping state below changes only in that order.
+ * Tile mappings are queue operations. ResourceState producer/consumer barriers bracket native
+ * updates on the device mapping queue; event edges order the public queue's earlier and later work.
+ * A bare event wait does not replace the ResourceState barrier. CPU targets advance at enqueue,
+ * while pending native publications retain both heap generations through actual GPU retirement.
  */
 constexpr uint32_t kReservedTileBytes = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
 constexpr uint32_t kReservedNullTile = ~0u;
@@ -88,9 +89,19 @@ class ReservedResource {
 public:
   static inline std::mutex MappingQueueMutex;
   ReservedResource() { live_.fetch_add(1, std::memory_order_relaxed); }
-  ~ReservedResource() { live_.fetch_sub(1, std::memory_order_relaxed); }
+  ~ReservedResource();
   ReservedResource(const ReservedResource &) = delete;
   ReservedResource &operator=(const ReservedResource &) = delete;
+
+  // The mutex protects enqueue/CPU targets, and Pending covers native remap
+  // completion. Negative proofs fall back rather than waiting for either.
+  static OwnedSparseHeapIndex::Pending BeginNativeMapping() { return heap_index_.BeginPending(); }
+  static OwnedSparseHeapIndex::Proof ProveHeapRanges(std::span<const OwnedHeapRange> ranges) {
+    return heap_index_.Prove(ranges, MappingQueueMutex);
+  }
+  static bool HeapProofCurrent(const OwnedSparseHeapIndex::Proof &proof) {
+    return heap_index_.Current(proof, MappingQueueMutex);
+  }
 
   /*
    * Whether any reserved resource exists in the process. Metal keeps sparse tiles that share a heap
@@ -212,28 +223,54 @@ public:
 
   /*
    * Queue-ordered mapping state. `assignments` pairs a linear tile with its new target. The Metal
-   * update operations are enqueued on `queue`; `status` (buffers) receives a byte per tile.
+   * update operations are enqueued on `queue`. A supplied publication encoder
+   * writes residency bytes/words on the GPU; retirement_heaps pins old and new
+   * native heaps independently of subsequent CPU target changes.
+   * False means no mapping or residency publication was encoded, so the caller
+   * needs no new native completion event. Its prior-use ordering is unchanged.
    */
-  void Apply(
+  bool Apply(
       WMT::MTL4CommandQueue queue, WMT::Buffer buffer, WMT::Texture texture,
-      const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
+      const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments,
+      WMT::MTL4ComputeCommandEncoder publication = {},
+      std::vector<WMT::Reference<WMT::Heap>> *retirement_heaps = nullptr
   );
+  bool HasMappingChanges(const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments) const;
+  struct MappingReady {
+    WMT::Reference<WMT::SharedEvent> event;
+    uint64_t value = 0;
+  };
+  MappingReady NativeMappingReady() const {
+    std::lock_guard<d3dalloy::mutex> lock(mutex);
+    return mapping_ready_;
+  }
+  void PublishMappingReady(WMT::SharedEvent event, uint64_t value) {
+    std::lock_guard<d3dalloy::mutex> lock(mutex);
+    mapping_ready_ = {event, value};
+  }
 
   /* The current target of each tile, read in queue order by CopyTileMappings. */
   ReservedTileTarget CurrentTarget(uint32_t tile);
+  // CPU logical generation. Capture under MappingQueueMutex and order native
+  // users after the mapping queue publication; CPU capture alone is not ready.
+  uint64_t MappingGeneration() const {
+    std::lock_guard<d3dalloy::mutex> lock(mutex);
+    return mapping_generation_;
+  }
   uint64_t CollectMappedTiles(uint64_t seen_generation, std::vector<uint32_t> &tiles,
                               uint32_t subresource = UINT32_MAX);
   void MapCastTiles(WMT::MTL4CommandQueue queue, WMT::Texture texture, WMT::Heap heap,
                     const std::unordered_set<uint32_t> &tiles);
 
   /*
-   * Buffers: CPU-visible residency bytes, biased in BufferAllocation::residencyStatusBase.
+   * Buffers: GPU-published residency bytes, biased in BufferAllocation::residencyStatusBase.
    * Reserved volumes: GPU-published uint32 words per logical tile; status_bytes stays null.
+   * The CPU pointer is used only for initial zeroing and synchronous creation.
    */
   WMT::Reference<WMT::Buffer> status_buffer;
   uint8_t *status_bytes = nullptr;
 
-  d3dalloy::mutex mutex;
+  mutable d3dalloy::mutex mutex;
 
 private:
   void EncodeTexture(
@@ -248,6 +285,7 @@ private:
   void Release(const ReservedTileTarget &target);
 
   static inline std::atomic<uint32_t> live_{0};
+  static inline OwnedSparseHeapIndex heap_index_;
 
   bool is_buffer_ = false;
   bool volume_ = false;
@@ -269,6 +307,7 @@ private:
   std::vector<ReservedTileTarget> targets_;
   std::unordered_set<uint32_t> mapped_tiles_;
   uint64_t mapping_generation_ = 0;
+  MappingReady mapping_ready_;
   std::unordered_map<WMTPixelFormat, WMT::Reference<WMT::Texture>> volume_cast_atlases_;
   std::unordered_map<obj_handle_t, std::pair<WMT::Reference<WMT::Heap>, uint32_t>> heaps_;
 };

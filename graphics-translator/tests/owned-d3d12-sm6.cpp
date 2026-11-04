@@ -561,56 +561,60 @@ void testWave(Compute &c, const char *entry = "cs_wave", uint32_t width = 32, co
 void testDivergent(Compute &c, const char *entry = "cs_divergent", uint32_t width = 32,
                    const char *name = "divergent") {
   begin();
-  auto r = c.run(entry, filled(64 * 64), filled(64), filled(64), {3, 0, 0, 0}, 1);
-  if (!r.empty()) {
-    const auto &o = r[0];
-    auto s = [](uint32_t gi) { return static_cast<int32_t>(gi * 2654435761u) >> 8; };
-    auto u = [](uint32_t gi) { return gi * 2246822519u; };
-    auto active = [](uint32_t gi) { return (gi % 3) != 0; };
-    for (uint32_t gi = 0; gi < 64; ++gi) {
-      const size_t b = gi * 64;
-      if (!active(gi)) {
-        for (uint32_t k = 0; k < 16; ++k)
-          EXPECT_EQ(name, "inactive", gi, load<uint32_t>(o, b + k * 4), 0xdeadbeefu);
-        continue;
-      }
-      const uint32_t lane = gi % width, first = gi - lane;
-      uint32_t count = 0, lowest = width, sum = 0, umax = 0, psum = 0, pcount = 0, ballot = 0, match = 0;
-      int32_t smin = INT32_MAX;
-      uint32_t mpsum = 0, mpcount = 0, mpproduct = 1, mpor = 0, mpxor = 0, mpand = ~0u;
-      for (uint32_t l = 0; l < width; ++l) {
-        const uint32_t g = first + l;
-        if (!active(g))
+  // The second mask puts full and partial logical waves in the same physical
+  // SIMD32. Their reduction paths must not exchange values across partitions.
+  for (uint32_t modulus : {3u, 2 * width + 1}) {
+    auto r = c.run(entry, filled(64 * 64), filled(64), filled(64), {modulus, 0, 0, 0}, 1);
+    if (!r.empty()) {
+      const auto &o = r[0];
+      auto s = [](uint32_t gi) { return static_cast<int32_t>(gi * 2654435761u) >> 8; };
+      auto u = [](uint32_t gi) { return gi * 2246822519u; };
+      auto active = [modulus](uint32_t gi) { return (gi % modulus) != 0; };
+      for (uint32_t gi = 0; gi < 64; ++gi) {
+        const size_t b = gi * 64;
+        if (!active(gi)) {
+          for (uint32_t k = 0; k < 16; ++k)
+            EXPECT_EQ(name, "inactive", gi, load<uint32_t>(o, b + k * 4), 0xdeadbeefu);
           continue;
-        ++count;
-        lowest = std::min(lowest, l);
-        sum += u(g);
-        smin = std::min(smin, s(g));
-        umax = std::max(umax, u(g));
-        ballot |= 1u << l;
-        const bool same = (g % 5) == (gi % 5);
-        if (same)
-          match |= 1u << l;
-        if (l < lane) {
-          psum += g;
-          ++pcount;
-          if (same) {
-            mpsum += g;
-            mpcount += (g & 1) != 0;
-            mpproduct *= (g & 3) + 1;
-            mpor |= 1u << (g & 31);
-            mpxor ^= u(g);
-            mpand &= ~(1u << (g & 31));
+        }
+        const uint32_t lane = gi % width, first = gi - lane;
+        uint32_t count = 0, lowest = width, sum = 0, umax = 0, psum = 0, pcount = 0, ballot = 0, match = 0;
+        int32_t smin = INT32_MAX;
+        uint32_t mpsum = 0, mpcount = 0, mpproduct = 1, mpor = 0, mpxor = 0, mpand = ~0u;
+        for (uint32_t l = 0; l < width; ++l) {
+          const uint32_t g = first + l;
+          if (!active(g))
+            continue;
+          ++count;
+          lowest = std::min(lowest, l);
+          sum += u(g);
+          smin = std::min(smin, s(g));
+          umax = std::max(umax, u(g));
+          ballot |= 1u << l;
+          const bool same = (g % 5) == (gi % 5);
+          if (same)
+            match |= 1u << l;
+          if (l < lane) {
+            psum += g;
+            ++pcount;
+            if (same) {
+              mpsum += g;
+              mpcount += (g & 1) != 0;
+              mpproduct *= (g & 3) + 1;
+              mpor |= 1u << (g & 31);
+              mpxor ^= u(g);
+              mpand &= ~(1u << (g & 31));
+            }
           }
         }
+        const uint32_t expected[16] = {count, lane == lowest, first + lowest, sum, static_cast<uint32_t>(smin), umax,
+                                       psum, pcount, ballot, match, mpsum, mpcount, mpproduct, mpor, mpxor, mpand};
+        static const char *names[16] = {"count", "isfirst", "readfirst", "sum", "min.s", "max.u", "prefixsum",
+                                        "prefixcount", "ballot", "match", "multiprefix.sum", "multiprefix.count",
+                                        "multiprefix.product", "multiprefix.or", "multiprefix.xor", "multiprefix.and"};
+        for (uint32_t k = 0; k < 16; ++k)
+          EXPECT_EQ(name, names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
       }
-      const uint32_t expected[16] = {count, lane == lowest, first + lowest, sum, static_cast<uint32_t>(smin), umax,
-                                     psum, pcount, ballot, match, mpsum, mpcount, mpproduct, mpor, mpxor, mpand};
-      static const char *names[16] = {"count", "isfirst", "readfirst", "sum", "min.s", "max.u", "prefixsum",
-                                      "prefixcount", "ballot", "match", "multiprefix.sum", "multiprefix.count",
-                                      "multiprefix.product", "multiprefix.or", "multiprefix.xor", "multiprefix.and"};
-      for (uint32_t k = 0; k < 16; ++k)
-        EXPECT_EQ(name, names[k], gi, load<uint32_t>(o, b + k * 4), expected[k]);
     }
   }
   end(name);

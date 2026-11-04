@@ -238,6 +238,9 @@ public:
   }
 
   void skipQueuedPresent(uint64_t frame_id) {
+    // Only the composition retirement sequencer may advance this on the CPU:
+    // every predecessor has actually retired. HWND skips use a GPU wait/signal
+    // submission so a canceled frame cannot overtake unfinished history writes.
     present_order_event_.signalValue(frame_id);
     notifyPresentCompleted();
   }
@@ -247,10 +250,14 @@ public:
       std::function<void(WMT::RenderCommandEncoder)> &&wait_fences,
       std::function<void(WMT::RenderCommandEncoder)> &&update_fences
   );
+  struct PresentWork {
+    bool identity_copy = false;
+    bool pq_code_copy = false;
+    uint32_t width = 0, height = 0;
+  };
   WMT::MetalDrawable encodeCommandsMetal4(
       WMT::MTL4CommandBuffer cmdbuf, WMT::Texture backbuffer, D3DalloyPresentMetadata metadata,
-      std::function<void(WMT::MTL4RenderCommandEncoder)> &&wait_fences,
-      std::function<void(WMT::MTL4RenderCommandEncoder)> &&update_fences
+      WMT::Fence fence, PresentWork &work
   );
 
 private:

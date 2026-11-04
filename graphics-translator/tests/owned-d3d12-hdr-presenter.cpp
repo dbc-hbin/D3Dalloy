@@ -150,8 +150,8 @@ struct Probe {
     require(cmd, "command buffer");
     require(allocator, "Metal4 command allocator");
     cmd.begin(allocator);
-    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata,
-                                             [](auto) {}, [](auto) {});
+    d3dalloy::Presenter::PresentWork work;
+    auto drawable = presenter.encodeCommandsMetal4(cmd, input, state.metadata, {}, work);
     require(drawable && drawable.texture(), "drawable");
     wmtcmd_blit_copy_from_texture_to_buffer copy{};
     copy.type = WMTBlitCommandCopyFromTextureToBuffer;
@@ -238,6 +238,9 @@ int main() {
     obj_handle_t view = 0;
     auto layer = Probe::makeLayer(detached.hwnd, p.device, view);
     NSObject_retain(layer.handle);
+    // Only the retained layer participates in the detached-screen query. Release
+    // its native view while the HWND still owns the Wine client surface.
+    ReleaseMetalView(view);
     require(DestroyWindow(detached.hwnd), "destroy detached window");
     detached.hwnd = nullptr;
     uint64_t version = ~uint64_t(0);
@@ -251,7 +254,6 @@ int main() {
     require(version == 0 && edr.maximum_edr_color_component_value == 1.f &&
             edr.maximum_potential_edr_color_component_value == 1.f, "detached native EDR defaults");
     NSObject_release(layer.handle);
-    ReleaseMetalView(view);
   }
   std::puts("OWNED_D3D12_HDR_PRESENTER_PASS real_gpu=1 drawable_readback=1 frames=5 detached=1");
   return 0;

@@ -5,6 +5,7 @@
 #include "d3dalloy_allocation.hpp"
 #include "rc/util_rc_ptr.hpp"
 #include "DXBCParser/RtasSerialized.h"
+#include "owned_rtas_size_cache.hpp"
 #include <cstdint>
 #include <vector>
 
@@ -50,11 +51,8 @@ inline constexpr uint64_t kAccelerationStructureAlignment =
 inline constexpr uint64_t kD3DInstanceDescriptorSize = 64;
 inline constexpr uint64_t kMetalIndirectInstanceDescriptorSize = 72;
 
-struct NativeSizes {
-  uint64_t accelerationStructureSize;
-  uint64_t buildScratchSize;
-  uint64_t refitScratchSize;
-};
+using NativeSizes = owned_graphics::RTASSizes;
+using NativeSizeKey = owned_graphics::RTASSizeKey;
 
 /* A resolved D3D12 GPU virtual address range inside one allocation. The allocation pointer
  * doubles as the identity used to key the device's acceleration-structure sidecars. */
@@ -105,7 +103,7 @@ struct ShadowJob {
   uint32_t destinationStride;
   uint32_t count;
   uint32_t mode;
-  uint32_t reserved;
+  uint32_t flags;
 };
 static_assert(sizeof(ShadowJob) == 48, "shadow job layout");
 
@@ -115,6 +113,10 @@ enum : uint32_t {
   /* `source` is the GPU virtual address of an array of GPU virtual addresses, one per element. */
   kShadowJobPointers = 1,
 };
+
+/* D3D12 ordinary BLAS updates keep index contents immutable. Only an exact,
+ * executed in-place shadow-layout proof permits omitting these jobs. */
+inline constexpr uint32_t kShadowJobIndex = 1;
 
 /* The shadow kernel's metadata source (D3DALLOYASShadowParams::metadataMode). */
 enum : uint32_t {
@@ -138,6 +140,9 @@ struct ShadowMetadata {
   uint64_t deserializedSize;
 };
 static_assert(sizeof(ShadowMetadata) == 48, "shadow metadata layout");
+static_assert(sizeof(WMTASPrepassInfo) == 96 && offsetof(WMTASPrepassInfo, flags) == 44 &&
+    offsetof(WMTASPrepassInfo, shadow_metadata) == 48, "AS prepass ABI");
+static_assert(sizeof(WMTASPrepassInfo::shadow_metadata) == sizeof(ShadowMetadata), "AS prepass metadata ABI");
 
 struct ShadowParams {
   uint64_t asAddress;
@@ -157,7 +162,7 @@ struct PostbuildParams {
   uint64_t asAddress;
   uint64_t destination;
   uint32_t operation;
-  uint32_t reserved;
+  uint32_t batchCount; // First entry only, zero for the original single-entry invocation.
 };
 static_assert(sizeof(PostbuildParams) == 24, "postbuild params layout");
 
@@ -269,8 +274,13 @@ struct NativeDescriptor {
 HRESULT ConvertBuildInputs(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS &inputs,
     ResolveGPUVA resolve, void *context, BuildInputs &result);
 
+// Returns false for uncacheable shapes or allocation failure; use the ordinary native query.
+bool MakeNativeSizeKey(const BuildInputs &inputs, NativeSizeKey &key) noexcept;
+
+// knownSizes must be the successful size query for these inputs on this device.
+// Only the size result is reused: execution descriptors always bind current input buffers.
 HRESULT CreateNativeDescriptor(WMT::Device device, const BuildInputs &inputs,
-    WMT::Buffer convertedInstances, NativeDescriptor &result);
+    WMT::Buffer convertedInstances, NativeDescriptor &result, const NativeSizes *knownSizes = nullptr);
 
 /* D3D12 sizes: the native structure plus the header and the shadow copy, rounded up to the D3D12
  * alignment. */

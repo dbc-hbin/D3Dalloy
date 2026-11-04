@@ -233,7 +233,9 @@ int main(int argc, char **argv) {
       sharing_sum += (seed + 3) * local_values[counter_local]; ++sharing_count;
     }
     sharing_count += 24; // Sixteen GPU-generated empty records, plus four CPU and four GPU seeds.
-    D3D12_NODE_GPU_INPUT empty_gpu{empty_entry, 4, 0, 0};
+    // Empty-record entries ignore both fields, even when stride arithmetic
+    // would overflow. NumRecords still launches four invocations.
+    D3D12_NODE_GPU_INPUT empty_gpu{empty_entry, 4, {UINT64_MAX - 32, UINT64_MAX - 64}};
     for (UINT mode = 0; mode < 5; ++mode) {
       if (mode == 4) Upload(seeds.Get(), &empty_gpu, sizeof(empty_gpu), 96);
       ComPtr<ID3D12CommandAllocator> allocator; Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)), "allocator");
