@@ -85,6 +85,38 @@ void dispatchIndependence() {
     }
     phase(names[replay],true);c.executeSealed({sealed.list.Get()});verify(expected);phase(names[replay],false);
   }
+  // The GPU writes two indirect grids. The last indirect launch has zero groups and must leave its word untouched.
+  auto arguments=committed(c.dev.Get(),D3D12_HEAP_TYPE_DEFAULT,bufDesc(64,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  auto grids=makePipeline("RWByteAddressBuffer Args:register(u1);[numthreads(1,1,1)] void cs(){"
+                          "Args.Store3(16,uint3(1,1,1));Args.Store3(32,uint3(0,1,1));}",root.Get());
+  D3D12_INDIRECT_ARGUMENT_DESC command{};command.Type=D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+  D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(D3D12_DISPATCH_ARGUMENTS),1,&command,0};
+  ComPtr<ID3D12CommandSignature> indirectSignature;
+  check(c.dev->CreateCommandSignature(&signature,nullptr,IID_PPV_ARGS(&indirectSignature)),"indirect grid signature");
+  auto indirect=c.list();initialize(indirect.list.Get(),output.Get());bind(indirect.list.Get());
+  indirect.list->SetPipelineState(grids.Get());indirect.list->SetComputeRootUnorderedAccessView(3,arguments->GetGPUVirtualAddress());
+  indirect.list->Dispatch(1,1,1);
+  transition(indirect.list.Get(),arguments.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+  indirect.list->SetPipelineState(writer.Get());
+  for(UINT i=0;i<count;++i) {
+    indirect.list->SetComputeRootDescriptorTable(1,{gpu.ptr+i*increment});
+    indirect.list->SetComputeRoot32BitConstant(2,i,0);
+    if (i%2) indirect.list->ExecuteIndirect(indirectSignature.Get(),1,arguments.Get(),i==count-1?32:16,nullptr,0);
+    else indirect.list->Dispatch(1,1,1);
+  }
+  transition(indirect.list.Get(),arguments.Get(),D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  copy(indirect.list.Get(),output.Get(),0);check(indirect.list->Close(),"indirect grid close");
+  for(UINT replay=0;replay<2;++replay) {
+    std::vector<uint32_t> expected(words,guard);
+    for(UINT i=0;i<count;++i) {
+      const UINT row=replay?mixed[i]:i;setView(i,row*64,64);
+      if(i!=count-1)expected[row*64+i]=0x13570000+i;
+    }
+    const char *name=replay?"indirect_grid_mixed":"indirect_grid_disjoint";
+    phase(name,true);c.executeSealed({indirect.list.Get()});verify(expected);phase(name,false);
+  }
+  std::printf("%s_INDIRECT_GRID_PASS replays=2 direct=4 indirect=4 zero_grid=1 all_words_and_guards=exact\n",foundation);
   // A shader-readonly UAV and a writer have potential RAW/WAR footprint edges,
   // while their actual words (one and zero) are disjoint and order-independent.
   D3D12_UNORDERED_ACCESS_VIEW_DESC structured{};structured.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;

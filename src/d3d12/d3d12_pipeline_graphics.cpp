@@ -1671,8 +1671,8 @@ public:
     SM50Shader shader_vs, shader_ps;
     SM50Error sm50_err;
     auto metal = device_->GetMTLDevice();
-    Sha1Digest key;
-    if (FAILED(hr = PipelineCacheKey(*pDesc, key, &extras)))
+    Sha1Digest key, effective_key;
+    if (FAILED(hr = PipelineCacheKey(*pDesc, key, &extras, &effective_key)))
       return hr;
     // Without a rasterized stream the pipeline has no fragment function (Metal requires it).
     const bool use_fragment = pDesc->PS.pShaderBytecode && !rasterization_disabled;
@@ -1682,7 +1682,7 @@ public:
     // Mesh variants use the device artifact cache, not the serialized ordinary-stage PSO blob.
     const uint32_t stages = (mesh ? 0u : 1u << PipelineCache::Vertex) |
                             (use_fragment ? 1u << PipelineCache::Fragment : 0);
-    if (FAILED(hr = cache_.Initialize(pDesc->CachedPSO, key, stages, metal.registryID())))
+    if (FAILED(hr = cache_.Initialize(pDesc->CachedPSO, key, stages, metal.registryID(), &effective_key)))
       return hr;
     WMT::Reference<WMT::Error> err;
     WMT::Reference<WMT4::Function> vs_func, ps_func;

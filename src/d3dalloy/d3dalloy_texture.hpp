@@ -376,6 +376,7 @@ public:
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);
   /* Set before D3D12 resource publication; D3D11 keeps eager view preparation. */
   bool descriptorIndexedViews = false;
+  bool privateAttachmentStore = false;
   bool supportsDescriptorViewPool(TextureViewKey key);
   // A shader view the submission planner can describe by allocation, mip and
   // slice: a native view of the current allocation, no cast/shadow/sparse

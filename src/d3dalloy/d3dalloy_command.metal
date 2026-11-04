@@ -36,7 +36,6 @@ kernel void d3d12_cast_merge(device const uchar *shadow [[buffer(0)]],
                             device uchar *native [[buffer(2)]],
                             constant uint4 &layout [[buffer(3)]],
                             uint3 index [[thread_position_in_grid]]) {
-  if (index.x >= layout.x || index.y >= layout.z || index.z >= layout.w) return;
   const ulong offset = (ulong(index.z) * layout.z + index.y) * layout.y + index.x;
   if (shadow[offset] != baseline[offset]) native[offset] = shadow[offset];
 }
@@ -49,7 +48,6 @@ kernel void d3d12_volume_render_publish(device const uchar *shadow [[buffer(0)]]
                                         texture2d_array<uint, access::read_write> atlas [[texture(0)]],
                                         constant uint *p [[buffer(3)]],
                                         uint2 position [[thread_position_in_grid]]) {
-  if (position.x >= p[3] || position.y >= p[4]) return;
   const uint offset = (position.y * p[3] + position.x) * p[5];
   bool changed = false;
   uint4 words = 0;
@@ -89,10 +87,9 @@ kernel void d3d12_volume_render_publish(device const uchar *shadow [[buffer(0)]]
 // while Metal's emulated D24 texture stores its depth plane as float32.
 kernel void d3d12_d24_to_float(device const uchar *source [[buffer(0)]],
                                 device uchar *destination [[buffer(1)]],
-                                constant uint4 &layout [[buffer(2)]],
-                                uint index [[thread_position_in_grid]]) {
-  if (index >= layout.z * layout.w) return;
-  const uint row = index / layout.z, column = index % layout.z;
+                                constant uint2 &layout [[buffer(2)]],
+                                uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, column = pos.x;
   const uint packed = *reinterpret_cast<device const uint *>(source + row * layout.x + column * 4);
   *reinterpret_cast<device float *>(destination + row * layout.y + column * 4) =
       precise::divide(float(packed & 0xffffffu), 16777215.0f);
@@ -100,10 +97,9 @@ kernel void d3d12_d24_to_float(device const uchar *source [[buffer(0)]],
 
 kernel void d3d12_float_to_d24(device const uchar *source [[buffer(0)]],
                                 device uchar *destination [[buffer(1)]],
-                                constant uint4 &layout [[buffer(2)]],
-                                uint index [[thread_position_in_grid]]) {
-  if (index >= layout.z * layout.w) return;
-  const uint row = index / layout.z, column = index % layout.z;
+                                constant uint2 &layout [[buffer(2)]],
+                                uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, column = pos.x;
   const float depth = *reinterpret_cast<device const float *>(source + row * layout.x + column * 4);
   const float normalized = clamp(depth, 0.0f, 1.0f);
   // Scaling by 2^24 is exact for a float32 source. Decompose the fractional
@@ -124,10 +120,9 @@ kernel void d3d12_float_to_d24(device const uchar *source [[buffer(0)]],
 // one packed 4:2:2 pair, so readback never races another invocation on a row.
 kernel void d3d12_rgb32_expand(device const uchar *source [[buffer(0)]],
                                device uchar *destination [[buffer(1)]],
-                               constant uint4 &layout [[buffer(2)]],
-                               uint index [[thread_position_in_grid]]) {
-  if (index >= layout.z * layout.w) return;
-  const uint row = index / layout.z, x = index % layout.z;
+                               constant uint2 &layout [[buffer(2)]],
+                               uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, x = pos.x;
   device const uint *src = reinterpret_cast<device const uint *>(source + row * layout.x + x * 12);
   device uint *dst = reinterpret_cast<device uint *>(destination + row * layout.y + x * 16);
   dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 0;
@@ -135,25 +130,22 @@ kernel void d3d12_rgb32_expand(device const uchar *source [[buffer(0)]],
 
 kernel void d3d12_rgb32_compact(device const uchar *source [[buffer(0)]],
                                 device uchar *destination [[buffer(1)]],
-                                constant uint4 &layout [[buffer(2)]],
-                                uint index [[thread_position_in_grid]]) {
-  if (index >= layout.z * layout.w) return;
-  const uint row = index / layout.z, x = index % layout.z;
+                                constant uint2 &layout [[buffer(2)]],
+                                uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, x = pos.x;
   device const uint *src = reinterpret_cast<device const uint *>(source + row * layout.x + x * 16);
   device uint *dst = reinterpret_cast<device uint *>(destination + row * layout.y + x * 12);
   dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
 }
 
-// layout.z is logical pixel width, layout.w is row count. The first member of
+// layout.z is logical pixel width, layout.w selects the byte order. The first member of
 // each pair owns R/B; the two G bytes belong to consecutive logical pixels.
 kernel void d3d12_packed422_expand(device const uchar *source [[buffer(0)]],
                                    device uchar *destination [[buffer(1)]],
                                    constant uint4 &layout [[buffer(2)]],
-                                   constant uint &variant [[buffer(3)]],
-                                   uint index [[thread_position_in_grid]]) {
-  const uint pairs = (layout.z + 1) / 2;
-  if (index >= pairs * layout.w) return;
-  const uint row = index / pairs, pair = index % pairs;
+                                   uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, pair = pos.x;
+  const bool variant = layout.w != 0;
   device const uchar *src = source + row * layout.x + pair * 4;
   device uchar *left = destination + row * layout.y + pair * 8;
   const uchar r = variant ? src[1] : src[0];
@@ -167,11 +159,9 @@ kernel void d3d12_packed422_expand(device const uchar *source [[buffer(0)]],
 kernel void d3d12_packed422_compact(device const uchar *source [[buffer(0)]],
                                     device uchar *destination [[buffer(1)]],
                                     constant uint4 &layout [[buffer(2)]],
-                                    constant uint &variant [[buffer(3)]],
-                                    uint index [[thread_position_in_grid]]) {
-  const uint pairs = (layout.z + 1) / 2;
-  if (index >= pairs * layout.w) return;
-  const uint row = index / pairs, pair = index % pairs;
+                                    uint2 pos [[thread_position_in_grid]]) {
+  const uint row = pos.y, pair = pos.x;
+  const bool variant = layout.w != 0;
   device const uchar *left = source + row * layout.x + pair * 8;
   device uchar *dst = destination + row * layout.y + pair * 4;
   const uchar g1 = pair * 2 + 1 < layout.z ? left[5] : 0;
@@ -1878,6 +1868,13 @@ static bool so_gs_primitive(uint topology, uint position, uint v, uint run_start
   destination[0] += source[0];
 }
 
+[[kernel]] void query_accumulate_visibility_batch(
+    device const ulong *source [[buffer(0)]], device ulong *destination [[buffer(1)]],
+    constant ulong2 *indices [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  const ulong2 pair = indices[i];
+  destination[pair.y] += source[pair.x];
+}
+
 [[kernel]] void clear_texture_1d_float(
     texture1d<float, access::read_write> tex [[texture(0)]],
     constant float4& value [[buffer(1)]],
@@ -2803,25 +2800,9 @@ struct D3DalloyStencilResolveOutput {
 }
 #include "../d3d12/d3d12_standard_swizzle_gpu.hpp"
 
-static uint d3d12_deposit_tile_bits(uint value, uint mask) {
-  uint result = 0;
-  for (uint bit = 1; bit < 65536; bit <<= 1) {
-    if (mask & bit) {
-      if (value & 1) result |= bit;
-      value >>= 1;
-    }
-  }
-  return result;
-}
-
 static ulong d3d12_standard_swizzle_offset(constant D3D12StandardSwizzleParams &p, uint3 coord) {
-  const ulong tile = p.first_tile +
-      ((ulong(coord.z / p.tile_depth) * p.tiles_y + coord.y / p.tile_height) * p.tiles_x +
-       coord.x / p.tile_width);
-  const uint inside = d3d12_deposit_tile_bits((coord.x % p.tile_width) * p.bytes_per_unit, p.x_mask) |
-                      d3d12_deposit_tile_bits(coord.y % p.tile_height, p.y_mask) |
-                      d3d12_deposit_tile_bits(coord.z % p.tile_depth, p.z_mask);
-  return tile * 65536ul + inside;
+  return p.tile_offset + (swizzle_deposit(coord.x * p.bytes_per_unit, p.x_moves) |
+                          swizzle_deposit(coord.y, p.y_moves) | swizzle_deposit(coord.z, p.z_moves));
 }
 
 // Both kernels copy opaque format units. The native-texture blit before/after
@@ -2832,8 +2813,7 @@ kernel void d3d12_swizzle_import(device const uchar *canonical [[buffer(0)]],
                                   device uchar *linear [[buffer(1)]],
                                   constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                   uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
                     ulong(coord.x) * p.bytes_per_unit;
   for (uint byte = 0; byte < p.bytes_per_unit; ++byte) linear[row + byte] = canonical[tiled + byte];
@@ -2843,8 +2823,7 @@ kernel void d3d12_swizzle_export(device const uchar *linear [[buffer(0)]],
                                   device uchar *canonical [[buffer(1)]],
                                   constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                   uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
                     ulong(coord.x) * p.bytes_per_unit;
   for (uint byte = 0; byte < p.bytes_per_unit; ++byte) canonical[tiled + byte] = linear[row + byte];
@@ -2858,8 +2837,7 @@ kernel void d3d12_swizzle_dirty(device const uchar *linear [[buffer(0)]],
                                  constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                  device atomic_uint *dirty [[buffer(3)]],
                                  uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
                     ulong(coord.x) * p.bytes_per_unit;
   for (uint byte = 0; byte < p.bytes_per_unit; ++byte)
@@ -2874,9 +2852,8 @@ kernel void d3d12_swizzle_export_if_dirty(device const uchar *linear [[buffer(0)
                                            constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                            device atomic_uint *dirty [[buffer(3)]],
                                            uint3 coord [[thread_position_in_grid]]) {
-  if (!atomic_load_explicit(dirty, memory_order_relaxed) ||
-      coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const ulong tiled = d3d12_standard_swizzle_offset(p, coord + uint3(p.origin_x, p.origin_y, p.origin_z));
+  if (!atomic_load_explicit(dirty, memory_order_relaxed)) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch +
                     ulong(coord.x) * p.bytes_per_unit;
   for (uint byte = 0; byte < p.bytes_per_unit; ++byte) canonical[tiled + byte] = linear[row + byte];
@@ -2888,9 +2865,7 @@ kernel void d3d12_swizzle_packed422_import(device const uchar *canonical [[buffe
                                             device uchar *linear [[buffer(1)]],
                                             constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                             uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
-  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
   const uchar r = canonical[tiled + (p.packed422_variant ? 1 : 0)];
   const uchar b = canonical[tiled + (p.packed422_variant ? 3 : 2)];
@@ -2898,7 +2873,7 @@ kernel void d3d12_swizzle_packed422_import(device const uchar *canonical [[buffe
   linear[row + 1] = canonical[tiled + (p.packed422_variant ? 0 : 1)];
   linear[row + 2] = b;
   linear[row + 3] = 255;
-  if (unit.x * 2 + 1 < p.physical_width) {
+  if (coord.x * 2 + 1 < p.tile_pixel_width) {
     linear[row + 4] = r;
     linear[row + 5] = canonical[tiled + (p.packed422_variant ? 2 : 3)];
     linear[row + 6] = b;
@@ -2910,11 +2885,9 @@ kernel void d3d12_swizzle_packed422_export(device const uchar *linear [[buffer(0
                                             device uchar *canonical [[buffer(1)]],
                                             constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                             uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
-  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
-  const uchar g1 = unit.x * 2 + 1 < p.physical_width
+  const uchar g1 = coord.x * 2 + 1 < p.tile_pixel_width
       ? linear[row + 5] : canonical[tiled + (p.packed422_variant ? 2 : 3)];
   if (p.packed422_variant) {
     canonical[tiled + 0] = linear[row + 1];
@@ -2934,17 +2907,15 @@ kernel void d3d12_swizzle_packed422_dirty(device const uchar *linear [[buffer(0)
                                            constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                            device atomic_uint *dirty [[buffer(3)]],
                                            uint3 coord [[thread_position_in_grid]]) {
-  if (coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
-  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
   const bool changed = p.packed422_variant
       ? linear[row + 1] != canonical[tiled + 0] || linear[row + 0] != canonical[tiled + 1] ||
         linear[row + 2] != canonical[tiled + 3] ||
-        (unit.x * 2 + 1 < p.physical_width && linear[row + 5] != canonical[tiled + 2])
+        (coord.x * 2 + 1 < p.tile_pixel_width && linear[row + 5] != canonical[tiled + 2])
       : linear[row + 0] != canonical[tiled + 0] || linear[row + 1] != canonical[tiled + 1] ||
         linear[row + 2] != canonical[tiled + 2] ||
-        (unit.x * 2 + 1 < p.physical_width && linear[row + 5] != canonical[tiled + 3]);
+        (coord.x * 2 + 1 < p.tile_pixel_width && linear[row + 5] != canonical[tiled + 3]);
   if (changed) atomic_store_explicit(dirty, 1u, memory_order_relaxed);
 }
 
@@ -2953,12 +2924,10 @@ kernel void d3d12_swizzle_packed422_export_if_dirty(device const uchar *linear [
                                                      constant D3D12StandardSwizzleParams &p [[buffer(2)]],
                                                      device atomic_uint *dirty [[buffer(3)]],
                                                      uint3 coord [[thread_position_in_grid]]) {
-  if (!atomic_load_explicit(dirty, memory_order_relaxed) ||
-      coord.x >= p.extent_x || coord.y >= p.extent_y || coord.z >= p.extent_z) return;
-  const uint3 unit = coord + uint3(p.origin_x, p.origin_y, p.origin_z);
-  const ulong tiled = d3d12_standard_swizzle_offset(p, unit);
+  if (!atomic_load_explicit(dirty, memory_order_relaxed)) return;
+  const ulong tiled = d3d12_standard_swizzle_offset(p, coord);
   const ulong row = ulong(coord.z) * p.slice_pitch + ulong(coord.y) * p.row_pitch + ulong(coord.x) * 8ul;
-  const uchar g1 = unit.x * 2 + 1 < p.physical_width
+  const uchar g1 = coord.x * 2 + 1 < p.tile_pixel_width
       ? linear[row + 5] : canonical[tiled + (p.packed422_variant ? 2 : 3)];
   if (p.packed422_variant) {
     canonical[tiled + 0] = linear[row + 1];
@@ -2982,7 +2951,6 @@ kernel void d3d12_swizzle_packed422_export_if_dirty(device const uchar *linear [
 
 kernel void d3d12_atomic64_import(constant Atomic64TransferParams &p [[buffer(0)]],
                                   uint cell [[thread_position_in_grid]]) {
-  if (cell >= p.cellCount) return;
   device const Atomic64ImportCell *sources = reinterpret_cast<device const Atomic64ImportCell *>(p.sources);
   ulong value = 0;
   for (uint byte = 0; byte < 8; ++byte) {
@@ -2995,12 +2963,12 @@ kernel void d3d12_atomic64_import(constant Atomic64TransferParams &p [[buffer(0)
 
 kernel void d3d12_atomic64_export_buffers(constant Atomic64TransferParams &p [[buffer(0)]],
                                           uint cell [[thread_position_in_grid]]) {
-  if (cell >= p.cellCount) return;
   device const Atomic64ImportCell *sources = reinterpret_cast<device const Atomic64ImportCell *>(p.sources);
   const uint root = reinterpret_cast<device const uint *>(p.roots)[cell];
   const uint4 node = reinterpret_cast<device const uint4 *>(p.nodes)[root];
   const ulong value = ulong(node.y) | ulong(node.z) << 32;
   const ulong baseline = reinterpret_cast<device const ulong *>(p.baseline)[cell];
+  if (value == baseline) return;
   for (uint byte = 0; byte < 8; ++byte) {
     const ulong address = sources[cell].bytes[byte];
     if (address && uchar(value >> (8 * byte)) != uchar(baseline >> (8 * byte)))
@@ -3009,31 +2977,37 @@ kernel void d3d12_atomic64_export_buffers(constant Atomic64TransferParams &p [[b
 }
 
 static bool d3d12_atomic64_texel(constant Atomic64TransferParams &p, uint3 coord, thread uint4 &value) {
-  if (coord.x >= p.width || coord.y >= p.height || coord.z >= p.depth) return false;
   const ulong begin = p.byteBase + ulong(coord.z) * p.rowPitch * p.height +
                       ulong(coord.y) * p.rowPitch + ulong(coord.x) * p.texelStride;
   device const uint *map = reinterpret_cast<device const uint *>(p.cellMap);
   device const uint *roots = reinterpret_cast<device const uint *>(p.roots);
   device const uint4 *nodes = reinterpret_cast<device const uint4 *>(p.nodes);
   device const ulong *baseline = reinterpret_cast<device const ulong *>(p.baseline);
-  uchar bytes[16] = {};
+  // UIntFormat uses 1/2/4/8/16-byte units. Rows are 8-byte aligned and
+  // byteBase and texelStride are multiples of unitBytes, including MSAA.
+  uint4 words = 0;
   bool changed = false;
-  for (uint byte = 0; byte < p.unitBytes; ++byte) {
+  for (uint byte = 0; byte < p.unitBytes; byte += 8) {
     const ulong offset = begin + byte;
     const uint cell = map[offset >> 3];
     if (cell == 0xffffffffu) return false;
     const uint4 node = nodes[roots[cell]];
     const ulong word = ulong(node.y) | ulong(node.z) << 32;
-    bytes[byte] = uchar(word >> ((offset & 7) * 8));
-    changed |= bytes[byte] != uchar(baseline[cell] >> ((offset & 7) * 8));
+    const uint shift = uint(offset & 7) * 8;
+    const ulong packed = word >> shift;
+    words[byte / 4] = uint(packed);
+    words[byte / 4 + 1] = uint(packed >> 32);
+    const ulong diff = (word ^ baseline[cell]) >> shift;
+    changed |= p.unitBytes >= 8 ? diff != 0 : (diff << (64 - p.unitBytes * 8)) != 0;
   }
   if (!changed) return false;
   value = uint4(0);
   uint bit = 0;
   for (uint channel = 0; channel < p.channels; ++channel) {
     const uint bits = (p.channelBits >> (channel * 8)) & 255u;
-    for (uint i = 0; i < bits; ++i, ++bit)
-      value[channel] |= uint((bytes[bit >> 3] >> (bit & 7)) & 1u) << i;
+    // Each UIntFormat channel fits one word, including packed RGB10A2.
+    value[channel] = (words[bit / 32] >> (bit & 31)) & (~0u >> (32 - bits));
+    bit += bits;
   }
   return true;
 }

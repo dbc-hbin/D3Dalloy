@@ -75,12 +75,8 @@ struct WorkGraphSchedulerParams {
   WorkGraphSchedulerAddress LevelStride; // Control bytes per suspended producer.
   WorkGraphSchedulerUInt NodeCount;
   WorkGraphSchedulerUInt Depth;
-  WorkGraphSchedulerUInt SeedCount;
-  WorkGraphSchedulerUInt MaxOutputs;
   WorkGraphSchedulerUInt BatchOffset;
   WorkGraphSchedulerUInt SharingOffset;
-  WorkGraphSchedulerUInt TransitionBudget;
-  WorkGraphSchedulerUInt GroupBudget; // Maximum issued threadgroups across one retired quantum.
 };
 
 struct WorkGraphSchedulerNode {
@@ -142,7 +138,6 @@ struct WorkGraphSchedulerState {
   WorkGraphSchedulerUInt Status;
   WorkGraphSchedulerUInt Error;
   WorkGraphSchedulerUInt Depth; // Number of live frames, zero when selecting a seed.
-  WorkGraphSchedulerUInt SeedIndex;
   WorkGraphSchedulerUInt SeedRecord;
   WorkGraphSchedulerUInt SelectedNode;
   WorkGraphSchedulerUInt SelectedLevel;
@@ -150,7 +145,6 @@ struct WorkGraphSchedulerState {
   WorkGraphSchedulerAddress NodeSteps;
   WorkGraphSchedulerAddress NonterminalSteps;
   WorkGraphSchedulerAddress HostSteps;
-  WorkGraphSchedulerAddress TransitionSteps;
   WorkGraphSchedulerAddress InputAddress;
   WorkGraphSchedulerUInt PeakDepth;
   WorkGraphSchedulerUInt ErrorNode;
@@ -180,11 +174,10 @@ struct WorkGraphSchedulerContext {
 };
 
 #ifndef __METAL_VERSION__
-static_assert(sizeof(WorkGraphSchedulerParams) == 128 && alignof(WorkGraphSchedulerParams) == 8);
+static_assert(sizeof(WorkGraphSchedulerParams) == 112 && alignof(WorkGraphSchedulerParams) == 8);
 static_assert(offsetof(WorkGraphSchedulerParams, LevelStride) == 88);
 static_assert(offsetof(WorkGraphSchedulerParams, NodeCount) == 96);
-static_assert(offsetof(WorkGraphSchedulerParams, TransitionBudget) == 120);
-static_assert(offsetof(WorkGraphSchedulerParams, GroupBudget) == 124);
+static_assert(offsetof(WorkGraphSchedulerParams, SharingOffset) == 108);
 static_assert(sizeof(WorkGraphSchedulerNode) == 96 && alignof(WorkGraphSchedulerNode) == 8);
 static_assert(offsetof(WorkGraphSchedulerNode, Grid) == 16);
 static_assert(offsetof(WorkGraphSchedulerNode, DynamicOffset) == 40);
@@ -196,11 +189,11 @@ static_assert(sizeof(WorkGraphSchedulerFrame) == 64 && alignof(WorkGraphSchedule
 static_assert(offsetof(WorkGraphSchedulerFrame, Grid) == 24);
 static_assert(offsetof(WorkGraphSchedulerFrame, NextGroup) == 40);
 static_assert(sizeof(WorkGraphSchedulerIndirect) == 16);
-static_assert(sizeof(WorkGraphSchedulerState) == 96 && alignof(WorkGraphSchedulerState) == 8);
+static_assert(sizeof(WorkGraphSchedulerState) == 88 && alignof(WorkGraphSchedulerState) == 8);
 static_assert(offsetof(WorkGraphSchedulerState, NodeSteps) == 32);
-static_assert(offsetof(WorkGraphSchedulerState, InputAddress) == 64);
-static_assert(offsetof(WorkGraphSchedulerState, PeakDepth) == 72);
-static_assert(offsetof(WorkGraphSchedulerState, QuantumGroups) == 84);
+static_assert(offsetof(WorkGraphSchedulerState, InputAddress) == 56);
+static_assert(offsetof(WorkGraphSchedulerState, PeakDepth) == 64);
+static_assert(offsetof(WorkGraphSchedulerState, QuantumGroups) == 76);
 static_assert(sizeof(WorkGraphSchedulerQueue) == 32 && offsetof(WorkGraphSchedulerQueue, Tail) == 24);
 static_assert(sizeof(WorkGraphSchedulerBatch) == 16);
 static_assert(sizeof(WorkGraphSchedulerContext) == 56);

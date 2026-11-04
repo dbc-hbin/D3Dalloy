@@ -72,14 +72,18 @@ static void render(uint64_t buffer,id<MTLRenderPipelineState> pso,id<MTLTexture>
   command(encoder,WMTMetal4RenderCommands,d);
   call(WMTMetal4EndEncoding,{encoder});
 }
-static void finish(uint64_t buffer,id<MTL4CommandQueue> queue) {
+static void finish(uint64_t buffer,id<MTL4CommandQueue> queue,unsigned expectedAllocations) {
+  id shared=member(reinterpret_cast<id>(buffer),"residency");
+  id<MTLResidencySet> residency=member(shared,"set");
   call(WMTMetal4EndCommandBuffer,{buffer});
+  require(counters(buffer).residencyAdd==expectedAllocations && residency.allocationCount==expectedAllocations,
+          "registered allocations publish at command-buffer end");
   uint64_t submission=call(WMTMetal4Commit,{handle(queue),reinterpret_cast<uintptr_t>(&buffer),1});
   require(submission!=0,"submission owner");
   call(WMTMetal4WaitSubmission,{submission});
   WMTMetal4SubmissionInfo info{}; call(WMTMetal4GetSubmissionInfo,{submission,reinterpret_cast<uintptr_t>(&info)});
   require(info.completed && !info.error_handle,"native GPU completion without error");
-  require([(id<MTLResidencySet>)member(reinterpret_cast<id>(buffer),"residency") allocationCount]==0,"retired residency is empty");
+  require(residency.allocationCount==0,"retired residency is empty");
   [reinterpret_cast<id>(submission) release];
 }
 static void word(const char *name,uint32_t actual,uint32_t expected) {
@@ -176,10 +180,10 @@ int main(int argc,char **argv) {
     requireUnbound(e,"encoder"); computeBuffer(e,zero,0,2);
     dispatch(e); computeBuffer(e,optional,0,2); call(WMTMetal4EndEncoding,{e});
     after=counters(buffer); require(after.tableNew==2 && after.tableBind==4 && after.residencyNew==1,"one compute/fragment table and one residency set per native slot");
-    require(after.tableSet==22 && after.residencyAdd==8,"exact ordinary-path operation counts");
-    require(after.residencyAdd==[(NSSet *)member(member(reinterpret_cast<id>(buffer),"recording"),"allocations") count],"separate allocation membership");
+    require(after.tableSet==18 && after.residencyAdd==0,"exact ordinary-path operation counts");
+    require(8==[(NSSet *)member(member(reinterpret_cast<id>(buffer),"recording"),"allocations") count],"separate allocation membership");
     [input release]; input=nil; [optional release]; optional=nil; // Recording must retain native resources through retirement.
-    finish(buffer,queue);
+    finish(buffer,queue,8);
     auto words=static_cast<const uint32_t *>(output.contents);
     word("dispatch_A",words[0],values[0]); word("dispatch_A_optional",words[1],optionalValue);
     word("changed_offset",words[2],values[1]); word("explicit_zero_resource",words[3],0);
@@ -193,8 +197,8 @@ int main(int argc,char **argv) {
     e=compute(buffer,computePSO); computeBuffer(e,output,0,0); computeBuffer(e,input,0,1);
     requireUnbound(e,"retired"); computeBuffer(e,zero,0,2); dispatch(e); call(WMTMetal4EndEncoding,{e});
     after=counters(buffer); require(after.tableNew==0 && after.residencyNew==0 && after.tableBind==1,"retired native slot reuses table and residency");
-    require(after.tableSet==6 && after.residencyAdd==4,"exact retired-reuse operation counts");
-    [input release]; finish(buffer,queue); word("retired_reuse",words[0],optionalValue); word("retired_zero_resource",words[1],0);
+    require(after.tableSet==3 && after.residencyAdd==0,"exact retired-reuse operation counts");
+    [input release]; finish(buffer,queue,4); word("retired_reuse",words[0],optionalValue); word("retired_zero_resource",words[1],0);
     [reinterpret_cast<id>(buffer) release]; [reinterpret_cast<id>(allocator) release];
     [output release]; [zero release]; [a release]; [b release]; [queue release]; [computePSO release]; [renderPSO release];
     [cp release]; [rp release]; [cf release]; [vf release]; [ff release]; [compiler release]; [library release]; [device release];

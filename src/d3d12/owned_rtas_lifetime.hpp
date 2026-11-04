@@ -2,8 +2,11 @@
 // Owned graphics backend: GPU-authoritative lifetime of acceleration-structure versions.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <optional>
 #include <set>
 #include <span>
 #include <unordered_map>
@@ -51,6 +54,10 @@ namespace owned_graphics {
  */
 template <typename Key, typename Payload, typename Hash = std::hash<Key>> class RTASLifetime {
 public:
+  RTASLifetime() = default;
+  RTASLifetime(const RTASLifetime &) = delete;
+  RTASLifetime &operator=(const RTASLifetime &) = delete;
+
   struct Version {
     Payload payload;
     uint32_t token = 0;
@@ -67,8 +74,10 @@ public:
     uint32_t leases = 0;
   };
 
+  using Pending = std::multimap<uint64_t, Key>;
   struct Slot {
     std::vector<Version> versions;
+    std::optional<typename Pending::iterator> pending;
     uint32_t encoded_token = 0;
     uint64_t encoded_queue = 0;
   };
@@ -162,6 +171,7 @@ public:
         ++version;
       }
     }
+    Schedule(key, found->second);
     return released;
   }
 
@@ -272,10 +282,10 @@ public:
         version.barrier = ObservationBarrier();
       }
     }
-    if (!matched)
-      return false;
-    Stamp(found->second);
-    return true;
+    if (matched)
+      Stamp(found->second);
+    Schedule(key, found->second);
+    return matched;
   }
 
   /**
@@ -299,6 +309,8 @@ public:
       for (auto &version : found->second.versions) {
         if (version.token == token && version.leases) {
           --version.leases;
+          if (!version.leases && !version.live)
+            Schedule(key, found->second);
           break;
         }
       }
@@ -320,7 +332,10 @@ public:
   Sweep() {
     std::vector<std::pair<Key, Payload>> released;
     const uint64_t low = ActiveLowWatermark();
-    for (auto &entry : slots_) {
+    while (!pending_.empty() && pending_.begin()->first < low) {
+      auto &entry = *slots_.find(pending_.begin()->second);
+      pending_.erase(pending_.begin());
+      entry.second.pending.reset();
       auto &versions = entry.second.versions;
       for (auto version = versions.begin(); version != versions.end();) {
         if (Dead(*version, low)) {
@@ -332,6 +347,7 @@ public:
           ++version;
         }
       }
+      Schedule(entry.first, entry.second);
     }
     return released;
   }
@@ -345,6 +361,8 @@ public:
       return released;
     for (auto &version : found->second.versions)
       released.push_back(std::move(version.payload));
+    if (found->second.pending)
+      pending_.erase(*found->second.pending);
     slots_.erase(found);
     return released;
   }
@@ -357,6 +375,22 @@ public:
   }
 
 private:
+  // Keep one wakeup per address. Re-observing an old version can cancel or move its deadline.
+  void Schedule(const Key &key, Slot &slot) {
+    uint64_t first = UINT64_MAX;
+    for (const auto &version : slot.versions)
+      if (!version.live && !version.leases)
+        first = std::min(first, version.stamped ? version.barrier : uint64_t(0));
+    if (slot.pending) {
+      if ((*slot.pending)->first == first)
+        return;
+      pending_.erase(*slot.pending);
+      slot.pending.reset();
+    }
+    if (first != UINT64_MAX)
+      slot.pending = pending_.emplace(first, key);
+  }
+
   static void
   ClearEncoding(Slot &slot) {
     slot.encoded_token = 0;
@@ -403,6 +437,7 @@ private:
   }
 
   std::unordered_map<Key, Slot, Hash> slots_;
+  Pending pending_;
   std::set<uint64_t> active_;
   uint64_t next_submission_ = 1;
   uint32_t next_token_ = 1;

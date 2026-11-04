@@ -253,6 +253,15 @@ int main(int argc, char **argv) {
       list->CopyBufferRegion(result.Get(), 0, zero.Get(), 0, 8);
       barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; list->ResourceBarrier(1, &barrier);
       list->SetComputeRootSignature(root.Get()); list->SetComputeRootUnorderedAccessView(0, result->GetGPUVirtualAddress());
+      ComPtr<ID3D12DescriptorHeap> unused_heap;
+      if (mode == 4) {
+        // A bound resource heap does not make the nodes' local constants CPU inputs.
+        D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1,
+                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        Check(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&unused_heap)), "unreferenced work graph heap");
+        ID3D12DescriptorHeap *heaps[]{unused_heap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+      }
       D3D12_SET_PROGRAM_DESC program{}; program.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
       (mode == 4 ? sharing_identifiers.Get() : identifiers.Get())->GetProgramIdentifier(&program.WorkGraph.ProgramIdentifier, mode == 4 ? L"sharing" : L"bounded");
       program.WorkGraph.Flags = mode == 0 || mode == 4 ? D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE : D3D12_SET_WORK_GRAPH_FLAG_NONE;
@@ -434,7 +443,31 @@ int main(int argc, char **argv) {
       D3D12_DISPATCH_GRAPH_DESC linked_dispatch{}; linked_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
       UINT entry_index = link_properties->GetEntrypointIndex(graph_index, {p ? L"linkB" : L"linkA", 0});
       Require(entry_index != UINT_MAX, "linked entrypoint");
-      linked_dispatch.NodeCPUInput = {entry_index, UINT(link_input.size()), link_input.data(), sizeof(UINT)}; list->DispatchGraph(&linked_dispatch);
+      ComPtr<ID3D12Resource> leaf_upload, leaf_input;
+      if (!p) {
+        linked_dispatch.NodeCPUInput = {entry_index, UINT(link_input.size()), link_input.data(), sizeof(UINT)};
+      } else {
+        // The GPU publishes the four strided seed records and their header in this same list.
+        constexpr UINT header_offset = 32;
+        constexpr UINT bytes = header_offset + sizeof(D3D12_NODE_GPU_INPUT);
+        leaf_upload = Buffer(device.Get(), bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        leaf_input = Buffer(device.Get(), bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        std::array<UINT, 8> padded{};
+        for (size_t i = 0; i < link_input.size(); ++i) {
+          padded[2*i] = link_input[i]; padded[2*i+1] = 0xdeadbeef;
+        }
+        D3D12_NODE_GPU_INPUT header{entry_index, UINT(link_input.size()), {leaf_input->GetGPUVirtualAddress(), 8}};
+        Upload(leaf_upload.Get(), padded.data(), sizeof(padded));
+        Upload(leaf_upload.Get(), &header, sizeof(header), header_offset);
+        list->CopyBufferRegion(leaf_input.Get(), 0, leaf_upload.Get(), 0, bytes);
+        D3D12_RESOURCE_BARRIER ready{}; ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        ready.Transition = {leaf_input.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        list->ResourceBarrier(1, &ready);
+        linked_dispatch.Mode = D3D12_DISPATCH_MODE_NODE_GPU_INPUT;
+        linked_dispatch.NodeGPUInput = leaf_input->GetGPUVirtualAddress() + header_offset;
+      }
+      list->DispatchGraph(&linked_dispatch);
       for (auto &b : barriers) { b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; }
       list->ResourceBarrier(UINT(barriers.size()), barriers.data());
       list->CopyBufferRegion(link_readback.Get(), 0, link_result.Get(), 0, 8); list->CopyBufferRegion(link_readback.Get(), 8, helper_result.Get(), 0, 8);

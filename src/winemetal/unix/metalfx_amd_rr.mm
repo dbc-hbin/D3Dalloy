@@ -122,7 +122,7 @@ struct KernelLibrary {
     id<MTLDevice> device = nil;
     Object library;
     mutable std::mutex pipelineMutex;
-    mutable std::array<std::pair<Object,Object>,12> pipelines;
+    mutable std::array<std::pair<Object,Object>,14> pipelines;
     Object getPipeline(NSString* name) const;
     ~KernelLibrary() { [device release]; }
 };
@@ -171,8 +171,9 @@ Object KernelLibrary::getPipeline(NSString* name) const {
 
 struct Feature::Impl {
     Object device, compiler, snapshotPipeline, geometryPipeline, unpackPipeline, filterPipeline, filterWritePipeline;
+    Object compactFilter, compactFilterWrite;
     Object neuralCommonPipeline, neuralPreparePipeline, neuralResolvePipeline, neuralResolveWritePipeline, zeroPipeline;
-    Object resolvePipeline, resolveWritePipeline, historyFence;
+    Object resolveWritePipeline, historyFence;
     // Keeps the device cache entry alive while this feature exists.
     std::shared_ptr<const KernelLibrary> kernelLibrary;
     WMTRRCreateInfo info{};
@@ -402,11 +403,20 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
             }
             const auto& kernels = *state->kernelLibrary;
             state->snapshotPipeline = kernels.getPipeline(@"rr_snapshot");
-            state->geometryPipeline = kernels.getPipeline(@"rr_geometry");
+            if (!needsNeural) state->geometryPipeline = kernels.getPipeline(@"rr_geometry");
             state->unpackPipeline = kernels.getPipeline(@"rr_unpack");
-            state->filterPipeline = kernels.getPipeline(@"rr_filter");
             const bool needsScalar = (info.signals & ((1u<<0) | (1u<<3) | (1u<<6))) != 0;
-            if (needsScalar) state->filterWritePipeline = kernels.getPipeline(@"rr_filter_write");
+            const bool shadows = (info.signals & (1u<<3)) != 0;
+            const bool compact = (info.signals & ((1u<<0) | (1u<<6))) != 0;
+            if (compact) {
+                state->compactFilter = kernels.getPipeline(@"rr_filter_compact");
+                state->compactFilterWrite = kernels.getPipeline(@"rr_filter_write_compact");
+            }
+            if (shadows) {
+                state->filterPipeline = kernels.getPipeline(@"rr_filter");
+                state->filterWritePipeline = kernels.getPipeline(@"rr_filter_write");
+            }
+            if (needsScalar) state->resolveWritePipeline = kernels.getPipeline(@"rr_resolve_write");
             if (needsNeural) {
                 state->zeroPipeline = kernels.getPipeline(@"rr_zero_albedo");
                 state->neuralCommonPipeline = kernels.getPipeline(@"rr_neural_common");
@@ -414,20 +424,19 @@ std::shared_ptr<Feature> Feature::create(void* nativeDevice, void* nativeCompile
                 state->neuralResolvePipeline = kernels.getPipeline(@"rr_neural_resolve");
                 state->neuralResolveWritePipeline = kernels.getPipeline(@"rr_neural_resolve_write");
             }
-            state->resolvePipeline = kernels.getPipeline(@"rr_resolve");
-            state->resolveWritePipeline = kernels.getPipeline(@"rr_resolve_write");
             id<MTLFence> fence = [device newFence];
             state->historyFence = Object(fence); [fence release];
             auto tileFits = [](const Object& pipeline) {
                 return pipeline && ((id<MTLComputePipelineState>)pipeline.get()).maxTotalThreadsPerThreadgroup >=
                     RrTileSize*RrTileSize;
             };
-            if (!state->snapshotPipeline || !state->geometryPipeline || !state->unpackPipeline ||
-                !tileFits(state->filterPipeline) ||
-                (needsScalar && !tileFits(state->filterWritePipeline)) ||
+            if (!state->snapshotPipeline || (!needsNeural && !state->geometryPipeline) || !state->unpackPipeline ||
+                (shadows && (!tileFits(state->filterPipeline) || !tileFits(state->filterWritePipeline))) ||
+                (compact && (!tileFits(state->compactFilter) || !tileFits(state->compactFilterWrite))) ||
+                (needsScalar && !state->resolveWritePipeline) ||
                 (needsNeural && (!state->zeroPipeline || !state->neuralCommonPipeline || !tileFits(state->neuralPreparePipeline) ||
                                  !state->neuralResolvePipeline || !state->neuralResolveWritePipeline)) ||
-                !state->resolvePipeline || !state->resolveWritePipeline || !state->historyFence) {
+                !state->historyFence) {
                 fail(error,ErrorCode::ResourceCreationFailed,"RR pipeline or fence allocation failed"); return {};
             }
             return std::shared_ptr<Feature>(new Feature(std::move(state)));
@@ -808,6 +817,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             Params base = impl_->parameters;
             std::memcpy(parameters.contents,&base,sizeof(base));
             for (unsigned s=0;s<7;++s) {
+                if (!inputs[s]) continue;
                 Params c = base; c.signal = s; c.checkerboard = !!(feature->info.checkerboard&(1u<<s));
                 c.origin = frame.checkerboard_origin[s]; c.hasHistory = reuse;
                 if (reuse) {
@@ -925,8 +935,9 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 auto motion = common[1] ? tex(common[1]) : (id<MTLTexture>)impl_->textures[1].get();
                 for (unsigned s=0;s<7;++s) if (inputs[s] && !radiance(s)) {
                     const bool writeOutput = (impl_->scalarOutputMask&(1u<<s)) != 0;
-                    dispatch((id<MTLComputePipelineState>)(writeOutput ? feature->filterWritePipeline.get() :
-                                                                       feature->filterPipeline.get()),s+1,
+                    const auto& filter = s == 3 ? (writeOutput ? feature->filterWritePipeline : feature->filterPipeline)
+                                                : (writeOutput ? feature->compactFilterWrite : feature->compactFilter);
+                    dispatch((id<MTLComputePipelineState>)filter.get(),s+1,
                         {inputs[s],tex(current->signals[s]),tex(common[0]),motion,tex(common[2]),
                          specAlbedo,diffAlbedo,
                          reuse ? tex(previous->signals[s]) : inputs[s],
@@ -934,7 +945,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                          fusedAlbedo,tex(guide),tex(decoded),
                          writeOutput ? (id<MTLTexture>)impl_->textures[6+2*s].get() : nil},true);
                 }
-                [encoder barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+                if (feature->filterPipeline || feature->compactFilter)
+                    [encoder barrierAfterEncoderStages:MTLStageDispatch beforeEncoderStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
                 simd_float4x4 view, projection, inverseProjection;
                 std::memcpy(&view,frame.view,sizeof(view));
                 std::memcpy(&projection,frame.projection,sizeof(projection));
@@ -971,7 +983,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     if (!radiance(s)) {
                         if (!(impl_->scalarOutputMask&(1u<<s)))
                             dispatch((id<MTLComputePipelineState>)feature->resolveWritePipeline.get(),s+1,
-                                {tex(current->signals[s]),output,inputs[s],tex(common[0])});
+                                {tex(current->signals[s]),output});
                         continue;
                     }
                     const auto& n = neuralFrame;

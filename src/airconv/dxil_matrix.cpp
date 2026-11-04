@@ -206,6 +206,26 @@ class MatrixLowerer {
     if(source==target)return value;
     Type *destination=componentType(module.getContext(),target);
     bool sf=floatComponent(source),tf=floatComponent(target);
+    // E5M2 and binary16 share the sign, exponent and bias. Preserve the signed
+    // canonical NaN of encodeFloat without unpacking subnormals through F32.
+    if (source == 22 && target == 8) {
+      auto *bits = builder.CreateShl(builder.CreateZExt(value, builder.getInt16Ty()), 8);
+      auto *nan = builder.CreateICmpUGT(builder.CreateAnd(value, builder.getInt8(0x7f)), builder.getInt8(0x7c));
+      auto *canonical = builder.CreateOr(builder.CreateAnd(bits, builder.getInt16(0x8000)), builder.getInt16(0x7e00));
+      return builder.CreateBitCast(builder.CreateSelect(nan, canonical, bits), destination);
+    }
+    if (source == 8 && target == 22) {
+      auto *bits = builder.CreateBitCast(value, builder.getInt16Ty());
+      auto *upper = builder.CreateLShr(bits, 8);
+      auto *bias = builder.CreateAdd(builder.getInt16(0x7f), builder.CreateAnd(upper, builder.getInt16(1)));
+      auto *rounded = builder.CreateLShr(builder.CreateAdd(bits, bias), 8);
+      auto *nan = builder.CreateICmpUGT(builder.CreateAnd(bits, builder.getInt16(0x7fff)), builder.getInt16(0x7c00));
+      return builder.CreateTrunc(builder.CreateSelect(nan, builder.CreateOr(upper, builder.getInt16(0x7f)), rounded),
+                                 destination);
+    }
+    // Small integers are exact in F32 and cannot yield a nonzero half subnormal.
+    if (!sf && target == 8 && componentBits(source) <= 16)
+      return signedComponent(source) ? builder.CreateSIToFP(value, destination) : builder.CreateUIToFP(value, destination);
     if(sf)value=floatValue(value,source);
     Type *arithmetic_target=(target==8 || target==21 || target==22 || target==23)?builder.getFloatTy():destination;
     if(sf && tf) {if(value->getType()!=arithmetic_target)value=builder.CreateFPCast(value,arithmetic_target);}
@@ -501,6 +521,22 @@ public:
 };
 } // namespace
 Expected<bool> IsMatrixOperation(const CallInst &call) {auto op=classify(call);if(!op)return op.takeError();return op->index!=0;}
+Expected<MatrixBufferAccess> GetMatrixBufferAccess(const CallInst &call) {
+  auto op = classify(call);
+  if (!op) return op.takeError();
+  if (op->legacy) {
+    if (op->index == 4) return MatrixBufferAccess{call.getArgOperand(2), true, false}; // LoadRawBuf
+    if (op->index == 6) return MatrixBufferAccess{call.getArgOperand(2), false, true}; // StoreRawBuf
+  } else {
+    switch (op->index) {
+    case 4:  return MatrixBufferAccess{call.getArgOperand(1), true, false};  // LoadFromDescriptor
+    case 10: return MatrixBufferAccess{call.getArgOperand(2), false, true}; // StoreToDescriptor
+    case 17: return MatrixBufferAccess{call.getArgOperand(2), true, true};  // MatrixAccumulateToDescriptor
+    case 21: return MatrixBufferAccess{call.getArgOperand(op->preview ? 2 : 1), true, true}; // VectorAccumulate
+    }
+  }
+  return MatrixBufferAccess{};
+}
 Expected<bool> ValidateMatrixContract(Module &module,uint32_t major,uint32_t minor) {
   auto records=descriptors(module);if(!records)return records.takeError();bool legacy=false,modern=false,wave32=false,preview=false;
   for(Function &function:module)if(!function.isDeclaration())for(Instruction &instruction:instructions(function))if(auto *call=dyn_cast<CallInst>(&instruction)) {

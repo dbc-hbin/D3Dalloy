@@ -12,38 +12,53 @@ using SwizzleUlong = uint64_t;
 
 namespace d3dalloy {
 
-// Kernel arguments for one D3D12 texture subresource. The buffer bindings
-// carry the allocation offsets; first_tile is subresource-relative to the
-// canonical buffer binding, which begins at that placed resource's byte zero.
+// Move packed coordinate bits into their places in the 16-bit tile offset.
+// Applying the largest displacements first keeps the bit positions ordered.
+struct SwizzleBitMoves {
+  SwizzleUint mask[4];
+};
+
+#ifndef __METAL__
+constexpr SwizzleBitMoves swizzle_bit_moves(SwizzleUint destinations) {
+  SwizzleBitMoves moves{};
+  SwizzleUint source = 0;
+  for (SwizzleUint dest = 0; dest < 16; ++dest) {
+    if (!(destinations & (1u << dest))) continue;
+    SwizzleUint position = source++;
+    for (SwizzleUint stage = 0; stage < 4; ++stage) {
+      const SwizzleUint shift = 8u >> stage;
+      if (dest - position >= shift) {
+        moves.mask[stage] |= 1u << position;
+        position += shift;
+      }
+    }
+  }
+  return moves;
+}
+#endif
+
+inline SwizzleUint swizzle_deposit(SwizzleUint value, SwizzleBitMoves moves) {
+  for (SwizzleUint stage = 0; stage < 4; ++stage) {
+    const SwizzleUint mask = moves.mask[stage];
+    value = (value & ~mask) | ((value & mask) << (8u >> stage));
+  }
+  return value;
+}
+
+// One dispatch covers exactly the active format units of one tile.
 struct D3D12StandardSwizzleParams {
-  SwizzleUlong first_tile;
-  SwizzleUlong tiles_x;
-  SwizzleUlong tiles_y;
-  SwizzleUint units_x;
-  SwizzleUint units_y;
-  SwizzleUint units_z;
-  SwizzleUint tile_width;
-  SwizzleUint tile_height;
-  SwizzleUint tile_depth;
-  SwizzleUint x_mask;
-  SwizzleUint y_mask;
-  SwizzleUint z_mask;
+  SwizzleUlong tile_offset;
+  SwizzleBitMoves x_moves, y_moves, z_moves;
   SwizzleUint bytes_per_unit;
   SwizzleUint row_pitch;
   SwizzleUint slice_pitch;
-  SwizzleUint origin_x;
-  SwizzleUint origin_y;
-  SwizzleUint origin_z;
-  SwizzleUint extent_x;
-  SwizzleUint extent_y;
-  SwizzleUint extent_z;
   // Packed 4:2:2 stores one 4-byte canonical pair as two RGBA8 native pixels.
-  SwizzleUint physical_width;
+  SwizzleUint tile_pixel_width;
   SwizzleUint packed422_variant;
 };
 
 #ifndef __METAL__
-static_assert(sizeof(D3D12StandardSwizzleParams) == 104);
+static_assert(sizeof(D3D12StandardSwizzleParams) == 80);
 #endif
 
 } // namespace d3dalloy

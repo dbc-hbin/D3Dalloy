@@ -889,6 +889,27 @@ static bool representation_validity(ID3D12Device *device, ID3D12CommandQueue *qu
   bind_views(1);if(!submit(readers[3].Get()))return false;
   ComPtr<ID3D12GraphicsCommandList> unrelated;
   if (!new_list(unrelated)) return false;
+  D3D12_RESOURCE_DESC color = td;
+  color.Width = color.Height = 4;
+  color.DepthOrArraySize = color.MipLevels = 1;
+  color.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  color.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  color.SampleDesc.Count = 4;
+  ComPtr<ID3D12Resource> msaa, resolved;
+  if (!ok(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &color, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                          nullptr, IID_PPV_ARGS(&msaa)), "handoff-msaa")) return false;
+  color.SampleDesc.Count = 1;
+  if (!ok(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &color, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                          nullptr, IID_PPV_ARGS(&resolved)), "handoff-resolved")) return false;
+  D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+  ComPtr<ID3D12DescriptorHeap> rtv;
+  if (!ok(device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv)), "handoff-rtv")) return false;
+  auto handle = rtv->GetCPUDescriptorHandleForHeapStart();
+  device->CreateRenderTargetView(msaa.Get(), nullptr, handle);
+  const float white[4] = {1, 1, 1, 1};
+  unrelated->ClearRenderTargetView(handle, white, 0, nullptr);
+  transition(unrelated.Get(), msaa.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+  unrelated->ResolveSubresource(resolved.Get(), 0, msaa.Get(), 0, color.Format);
   unrelated->CopyBufferRegion(output_readback.Get(), 0, upload.Get(), guard_offset, sizeof(uint32_t));
   if (!ok(unrelated->Close(),"handoff-unrelated-close") || !submit(unrelated.Get())) return false;
   bind_views(0);

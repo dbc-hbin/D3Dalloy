@@ -1877,33 +1877,46 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
 
   auto pointer = [&](Value *index) { return b.CreateInBoundsGEP(wide_scratch->getValueType(), wide_scratch, {b.getInt32(0), index}); };
   const auto nativeLane = [&] { return b.CreateAnd(lane, b.getInt32(kNativeWaveLanes - 1)); };
-  const auto partialAt = [&](unsigned group, Type *result_type, Value *identity) -> Value * {
-    Value *present = b.CreateICmpULT(b.getInt32(group * kNativeWaveLanes), active);
-    Value *index = b.CreateSelect(present, b.getInt32(group * kNativeWaveLanes), b.getInt32(0));
+  const auto partialAt = [&](unsigned group, Type *result_type, Value *identity, unsigned slot = 0) -> Value * {
+    auto *offset = b.getInt32(group * kNativeWaveLanes + slot);
+    Value *present = b.CreateICmpULT(offset, active);
+    Value *index = b.CreateSelect(present, offset, b.getInt32(0));
     auto *load = b.CreateLoad(b.getInt64Ty(), pointer(b.CreateAdd(base, index)));
     load->setVolatile(true);
     return b.CreateSelect(present, b.CreateZExtOrTrunc(load, result_type), identity);
   };
-  if (opcode == OpWaveActiveAllEqual && type->getPrimitiveSizeInBits() <= 32) {
+  const unsigned source_lanes = std::min(wide_threads, wave_lanes);
+  const bool one_simd = source_lanes <= kNativeWaveLanes;
+  if (opcode == OpWaveActiveAllEqual) {
     // The wide-wave admission proof guarantees contiguous active compute lanes.
-    // Pack one representative and one disagreement bit into a scratch word.
     auto *bitsType = b.getIntNTy(type->getPrimitiveSizeInBits());
     auto asValue = [&](Value *bits) { return b.CreateBitCast(b.CreateTruncOrBitCast(bits, bitsType), type); };
     auto equals = [&](Value *other) {
       return type->isFloatingPointTy() ? b.CreateFCmpOEQ(value, other) : b.CreateICmpEQ(value, other);
     };
-    auto *bits = b.CreateZExtOrTrunc(b.CreateBitCast(value, bitsType), b.getInt32Ty());
-    auto *first = emitAIR(b, "air.simd_shuffle.u.i32", {bits, b.getInt16(0)}, b.getInt32Ty(), true);
+    const bool two_words = bitsType->getBitWidth() > 32;
+    auto *integer = two_words ? b.getInt64Ty() : b.getInt32Ty();
+    Type *exchange = two_words ? static_cast<Type *>(FixedVectorType::get(b.getInt32Ty(), 2)) : integer;
+    auto *bits = b.CreateZExtOrTrunc(b.CreateBitCast(value, bitsType), integer);
+    auto *shuffled = emitAIR(b, two_words ? "air.simd_shuffle.u.v2i32" : "air.simd_shuffle.u.i32",
+        {b.CreateBitCast(bits, exchange), b.getInt16(0)}, exchange, true);
+    auto *first = b.CreateBitCast(shuffled, integer);
     auto *equal = emitAIR(b, "air.simd_all", {equals(asValue(first))}, b.getInt1Ty(), true);
-    if (wide_threads <= kNativeWaveLanes) return equal;
-    Value *word = b.CreateOr(b.CreateZExt(first, b.getInt64Ty()),
-        b.CreateSelect(equal, b.getInt64(0), b.getInt64(uint64_t(1) << 32)));
+    if (one_simd) return equal;
+    // Short values pack the verdict above the representative. A full-width
+    // representative occupies lane 0's word; lane 1 stores its SIMD verdict.
+    // A partial SIMD with only lane 0 is uniform by definition.
+    Value *word = two_words ? b.CreateSelect(b.CreateICmpEQ(nativeLane(), b.getInt32(0)), first,
+                                             b.CreateZExt(equal, b.getInt64Ty()))
+                            : b.CreateOr(b.CreateZExt(first, b.getInt64Ty()),
+                                  b.CreateSelect(equal, b.getInt64(0), b.getInt64(uint64_t(1) << 32)));
     b.CreateStore(word, pointer(wide_group_index))->setVolatile(true);
     air.CreateBarrier(air::MemFlags::Threadgroup, false);
     Value *result = equal;
-    for (unsigned group = 0; group * kNativeWaveLanes < std::min(wide_threads, wave_lanes); ++group) {
-      Value *peer = partialAt(group, b.getInt64Ty(), word);
-      Value *uniform = b.CreateICmpULT(peer, b.getInt64(uint64_t(1) << 32));
+    for (unsigned group = 0; group * kNativeWaveLanes < source_lanes; ++group) {
+      Value *peer = partialAt(group, b.getInt64Ty(), two_words ? first : word);
+      Value *uniform = two_words ? partialAt(group, b.getInt1Ty(), b.getTrue(), 1)
+                                 : b.CreateICmpULT(peer, b.getInt64(uint64_t(1) << 32));
       result = b.CreateAnd(result, b.CreateAnd(uniform, equals(asValue(peer))));
     }
     air.CreateBarrier(air::MemFlags::Threadgroup, false);
@@ -1948,10 +1961,11 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
       if (prefix) localPrefix = b.CreateZExtOrTrunc(emitAIR(b,
           airSymbol(air,waveNativeName(kind,true),nativeType,sign),{nativeValue},nativeType,true),type);
     }
+    if (one_simd) return prefix ? localPrefix : partial;
     b.CreateStore(b.CreateZExtOrTrunc(partial,b.getInt64Ty()),pointer(wide_group_index))->setVolatile(true);
     air.CreateBarrier(air::MemFlags::Threadgroup,false);
     Value *result = identity;
-    for (unsigned group = 0; group < wave_lanes / kNativeWaveLanes; ++group) {
+    for (unsigned group = 0; group * kNativeWaveLanes < source_lanes; ++group) {
       Value *next = waveCombine(b,air,kind,result,partialAt(group,type,identity),is_signed);
       result = prefix ? b.CreateSelect(b.CreateICmpULT(b.getInt32(group * kNativeWaveLanes),
           b.CreateAnd(lane,b.getInt32(~(kNativeWaveLanes-1)))),next,result) : next;
@@ -1963,12 +1977,14 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
   if (vote) {
     Value *condition = opcode == OpWaveAllTrue ? b.CreateNot(value) : value;
     Value *ballot = b.CreateTrunc(emitAIR(b,"air.simd_ballot.i64",{condition},b.getInt64Ty(),true),b.getInt32Ty());
-    b.CreateStore(b.CreateZExt(ballot,b.getInt64Ty()),pointer(wide_group_index))->setVolatile(true);
-    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    if (!one_simd) {
+      b.CreateStore(b.CreateZExt(ballot,b.getInt64Ty()),pointer(wide_group_index))->setVolatile(true);
+      air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    }
     SmallVector<Value *,4> words(4,b.getInt32(0));
     Value *result = b.getInt32(0);
-    for (unsigned group = 0; group < wave_lanes / kNativeWaveLanes; ++group) {
-      Value *word = partialAt(group,b.getInt32Ty(),b.getInt32(0));
+    for (unsigned group = 0; group * kNativeWaveLanes < source_lanes; ++group) {
+      Value *word = one_simd ? ballot : partialAt(group,b.getInt32Ty(),b.getInt32(0));
       if (multi) word = b.CreateAnd(word,call.getArgOperand(2+group));
       if (prefix) {
         Value *groupIndex = b.CreateLShr(lane,b.getInt32(5));
@@ -1980,7 +1996,7 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
       result = count_result ? b.CreateAdd(result,emitAIR(b,"air.popcount.i32",{word},b.getInt32Ty(),false))
           : b.CreateOr(result,word);
     }
-    air.CreateBarrier(air::MemFlags::Threadgroup,false);
+    if (!one_simd) air.CreateBarrier(air::MemFlags::Threadgroup,false);
     if (opcode == OpWaveActiveBallot) return buildAggregate(b,call.getType(),words);
     if (opcode == OpWaveAnyTrue) return b.CreateICmpNE(result,b.getInt32(0));
     if (opcode == OpWaveAllTrue) return b.CreateICmpEQ(result,b.getInt32(0));
@@ -2008,17 +2024,13 @@ OperationLowerer::lowerWideWave(CallInst &call, uint32_t opcode, IRBuilder<> &b,
     Value *acc = reduction ? waveIdentity(b, kind, type, is_signed)
         : bool_result ? (opcode == OpWaveAnyTrue ? b.getFalse() : b.getTrue()) : b.getInt32(0);
     SmallVector<Value *, 4> words(4, b.getInt32(0));
-    Value *first = opcode == OpWaveActiveAllEqual ? read(b.getInt32(0)) : nullptr;
-    for (unsigned source = 0; source < wave_lanes; ++source) {
+    for (unsigned source = 0; source < source_lanes; ++source) {
       Value *other = read(b.getInt32(source));
       Value *take = b.CreateICmpULT(b.getInt32(source), active);
       if (prefix) take = b.CreateAnd(take, b.CreateICmpULT(b.getInt32(source), lane));
       if (multi) take = b.CreateAnd(take, b.CreateICmpNE(b.CreateAnd(call.getArgOperand(2 + source / 32), b.getInt32(1u << (source % 32))), b.getInt32(0)));
       if (reduction) {
         acc = b.CreateSelect(take, waveCombine(b, air, kind, acc, other, is_signed), acc);
-      } else if (opcode == OpWaveActiveAllEqual) {
-        Value *equal = type->isFloatingPointTy() ? b.CreateFCmpOEQ(other, first) : b.CreateICmpEQ(other, first);
-        acc = b.CreateAnd(acc, b.CreateOr(b.CreateNot(take), equal));
       } else {
         Value *condition = other;
         if (opcode == OpWaveMatch) {

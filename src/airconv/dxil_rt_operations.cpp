@@ -222,7 +222,10 @@ enum DxilRtOpcode : uint32_t {
  * because the other five map onto their operand by a plain shift.
  */
 enum RayFlag : uint32_t {
+  kRayFlagForceOpaque = 0x1,
+  kRayFlagForceNonOpaque = 0x2,
   kRayFlagSkipClosestHitShader = 0x8,
+  kRayFlagSkipProcedural = 0x200,
 };
 
 /** Values of the AIR traversal's configuration operands (see the file comment). */
@@ -2032,6 +2035,13 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
   if (pipeline_geometry_cull)
     geometry_cull = builder.CreateOr(geometry_cull, builder.getInt32(pipeline_geometry_cull));
 
+  const auto *constant_flags = dyn_cast<ConstantInt>(ray_flags);
+  // A forced-opaque triangle cannot invoke any-hit. With procedural geometry
+  // skipped as well, this trace never enters a software candidate callback.
+  const bool opaque_triangles = constant_flags &&
+      (constant_flags->getZExtValue() & (kRayFlagForceOpaque | kRayFlagForceNonOpaque)) == kRayFlagForceOpaque &&
+      ((constant_flags->getZExtValue() | context.pipeline_flags) & kRayFlagSkipProcedural);
+  const bool query_traversal = (context.pipeline_flags & 0x400) || (context.query_callbacks && !opaque_triangles);
   bool skip_closest_hit = false;
   const bool skip_is_constant = constantFlag(ray_flags, kRayFlagSkipClosestHitShader, skip_closest_hit);
   Value *skip_value = nullptr;
@@ -2132,7 +2142,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
   auto emitTraversal = [&](IRBuilder<> &b) {
     copyPayloadInto(b, child, payload_operand);
     auto issueTraversal = [&](IRBuilder<> &tb) -> Value * {
-      if (context.query_callbacks || (context.pipeline_flags & 0x400))
+      if (query_traversal)
         return emitQueryTraversal(tb, child, acceleration_structure, origin, direction, t_min, t_max,
                                   ray_flags, instance_mask, triangle_cull, geometry_cull, opacity_cull, forced_opacity,
                                   deferred);

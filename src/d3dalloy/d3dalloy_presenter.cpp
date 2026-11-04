@@ -320,14 +320,18 @@ Presenter::encodeCommandsMetal4(
 ) {
   assert(compiler_ && "Metal4 presentation requires a Metal4 compiler");
   work = {};
-  auto drawable = layer_.nextDrawable();
+  WMTPresentDrawable present{};
+  present.layer = layer_.handle;
+  present.source = backbuffer.handle;
+  MetalLayer_acquirePresentDrawable(&present);
+  WMT::MetalDrawable drawable{present.drawable};
   if (!drawable) return {};
   if (!cmdbuf.useDrawable(drawable)) return {};
-  auto destination = drawable.texture();
+  WMT::Texture destination{present.texture};
   const double width = layer_props_.drawable_width;
   const double height = layer_props_.drawable_height;
-  const uint64_t source_width = backbuffer.width(), source_height = backbuffer.height();
-  const uint64_t destination_width = destination.width(), destination_height = destination.height();
+  const uint64_t source_width = present.source_width, source_height = present.source_height;
+  const uint64_t destination_width = present.destination_width, destination_height = present.destination_height;
   work.width = uint32_t(destination_width);
   work.height = uint32_t(destination_height);
   const auto &geometry = metadata.geometry;
@@ -349,10 +353,10 @@ Presenter::encodeCommandsMetal4(
   // An untonemapped, unit-EDR PQ10 flip has the same ST.2084 input/output
   // transfer. Its decode/encode round trip preserves all 1024 stored UNORM
   // codes. No such inference is made for floating-point or transformed color.
-  const auto format = backbuffer.pixelFormat();
+  const auto format = present.source_format;
   const bool copy_format = format == WMTPixelFormatRGBA8Unorm || format == WMTPixelFormatBGRA8Unorm ||
       format == WMTPixelFormatRGB10A2Unorm;
-  if (!composition_ && identity_geometry && copy_format && format == destination.pixelFormat() &&
+  if (!composition_ && identity_geometry && copy_format && format == present.destination_format &&
       sample_count_ == 1 && metadata.alpha == D3DalloyPresentAlpha::Opaque && metadata.edr_scale == 1.0f &&
       !metadata.composition_color_space && !pipeline_key_.source_srgb &&
       (!pipeline_key_.is_pq || format == WMTPixelFormatRGB10A2Unorm) &&

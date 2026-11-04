@@ -9,7 +9,7 @@
 #include <chrono>
 #include <set>
 #ifndef EXPECT_RR_PIPELINES
-#define EXPECT_RR_PIPELINES 11
+#define EXPECT_RR_PIPELINES 7
 #endif
 #ifndef EXPECT_RR_WORKING_SETS
 #define EXPECT_RR_WORKING_SETS 1
@@ -31,7 +31,7 @@ Pipeline originalPipeline;
 Encode originalEncode;
 Method encodeMethod;
 unsigned creations = 0, pipelines = 0;
-id zeroPipeline = nil, scalarWritePipeline = nil, resolveWritePipeline = nil;
+id zeroPipeline = nil, scalarWritePipeline = nil, compactWritePipeline = nil, resolveWritePipeline = nil;
 using BindPipeline = void (*)(id,SEL,id);
 BindPipeline originalBind = nullptr;
 Method bindMethod = nullptr;
@@ -39,7 +39,7 @@ unsigned zeroDispatches = 0;
 unsigned scalarWrites = 0, scalarResolves = 0;
 void observeBind(id self, SEL selector, id pipeline) {
   if (pipeline == zeroPipeline && pipeline) ++zeroDispatches;
-  if (pipeline == scalarWritePipeline && pipeline) ++scalarWrites;
+  if (pipeline && (pipeline == scalarWritePipeline || pipeline == compactWritePipeline)) ++scalarWrites;
   if (pipeline == resolveWritePipeline && pipeline) ++scalarResolves;
   originalBind(self,selector,pipeline);
 }
@@ -79,6 +79,7 @@ id observePipeline(id self, SEL selector, id function, NSError **error) {
   id pipeline = originalPipeline(self,selector,function,error);
   if ([[(id<MTLFunction>)function name] isEqualToString:@"rr_zero_albedo"]) zeroPipeline = pipeline;
   if ([[(id<MTLFunction>)function name] isEqualToString:@"rr_filter_write"]) scalarWritePipeline = pipeline;
+  if ([[(id<MTLFunction>)function name] isEqualToString:@"rr_filter_write_compact"]) compactWritePipeline = pipeline;
   if ([[(id<MTLFunction>)function name] isEqualToString:@"rr_resolve_write"]) resolveWritePipeline = pipeline;
   return pipeline;
 }

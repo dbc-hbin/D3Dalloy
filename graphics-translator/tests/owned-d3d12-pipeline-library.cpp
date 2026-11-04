@@ -615,6 +615,26 @@ void testContracts(Fixture &f, std::vector<uint8_t> &serialized) {
   state.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
   reject([&](void **p) { return library->LoadGraphicsPipeline(L"graphics", &state, __uuidof(ID3D12PipelineState), p); },
          "render_target_format_mismatch");
+  // Equivalent executable states still have distinct public descriptions.
+  auto dormant = gfx;
+  dormant.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+  dormant.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+  dormant.DepthStencilState.StencilWriteMask = 0x17;
+  reject([&](void **p) {
+    return library->LoadGraphicsPipeline(L"graphics", &dormant, __uuidof(ID3D12PipelineState), p);
+  }, "dormant_library_mismatch");
+  ComPtr<ID3D12PipelineState> equivalent;
+  check(f.device->CreateGraphicsPipelineState(&dormant, IID_PPV_ARGS(&equivalent)), "create equivalent graphics");
+  ComPtr<ID3DBlob> dormant_blob;
+  check(equivalent->GetCachedBlob(&dormant_blob), "get equivalent cached blob");
+  dormant.CachedPSO = {dormant_blob->GetBufferPointer(), dormant_blob->GetBufferSize()};
+  check(f.device->CreateGraphicsPipelineState(&dormant, IID_PPV_ARGS(&loaded)), "reload own dormant fields");
+  loaded.Reset();
+  auto different = gfx;
+  different.CachedPSO = dormant.CachedPSO;
+  reject([&](void **p) {
+    return f.device->CreateGraphicsPipelineState(&different, __uuidof(ID3D12PipelineState), p);
+  }, "dormant_blob_mismatch");
   auto culled = f.graphicsStream(D3D12_CULL_MODE_FRONT);
   auto culledDesc = culled.desc();
   reject([&](void **p) { return library->LoadPipeline(L"stream", &culledDesc, __uuidof(ID3D12PipelineState), p); },

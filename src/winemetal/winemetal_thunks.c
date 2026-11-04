@@ -787,6 +787,11 @@ MetalLayer_nextDrawable(obj_handle_t layer) {
   return params.ret;
 }
 
+WINEMETAL_API void
+MetalLayer_acquirePresentDrawable(struct WMTPresentDrawable *present) {
+  UNIX_CALL(321, present);
+}
+
 WINEMETAL_API bool
 MTLDevice_supportsFXSpatialScaler(obj_handle_t device) {
   struct unixcall_generic_obj_uint64_ret params;

@@ -35,6 +35,16 @@ void require(bool condition, const char *step) {
     fail(step);
 }
 
+template <typename... Args>
+void writeIndirectPhase(const char *format, Args... args) {
+  char line[256];
+  const int length = std::snprintf(line, sizeof(line), format, args...);
+  DWORD written = 0;
+  if (length <= 0 || size_t(length) >= sizeof(line) ||
+      !WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, DWORD(length), &written, nullptr) || written != DWORD(length))
+    fail("indirect phase marker");
+}
+
 void requireOwnedBackend() {
   HMODULE module = GetModuleHandleW(L"d3d12.dll");
   require(module != nullptr, "d3d12-module");
@@ -1327,10 +1337,10 @@ void RunPreparedComputeIndirect(TestContext &context, const std::vector<uint8_t>
         const bool predicate = execution != 3;
         const UINT values[] = {count,predicate ? 1u : 0u};
         writeUpload(input.Get(),values,sizeof(values));
-        std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_begin\n",
+        writeIndirectPhase("OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_begin\n",
                      mode,maximum,execution);
         context.submitClosed(list.Get());
-        std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_end\n",
+        writeIndirectPhase("OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=%u max=%u replay=%u phase=submit_end\n",
                      mode,maximum,execution);
         const UINT active = predicated && !predicate ? 0 :
                             counted && count < maximum ? count : maximum;
@@ -1495,9 +1505,9 @@ void RunSimpleGraphicsIndirect(TestContext &context) {
       std::memcpy(records.data()+16+32,indexed ? static_cast<const void *>(&lastIndexed) : &last,
                   indexed ? sizeof(lastIndexed) : sizeof(last));
       writeUpload(upload.Get(),records.data(),records.size());
-      std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_begin\n",kind,maximum);
+      writeIndirectPhase("OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_begin\n",kind,maximum);
       context.submitClosed(list.Get());
-      std::fprintf(stderr,"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_end\n",kind,maximum);
+      writeIndirectPhase("OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format=%u max=%u phase=submit_end\n",kind,maximum);
       const uint8_t red = maximum >= 2 ? 3 : 2; const uint8_t green = maximum >= 2 ? 7 : 5;
       uint8_t *observed = nullptr;
       check(readback->Map(0,nullptr,reinterpret_cast<void **>(&observed)),"simple-indirect-image-map");
@@ -1505,8 +1515,13 @@ void RunSimpleGraphicsIndirect(TestContext &context) {
         for (UINT x = 0; x < 4; ++x) {
           const uint8_t *pixel = observed+footprint.Offset+y*footprint.Footprint.RowPitch+x*4;
           const bool covered = maximum != 0 && x >= 1 && x < 3;
-          require(pixel[0] == (covered ? red : 0) && pixel[1] == (covered ? green : 0) &&
-                  pixel[2] == 0 && pixel[3] == (covered ? 255 : 0),"simple-indirect-exact-pixel");
+          if (pixel[0] != (covered ? red : 0) || pixel[1] != (covered ? green : 0) ||
+              pixel[2] != 0 || pixel[3] != (covered ? 255 : 0)) {
+            std::fprintf(stderr, "SIMPLE_INDIRECT_PIXEL format=%u max=%u x=%u y=%u actual=%u,%u,%u,%u expected=%u,%u,0,%u\n",
+                kind, maximum, x, y, pixel[0], pixel[1], pixel[2], pixel[3], covered ? red : 0,
+                covered ? green : 0, covered ? 255 : 0);
+            require(false,"simple-indirect-exact-pixel");
+          }
         }
       // Footprint row padding has unspecified contents; only bytes outside
       // the entire placed footprint are guards, never the copied row padding.

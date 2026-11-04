@@ -498,8 +498,6 @@ struct MeshCaptureIndirectData {
   bool domain_only = false;
   SM50_MSAA_MESH_LAYOUT msaa_layout{};
   SOIndirectPreflightParams preflight{};
-  WMT::Reference<WMT::ComputePipelineState> compact_pipeline;
-  WMT::Reference<WMT::ComputePipelineState> compact_reduce_pipeline, primitive_scan_pipeline;
   /* Stream output after the GS: the recorded draw (chained per captured stream) whose assembly params live in
    * `so_template->heap`. Every command copies it with its own scratch, params, control and status; the SO
    * counters, predicate snapshot and targets stay shared, so commands append in API order. */
@@ -536,8 +534,6 @@ struct MeshCaptureIndirectData {
   bool strip_expand = false;
 
   uint32_t strip_vertices_per_primitive = 0;
-  WMT::Reference<WMT::ComputePipelineState> strip_cut_pipeline;
-  WMT::Reference<WMT::ComputePipelineState> strip_reduce_pipeline;
   WMT::Buffer statistics_buffer;  // IAVertices accounting of the expansion (statistics queries only)
   uint64_t statistics_offset = 0;
   uint64_t statistics_address = 0;
@@ -823,6 +819,7 @@ struct ResolveEncoderData : EncoderData {
   WMT::Reference<WMT::RenderPipelineState> pipeline;
   WMT::Reference<WMT::DepthStencilState> depth_stencil_state;
   uint8_t dsv_flags = 0;
+  bool overwrite_color = false;
   WMTProgrammableSamplePositions sample_positions{};
   struct {
     int32_t source_delta_x = 0;

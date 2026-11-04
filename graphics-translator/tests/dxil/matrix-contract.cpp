@@ -18,6 +18,25 @@ int main(int argc,char **argv) {
     auto parsed=d3dalloy::dxil::ModuleInfo::Parse((*bytes)->getBufferStart(),(*bytes)->getBufferSize());
     if(!parsed) {std::fprintf(stderr,"MATRIX_CONTRACT_FAIL parse=%s error=%s\n",argv[i],toString(parsed.takeError()).c_str());++failures;continue;}
     auto &info=**parsed;
+    const bool retired = info.entry_name == "cs_wavematrix16x64";
+    const bool formats = info.entry_name == "cs_matrix_formats";
+    const bool atomic = info.entry_name == "cs_matrix_atomic";
+    if (retired || formats || atomic) {
+      unsigned seen = 0;
+      bool valid = true;
+      for (const auto &binding : info.resources) {
+        if (binding.klass != d3dalloy::dxil::ResourceClass::UAV) continue;
+        const unsigned slot = binding.lower_bound;
+        const bool read = slot == 1 || formats || atomic;
+        valid &= slot <= 1 && binding.read == read && binding.written == (slot == 0);
+        if (slot <= 1) seen |= 1u << slot;
+      }
+      if (!valid || seen != (atomic ? 1u : 3u)) {
+        std::fprintf(stderr, "MATRIX_CONTRACT_FAIL UAV access flags in %s\n", argv[i]);
+        ++failures;
+        continue;
+      }
+    }
     CallInst *matrix=nullptr;
     for(Function &function:*info.module) if(!function.isDeclaration())
       for(Instruction &instruction:instructions(function)) if(auto *call=dyn_cast<CallInst>(&instruction)) {

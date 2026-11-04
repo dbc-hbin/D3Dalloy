@@ -109,6 +109,7 @@ struct SubmissionNode {
   const EncoderData *record;
   size_t list_ordinal, node_ordinal;
   size_t group = SIZE_MAX;
+  uint16_t discard_store_mask = 0;
   const char *rejection = nullptr;
   // Access completeness answers whether resource dependencies can be trusted.
   // Merge eligibility is separate: an encoder may be fully described yet still
@@ -169,6 +170,7 @@ struct SubmissionClearBatch {
   std::vector<std::pair<size_t, uint8_t>> members;
 };
 struct SubmissionResourcePins {
+  std::shared_ptr<const std::vector<Rc<BufferAllocation>>> indirect_buffer_owners;
   std::vector<Com<MTLD3D12Resource, false>> descriptor_owners;
   std::vector<Rc<BufferAllocation>> buffer_owners;
   std::vector<std::shared_ptr<const SubmissionDescriptorCache>> descriptor_caches;
@@ -303,6 +305,56 @@ SubmissionAccess TextureAccess(TextureAllocation *allocation,TextureViewKey key,
   if (heap) SetHeapAccessExtent(access, allocation->canonicalHeapOffset, allocation->canonicalHeapSize);
   return access;
 }
+// A later full clear kills a previous native store even across independent work. Bound the
+// reverse search and stop at any unproven observation. A group is changed only at its last member.
+void DiscardOverwrittenStores(SubmissionPlan &plan, size_t next, const ClearEncoderData &clear) {
+  const auto &view = clear.attachment;
+  if (!view || clear.depth_plane || clear.array_length > 1 || view->castBlockSize ||
+      !view->allocation->descriptor->privateAttachmentStore || view->reservedCast || view->msaaSampleAddress)
+    return;
+  auto *texture = view->allocation->descriptor;
+  if (clear.width != std::max(1u, texture->width() >> view->key.mip_start) ||
+      clear.height != std::max(1u, texture->height() >> view->key.mip_start)) return;
+  const uint8_t aspects = clear.clear_dsv ? uint8_t(clear.clear_dsv) : 4;
+  const auto &consumer = plan.nodes[next];
+  if (!consumer.access_complete || consumer.boundary_before) return;
+  const auto range = TextureAccess(view->allocation, view->key, aspects, true, true, WMTMetal4StageFragment);
+  for (size_t i = next; i && next - i < kSubmissionCandidateBudget;) {
+    auto &node = plan.nodes[--i];
+    if (node.list_ordinal != consumer.list_ordinal || !node.access_complete || node.boundary_after ||
+        node.helper_passes || node.external_backing || node.sparse_resource_used) return;
+    if (std::any_of(node.scopes_after.begin(), node.scopes_after.end(),
+                    [&](const SubmissionAccess &scope) { return AccessOverlaps(scope, range); })) return;
+    if (std::any_of(node.accesses.begin(), node.accesses.end(),
+                    [&](const SubmissionAccess &access) { return AccessOverlaps(access, range); })) {
+      if (node.record->type != EncoderType::Render || node.folded_resolve) return;
+      const auto &render = *static_cast<const RenderEncoderData *>(node.record);
+      if (render.render_pass_requires_fence || render.render_target_array_length > 1) return;
+      auto *group = node.group == SIZE_MAX ? nullptr : &plan.groups[node.group];
+      if (group && group->members.back() != i) return;
+      auto discard = [&](const auto &attachment, unsigned bit, auto *native) {
+        if (attachment.attachment.ptr() != view.ptr() || attachment.level || attachment.slice || attachment.depth_plane ||
+            attachment.store_action != WMTStoreActionStore) return;
+        if (native) {
+          if (native->store_action != WMTStoreActionStore) return;
+          native->store_action = WMTStoreActionDontCare;
+        } else node.discard_store_mask |= uint16_t(1u << bit);
+        owned_graphics::Trace("render_store_overwritten", ",\"encoder\":", render.id, ",\"slot\":", bit,
+                              ",\"clear_encoder\":", clear.id);
+      };
+      if (aspects & 4) for (unsigned slot = 0; slot < render.render_target_count; ++slot) {
+        auto &color = render.colors[slot];
+        if (color.resolve_attachment || color.buffer_attachment || color.attachment.ptr() != view.ptr()) continue;
+        unsigned physical = group ? group->color_maps.back()[slot] : slot;
+        if (physical < 8) discard(color, slot, group ? &group->descriptor.colors[physical] : nullptr);
+      }
+      if (aspects & 1) discard(render.depth, 8, group ? &group->descriptor.depth : nullptr);
+      if (aspects & 2) discard(render.stencil, 9, group ? &group->descriptor.stencil : nullptr);
+      return;
+    }
+    if (node.boundary_before || !node.scopes_before.empty()) return;
+  }
+}
 bool HeapAttachmentViewsOverlap(const TextureViewRef &a, const TextureViewRef &b) {
   // One retained view may provide both depth and stencil, or recur in a group.
   // Distinct views must not alias physical heap storage inside that native pass.
@@ -385,7 +437,7 @@ const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Dev
         (color.store_action == WMTStoreActionStoreAndMultisampleResolve ||
          color.store_action == WMTStoreActionMultisampleResolve) && !color.resolve_level &&
         !color.resolve_slice && !color.resolve_depth_plane;
-    if (color.buffer_attachment || (color.resolve_attachment && !folded_resolve) ||
+    if ((color.resolve_attachment && !folded_resolve) ||
         (!access_only && (color.level || color.slice || color.depth_plane)) ||
         (!folded_resolve && color.store_action != WMTStoreActionStore &&
                               color.store_action != WMTStoreActionDontCare) ||
@@ -418,7 +470,7 @@ const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Dev
 }
 // No state_events inference: these summaries describe native allocation effects.
 bool AppendSubmissionBuffer(SubmissionNode &node, MTLD3D12Device *device,
-                            uint64_t address, uint64_t bytes, bool writes, uint64_t stages) {
+                            uint64_t address, uint64_t bytes, bool writes, uint64_t stages, SubmissionAccess *captured = nullptr) {
   uint64_t offset = 0;
   auto allocation_owner = device->LookupBufferByVA(address, &offset);
   auto *allocation = allocation_owner.ptr();
@@ -431,8 +483,10 @@ bool AppendSubmissionBuffer(SubmissionNode &node, MTLD3D12Device *device,
   if (length > allocation->byteLength() - offset) return false;
   if (!length) return true;
   node.allocation_pins.push_back(std::move(allocation_owner));
-  return AppendSubmissionAccess(node, BufferAccess(allocation,bytes == UINT64_MAX ? 0 : offset,
-      bytes == UINT64_MAX ? allocation->byteLength() : length,writes,stages));
+  const auto access = BufferAccess(allocation, bytes == UINT64_MAX ? 0 : offset,
+      bytes == UINT64_MAX ? allocation->byteLength() : length, writes, stages);
+  if (captured) *captured = access;
+  return AppendSubmissionAccess(node, access);
 }
 bool AppendSubmissionTexture(SubmissionNode &node, MTLD3D12Device *device, Texture *texture,
     TextureAllocation *allocation, TextureViewKey key, uint8_t aspects, bool writes, bool attachment, uint64_t stages,
@@ -585,7 +639,7 @@ bool IndependentAtomicDomain(MTLD3D12Device *device, const ClosedPassShape &shap
 }
 
 bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D12Device *device,
-    const ClosedDescriptorShape &shape) {
+    const ClosedDescriptorShape &shape, const SubmissionDescriptorCache **captured = nullptr) {
   if (!shape.descriptors_complete) return false;
   uint64_t count = 0;
   for (const auto &table : shape.descriptors) {
@@ -597,6 +651,7 @@ bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D1
   auto append_cached = [&](const std::shared_ptr<const SubmissionDescriptorCache> &cache) {
     if (!ResolveSubmissionDescriptorBudget(node, cache->descriptor_count)) return false;
     plan.descriptor_caches.push_back(cache);
+    if (captured) *captured = cache.get();
     node.helper_passes |= cache->helper_passes;
     for (const auto &access : cache->accesses)
       if (!AppendSubmissionAccess(node, access)) return false;
@@ -680,7 +735,7 @@ bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D1
 // keeps the original serial command stream. A conflict starts a new group:
 // the serial encoder's device barrier orders all prior dispatches before it.
 bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MTLD3D12Device *device,
-    const ComputeEncoderData &compute, const ClosedPassShape &shape) {
+    const ClosedPassShape &shape, std::span<const SubmissionAccess> buffers, const SubmissionDescriptorCache *tables) {
   if (node.external_backing) { node.dispatch_serial_reason = "dispatch_external_backing"; return false; }
   if (!shape.dispatch_access_complete || shape.dispatches.size() < 2) {
     node.dispatch_serial_reason = "dispatch_capture"; return false;
@@ -696,12 +751,14 @@ bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MT
     SubmissionNode resolved{};
     bool complete = true;
     for (const auto index : dispatch.buffers) {
-      if (index >= compute.submission_buffers.size()) { complete = false; break; }
-      const auto &use = compute.submission_buffers[index];
-      if (!AppendSubmissionBuffer(resolved, device, use.address, use.length, use.writes,
-                                  use.stages ? use.stages : WMTMetal4StageDispatch)) { complete = false; break; }
+      if (index >= buffers.size() || (buffers[index].allocation && !AppendSubmissionAccess(resolved, buffers[index]))) {
+        complete = false; break;
+      }
     }
-    if (complete) complete = ResolveSubmissionTables(plan, resolved, device, dispatch);
+    if (complete && tables && dispatch.uses_pass_descriptors) {
+      for (const auto &access : tables->accesses)
+        if (!AppendSubmissionAccess(resolved, access)) { complete = false; break; }
+    } else if (complete) complete = ResolveSubmissionTables(plan, resolved, device, dispatch);
     for (auto &pin : resolved.allocation_pins) node.allocation_pins.push_back(std::move(pin));
     if (!complete || resolved.sparse_resource_used || resolved.helper_passes) {
       node.dispatch_serial_reason = "dispatch_access"; return false;
@@ -1121,6 +1178,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
   WMT::Reference<WMT::ComputePipelineState> swizzle_import_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> cast_merge_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> visibility_batch_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> volume_render_publish_pipeline_;
   std::array<WMT::Reference<WMT::ComputePipelineState>, 4> writable_msaa_import_;
   std::array<WMT::Reference<WMT::ComputePipelineState>, 2> depth_msaa_import_;
@@ -1129,6 +1187,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   WMT::Reference<WMT::ComputePipelineState> swizzle_packed422_import_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_packed422_export_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_dirty_pipeline_;
+  WMT::Reference<WMT::ComputePipelineState> as_metadata_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_export_if_dirty_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_packed422_dirty_pipeline_;
   WMT::Reference<WMT::ComputePipelineState> swizzle_packed422_export_if_dirty_pipeline_;
@@ -1161,6 +1220,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // Metal 4 blits run on compute encoders. Unknown types are conservative.
   static uint64_t ProducerStages(EncoderType type) {
     constexpr uint64_t compute = WMTMetal4StageDispatch | WMTMetal4StageBlit | WMTMetal4StageAccelerationStructure;
+    if (type == EncoderType::Resolve) return WMTMetal4StageFragment | WMTMetal4StageTile;
     if (type == EncoderType::Render || type == EncoderType::Clear)
       return WMTMetal4StageVertex | WMTMetal4StageFragment | WMTMetal4StageTile | WMTMetal4StageObject |
           WMTMetal4StageMesh | compute;
@@ -1185,7 +1245,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     }
     if (record->type == EncoderType::Compute)
       return node.helper_passes ? WMTMetal4StageDispatch | WMTMetal4StageFragment : 0;
-    if (record->type == EncoderType::Blit || record->type == EncoderType::Clear) return 0;
+    if (record->type == EncoderType::Blit || record->type == EncoderType::Clear || record->type == EncoderType::Resolve) return 0;
     return WMTMetal4StageAll;
   }
   void SweepInflightAccesses(uint64_t retired) {
@@ -1290,7 +1350,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     drain.endEncoding();
     owned_graphics::Trace("native_skipped_drain", ",\"submission\":", seq, ",\"barrier_count\":1");
   }
-  using OwnedHandle = std::unique_ptr<void, decltype([](HANDLE handle) { CloseHandle(handle); })>;
 
   // An allocator cannot discard recorded payloads while a FIFO task or any
   // Metal segment that reads them remains outstanding.  The lease is moved
@@ -1405,7 +1464,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   struct ExecuteTask {
     std::shared_ptr<ReflexState::Work> reflex_work;
     std::vector<ListSubmission> lists;
-    bool contains_temporal = false;
   };
   struct MarkerTask { DiagnosticAnnotation annotation; std::shared_ptr<DiagnosticBreadcrumb> breadcrumb; };
   std::vector<std::string> diagnostic_groups_; // FIFO worker only.
@@ -1436,7 +1494,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // when ResizeBuffers checks for outstanding backbuffer references.
     Com<MTLD3D12Resource, false> backbuffer;
     std::optional<Presenter::PresentState> state;
-    OwnedHandle completion_handle;
     double after = 0;
   };
 
@@ -1470,7 +1527,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     WMT::Reference<WMT::MTL4CommandBuffer> cmdbuf{};
     std::shared_ptr<Atomic64Phase> atomic64_phase;
     WMT::Reference<WMT::MTL4Submission> submission{};
-    HANDLE semaphore{};
     std::shared_ptr<D3DalloyPresentLatency> latency;
     // Allocator GPU argument storage uses newBufferWithBytesNoCopy. Retaining
     // its MTLBuffer alone does not retain the allocator's malloc backing.
@@ -1842,10 +1898,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         else
           inflight.present_completion->notifyPresentCompleted();
       }
-      if (inflight.semaphore) {
-        inflight.latency->complete(inflight.semaphore);
-        CloseHandle(inflight.semaphore);
-      }
+      if (inflight.latency)
+        inflight.latency->complete();
 
       /*
        * The GPU has finished this submission, so every version mirror it wrote now holds the
@@ -2351,9 +2405,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (task.composition.surface)
         task.presenter->abortNativeRetirements();
     }
-    if (task.completion_handle && task.credit &&
+    if (task.latency && task.credit &&
         task.credit->exchange(false, std::memory_order_acq_rel))
-      task.latency->complete(task.completion_handle.get());
+      task.latency->complete();
   }
 
 public:
@@ -2707,7 +2761,7 @@ public:
     blit.endEncoding();
     for (const auto &draw : draws) {
       inflight.so_draws.push_back(draw);
-      if (!draw->indexed || !draw->vertex_count)
+      if (!draw->positions || !draw->vertex_count)
         continue;
       auto encoder = cmdbuf.computeCommandEncoder(false);
       encoder.waitForFence(fence_);
@@ -4732,7 +4786,8 @@ public:
           ",\"viewports\":", task_params->ViewportCount, ",\"layers\":", layer_count);
       uint64_t completed_tasks = 0, quantum = 0;
       uint32_t budget = kMSAATileFirstQuantum;
-      for (;;) {
+      uint64_t producer = ready_producer;
+      while (batch.Status != kMSAATileDone) {
         const uint32_t scheduled = batch.ReadyTasks;
         for (task_slot = 0; task_slot < scheduled; ++task_slot) {
           const auto &descriptor = batch.Descriptors[task_slot];
@@ -4748,7 +4803,6 @@ public:
         task_kernel(draw.task_prepare_pipeline, {1, 1, 1}, {1, 1, 1},
             {{task_state, 0}, {task_parameters, 0}, {execution.bounds, 0},
              {execution.draws, 0}, {task_completion, 0}}, UINT64_MAX, kMSAATilePublish);
-        uint64_t producer = 0;
         if (!retire(cmdbuf, inflight, producer)) return false;
         const auto completed = *mailbox;
         owned_graphics::Trace("msaa_tile_quantum", ",\"queue\":", owned_id_, ",\"encoder\":", render.id,
@@ -4763,31 +4817,28 @@ public:
             (completed.Status == kMSAATileDone && completed.ReadyTasks) ||
             (completed.Status == kMSAATileRunning &&
              (!completed.ReadyTasks || completed.CompletedTasks == completed_tasks))) return false;
-        if (completed.Status == kMSAATileDone) {
-          // Every command using these submission scratch lists has retired.
-          // Future MSAA executions own their captures separately and enroll
-          // them on entry; SO/frontier/atomic/swizzle owners are separate.
-          // Do not carry completed full-size coverage and scratch through all
-          // subsequent draws in this Execute. The newly opened native segment
-          // can still hold its already-registered allocations until retirement.
-          const auto buffers = inflight->msaa_buffers.size();
-          const auto textures = inflight->msaa_textures.size();
-          const auto markers = inflight->rov_markers.size();
-          inflight->msaa_buffers.clear();
-          inflight->msaa_textures.clear();
-          inflight->rov_markers.clear();
-          owned_graphics::Trace("msaa_tile_release", ",\"queue\":", owned_id_, ",\"encoder\":", render.id,
-              ",\"producer\":", producer, ",\"released_buffers\":", buffers,
-              ",\"released_textures\":", textures, ",\"released_markers\":", markers,
-              ",\"retained_buffers\":", inflight->msaa_buffers.size(),
-              ",\"retained_textures\":", inflight->msaa_textures.size(),
-              ",\"retained_markers\":", inflight->rov_markers.size());
-          break;
-        }
         quantum = completed.Quantum; completed_tasks = completed.CompletedTasks;
         budget = completed.ReadyTasks;
         batch = completed;
       }
+      // Every command using these submission scratch lists has retired.
+      // Future MSAA executions own their captures separately and enroll
+      // them on entry; SO/frontier/atomic/swizzle owners are separate.
+      // Do not carry completed full-size coverage and scratch through all
+      // subsequent draws in this Execute. The newly opened native segment
+      // can still hold its already-registered allocations until retirement.
+      const auto buffers = inflight->msaa_buffers.size();
+      const auto textures = inflight->msaa_textures.size();
+      const auto markers = inflight->rov_markers.size();
+      inflight->msaa_buffers.clear();
+      inflight->msaa_textures.clear();
+      inflight->rov_markers.clear();
+      owned_graphics::Trace("msaa_tile_release", ",\"queue\":", owned_id_, ",\"encoder\":", render.id,
+          ",\"producer\":", producer, ",\"released_buffers\":", buffers,
+          ",\"released_textures\":", textures, ",\"released_markers\":", markers,
+          ",\"retained_buffers\":", inflight->msaa_buffers.size(),
+          ",\"retained_textures\":", inflight->msaa_textures.size(),
+          ",\"retained_markers\":", inflight->rov_markers.size());
     } else {
       for (uint32_t primitive = 0; primitive < execution.max_primitives; ++primitive) {
         const auto bounds = execution.mapped_bounds[primitive];
@@ -5173,6 +5224,8 @@ public:
     bool writes;
     SwizzleSubresourceSelection imports, exports;
     WMT::Reference<WMT::Buffer> baseline;
+    WMT::Reference<WMT::Buffer> compared_shadow;
+    uint64_t baseline_tiles = 0, dirty_offset = 0;
     TextureViewRef cast_view;
     Rc<TextureAllocation> cast_allocation;
     Texture *msaa_texture = nullptr;
@@ -5205,6 +5258,12 @@ public:
     case EncoderType::StandardSwizzle:
       complete = true;
       break;
+    case EncoderType::Resolve:
+      if (node->resolve_folded_into_previous) {
+        complete = true; // The preceding render pass already accounted for this store.
+        break;
+      }
+      [[fallthrough]];
     case EncoderType::Blit: {
       if (inflight.swizzle_representations.empty() && !(inflight.swizzle_predecessor && swizzle_carry_count_)) break;
       if (!node->access_complete || node->sparse_resource_used || node->helper_passes || node->accesses.empty()) break;
@@ -5512,7 +5571,8 @@ public:
                              WMT::Buffer dirty_flags = {}, uint64_t dirty_offset = 0, bool compare = false,
                              WMT::Buffer baseline = {}, WMT::Texture volume_source = {},
                              bool volume_compressed = false,
-                             const SwizzleSubresourceSelection *selection = nullptr) {
+                             const SwizzleSubresourceSelection *selection = nullptr,
+                             SwizzlePassResource *compared = nullptr, uint64_t *remaining_scratch = nullptr) {
     if (!resource || !resource->swizzle_layout || !resource->texture || !resource->buffer ||
         !resource->texture->current() || !resource->buffer->current())
       return false;
@@ -5634,7 +5694,21 @@ public:
         max_buffer_length / tile_scratch_size, window_tiles})) : 1;
     const uint64_t scratch_size = tile_scratch_size * batch_capacity;
     WMT::Reference<WMT::Buffer> scratch;
-    if (inflight.swizzle_batch_scratch_length >= scratch_size && !inflight.swizzle_batch_buffers.empty()) {
+    // Keep a small compared shadow until every alias has been examined, then publish from the same bytes.
+    if (compare && compared && remaining_scratch && compared->baseline_tiles <= *remaining_scratch / tile_scratch_size) {
+      WMTBufferInfo info{};
+      info.length = compared->baseline_tiles * tile_scratch_size;
+      info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
+      compared->compared_shadow = metal.newBuffer(info);
+      if (compared->compared_shadow) {
+        *remaining_scratch -= info.length;
+        inflight.swizzle_baselines.push_back(compared->compared_shadow);
+      }
+    }
+    const bool saved_shadow = compared && compared->compared_shadow;
+    if (saved_shadow) {
+      scratch = compared->compared_shadow;
+    } else if (inflight.swizzle_batch_scratch_length >= scratch_size && !inflight.swizzle_batch_buffers.empty()) {
       scratch = inflight.swizzle_batch_buffers.back();
     } else {
       WMTBufferInfo info{};
@@ -5649,6 +5723,7 @@ public:
     }
     struct SwizzleTile {
       D3D12StandardSwizzleParams params;
+      WMTSize grid;
       WMTOrigin origin;
       WMTSize size;
       uint32_t native_level, native_slice, native_pitch, native_image_pitch;
@@ -5659,7 +5734,7 @@ public:
     uint32_t encoded_subresources = 0;
     auto flush_batch = [&]() {
       if (!tile_count) return;
-      if (to_canonical) {
+      if (to_canonical && (!saved_shadow || compare)) {
         auto blit = cmdbuf.blitCommandEncoder();
         blit.waitForFence(fence_);
         for (uint32_t i = 0; i < tile_count; ++i) {
@@ -5672,7 +5747,7 @@ public:
           copy.origin = tile.origin;
           copy.size = tile.size;
           copy.dst = scratch;
-          copy.offset = uint64_t(i) * tile_scratch_size;
+          copy.offset = ((saved_shadow ? encoded_tiles : 0) + i) * tile_scratch_size;
           copy.bytes_per_row = tile.native_pitch;
           copy.bytes_per_image = tile.native_image_pitch;
           copy.options = WMTBlitOptionNone;
@@ -5689,8 +5764,10 @@ public:
       auto compute = cmdbuf.computeCommandEncoder(concurrent);
       compute.waitForFence(fence_);
       for (uint32_t i = 0; i < tile_count; ++i) {
-        auto p = tiles[i].params;
-        const uint64_t scratch_offset = uint64_t(i) * tile_scratch_size;
+        auto &p = tiles[i].params;
+        const uint64_t scratch_offset = ((saved_shadow ? encoded_tiles : 0) + i) * tile_scratch_size;
+        if (compare && compared)
+          p.tile_offset = (encoded_tiles + i) * standard_swizzle::tile_bytes;
         wmtcmd_compute_setpso set_pso{};
         wmtcmd_compute_setbuffer set_source{}, set_destination{};
         wmtcmd_compute_setbuffer set_dirty{};
@@ -5719,13 +5796,13 @@ public:
           set_params.next.set(&set_dirty);
           set_dirty.type = WMTComputeCommandSetBuffer;
           set_dirty.buffer = dirty_flags;
-          set_dirty.offset = dirty_offset;
+          set_dirty.offset = dirty_offset + (encoded_tiles + i) * sizeof(uint32_t);
           set_dirty.index = 3;
           set_dirty.next.set(&dispatch);
         } else
           set_params.next.set(&dispatch);
         dispatch.type = WMTComputeCommandDispatchThreads;
-        dispatch.size = {p.extent_x, p.extent_y, p.extent_z};
+        dispatch.size = tiles[i].grid;
         compute.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&set_pso));
       }
       compute.updateFence(fence_);
@@ -5756,6 +5833,14 @@ public:
       ++encoded_batches;
       tile_count = 0;
     };
+    D3D12StandardSwizzleParams p{};
+    p.x_moves = swizzle_bit_moves(shape.x_mask);
+    p.y_moves = swizzle_bit_moves(shape.y_mask);
+    p.z_moves = swizzle_bit_moves(shape.z_mask);
+    p.bytes_per_unit = layout.bytes_per_unit;
+    p.row_pitch = row_pitch;
+    p.slice_pitch = slice_pitch;
+    p.packed422_variant = desc.Format == DXGI_FORMAT_G8R8_G8B8_UNORM;
     for (uint32_t array = 0; array < layout.array_count; ++array) {
       for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
         if (selection && !selection->Contains(mip, array)) continue;
@@ -5765,40 +5850,24 @@ public:
         const auto &m = layout.mips[mip];
         const uint64_t mip_width = std::max<uint64_t>(1, desc.Width >> mip);
         const uint64_t mip_height = std::max<uint64_t>(1, UINT64(desc.Height) >> mip);
-        D3D12StandardSwizzleParams p{};
-        p.first_tile = array * layout.tiles_per_slice + m.first_tile_in_slice;
-        p.tiles_x = m.tiles_x;
-        p.tiles_y = m.tiles_y;
-        p.units_x = m.units_x;
-        p.units_y = m.units_y;
-        p.units_z = m.units_z;
-        p.tile_width = shape.tile_width;
-        p.tile_height = shape.tile_height;
-        p.tile_depth = shape.tile_depth;
-        p.x_mask = shape.x_mask;
-        p.y_mask = shape.y_mask;
-        p.z_mask = shape.z_mask;
-        p.bytes_per_unit = layout.bytes_per_unit;
-        p.row_pitch = row_pitch;
-        p.slice_pitch = slice_pitch;
-        p.physical_width = mip_width;
-        p.packed422_variant = desc.Format == DXGI_FORMAT_G8R8_G8B8_UNORM;
+        const uint64_t first_tile = array * layout.tiles_per_slice + m.first_tile_in_slice;
         for (uint64_t tz = 0; tz < m.tiles_z; ++tz) {
           for (uint64_t ty = 0; ty < m.tiles_y; ++ty) {
             for (uint64_t tx = 0; tx < m.tiles_x; ++tx) {
-              p.origin_x = tx * shape.tile_width;
-              p.origin_y = ty * shape.tile_height;
-              p.origin_z = tz * shape.tile_depth;
-              p.extent_x = std::min<uint64_t>(shape.tile_width, m.units_x - p.origin_x);
-              p.extent_y = std::min<uint64_t>(shape.tile_height, m.units_y - p.origin_y);
-              p.extent_z = std::min<uint64_t>(shape.tile_depth, m.units_z - p.origin_z);
-              const uint64_t pixel_x = uint64_t(p.origin_x) * layout.block_width;
-              const uint64_t pixel_y = uint64_t(p.origin_y) * layout.block_height;
-              WMTOrigin origin{pixel_x, pixel_y, p.origin_z};
+              const uint64_t tile = first_tile + (tz * m.tiles_y + ty) * m.tiles_x + tx;
+              p.tile_offset = tile * standard_swizzle::tile_bytes;
+              const uint64_t x = tx * shape.tile_width, y = ty * shape.tile_height, z = tz * shape.tile_depth;
+              const WMTSize grid{std::min<uint64_t>(shape.tile_width, m.units_x - x),
+                                 std::min<uint64_t>(shape.tile_height, m.units_y - y),
+                                 std::min<uint64_t>(shape.tile_depth, m.units_z - z)};
+              const uint64_t pixel_x = x * layout.block_width;
+              const uint64_t pixel_y = y * layout.block_height;
+              WMTOrigin origin{pixel_x, pixel_y, z};
               WMTSize size{
-                  std::min<uint64_t>(uint64_t(p.extent_x) * layout.block_width, mip_width - pixel_x),
-                  std::min<uint64_t>(uint64_t(p.extent_y) * layout.block_height, mip_height - pixel_y),
-                  p.extent_z};
+                  std::min<uint64_t>(grid.width * layout.block_width, mip_width - pixel_x),
+                  std::min<uint64_t>(grid.height * layout.block_height, mip_height - pixel_y),
+                  grid.depth};
+              p.tile_pixel_width = size.width;
               uint32_t native_level=mip,native_slice=array,native_pitch=row_pitch;
               uint32_t native_image_pitch=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D ? slice_pitch : 0;
               if (volume_layout) {
@@ -5806,7 +5875,6 @@ public:
                 // linear block bytes use the existing Morton GPU staging kernel.
                 // Export the actual written UInt alias: a Metal fence alone does
                 // not publish sparse heap writes through the BC texture alias.
-                const uint32_t tile=p.first_tile+(tz*m.tiles_y+ty)*m.tiles_x+tx;
                 const uint32_t per_slice=volume_layout->atlas_columns*volume_layout->atlas_rows;
                 const uint32_t local=tile%per_slice;
                 const uint32_t scale=volume_source && !volume_compressed ? layout.block_width : 1;
@@ -5817,7 +5885,7 @@ public:
                 native_pitch=volume_layout->page_w/layout.block_width*layout.bytes_per_unit;
                 native_image_pitch=0;
               }
-              tiles[tile_count++] = {p, origin, size, native_level, native_slice, native_pitch, native_image_pitch};
+              tiles[tile_count++] = {p, grid, origin, size, native_level, native_slice, native_pitch, native_image_pitch};
               if (tile_count == batch_capacity) flush_batch();
             }
           }
@@ -5836,8 +5904,9 @@ public:
         ",\"total_tiles\":", layout.total_tiles,
         ",\"tile_bytes\":", tile_scratch_size, ",\"window_bytes\":", scratch_size,
         ",\"scratch_bytes\":", inflight.swizzle_batch_scratch_length, ",\"concurrent\":", concurrent,
-        ",\"encoder_count\":", encoded_batches * 2, ",\"wait_count\":", encoded_batches * 2,
-        ",\"update_count\":", encoded_batches * 2);
+        ",\"retained_shadow\":", int(saved_shadow), ",\"encoder_count\":", encoded_batches * (saved_shadow && !compare ? 1 : 2),
+        ",\"wait_count\":", encoded_batches * (saved_shadow && !compare ? 1 : 2),
+        ",\"update_count\":", encoded_batches * (saved_shadow && !compare ? 1 : 2));
     if (representation) {
       representation->synchronized_version = representation->content_version;
       for (uint32_t i = 0; i < requested.size(); ++i) representation->valid[i] |= requested[i];
@@ -6418,12 +6487,23 @@ public:
       if (address && cast_blocks) { address->x /= 4; address->y /= 4; }
       return address;
     };
+    struct VolumeBlits {
+      WMT::MTL4ComputeCommandEncoder encoder{};
+      WMT::Fence fence;
+      void finish() {
+        if (!encoder) return;
+        encoder.updateFence(fence);
+        encoder.endEncoding();
+        encoder = {};
+      }
+      ~VolumeBlits() { finish(); }
+    } blits{{}, fence_};
     auto encode_blit = [&](const auto &command) {
-      auto blit = cmdbuf.blitCommandEncoder();
-      blit.waitForFence(fence_);
-      blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&command));
-      blit.updateFence(fence_);
-      blit.endEncoding();
+      if (!blits.encoder) {
+        blits.encoder = cmdbuf.blitCommandEncoder();
+        blits.encoder.waitForFence(fence_);
+      }
+      blits.encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&command));
     };
     auto read_tile = [&](uint32_t tile, WMT::Buffer buffer) {
       wmtcmd_blit_copy_from_texture_to_buffer copy{};
@@ -6637,6 +6717,7 @@ public:
       params.type = WMTComputeCommandSetBytes; params.bytes.set(merge_layout); params.length = sizeof(merge_layout);
       params.index = 3; params.next.set(&dispatch);
       dispatch.type = WMTComputeCommandDispatchThreads; dispatch.size = {layout.page_w, layout.page_h, 1};
+      blits.finish();
       auto compute = cmdbuf.computeCommandEncoder(false);
       compute.waitForFence(fence_);
       compute.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pso));
@@ -6689,8 +6770,22 @@ public:
         // the canonical bytes before either shader executes: comparing against
         // the post-shader canonical buffer would mistake buffer writes for
         // texture writes and publish the stale texture shadow over them.
+        const auto &layout = *use.resource->swizzle_layout;
+        auto ranges = [&](auto visit) {
+          if (use.exports.whole) {
+            visit(0, layout.total_tiles);
+            return;
+          }
+          for (uint32_t array = 0; array < layout.array_count; ++array)
+            for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
+              if (!use.exports.Contains(mip, array)) continue;
+              const auto &m = layout.mips[mip];
+              visit(array * layout.tiles_per_slice + m.first_tile_in_slice, uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z);
+            }
+        };
+        ranges([&](uint64_t, uint64_t tiles) { use.baseline_tiles += tiles; });
         WMTBufferInfo info{};
-        info.length = use.resource->swizzle_layout->size_bytes;
+        info.length = use.baseline_tiles * standard_swizzle::tile_bytes;
         info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
         info.memory.set(nullptr);
         use.baseline = device_->GetMTLDevice().newBuffer(info);
@@ -6705,27 +6800,15 @@ public:
         blit.waitForFence(fence_);
         uint64_t copied_bytes = 0;
         uint32_t copy_count = 0;
-        auto copy_interval = [&](uint64_t offset, uint64_t bytes) {
-          copy.src_offset = copy.dst_offset = offset;
+        ranges([&](uint64_t tile, uint64_t tiles) {
+          const uint64_t bytes = tiles * standard_swizzle::tile_bytes;
+          copy.src_offset = tile * standard_swizzle::tile_bytes;
+          copy.dst_offset = copied_bytes;
           copy.copy_length = bytes;
           blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
           copied_bytes += bytes;
           ++copy_count;
-        };
-        const auto &layout = *use.resource->swizzle_layout;
-        if (use.exports.whole)
-          copy_interval(0, info.length);
-        else {
-          // Preserve global canonical offsets. Only these subresources will be
-          // compared, so unselected baseline bytes need neither copying nor use.
-          for (uint32_t array = 0; array < layout.array_count; ++array)
-            for (uint32_t mip = 0; mip < layout.mip_count; ++mip) {
-              if (!use.exports.Contains(mip, array)) continue;
-              const auto &m = layout.mips[mip];
-              copy_interval((array * layout.tiles_per_slice + m.first_tile_in_slice) * 65536,
-                            uint64_t(m.tiles_x) * m.tiles_y * m.tiles_z * 65536);
-            }
-        }
+        });
         blit.updateFence(fence_);
         blit.endEncoding();
         owned_graphics::Trace("standard_swizzle_baseline", ",\"queue\":", owned_id_,
@@ -6769,14 +6852,18 @@ public:
     // or a buffer actively written in this pass. Compare each placed shadow
     // against its pre-pass canonical baseline, before publishing any shadow.
     std::vector<uint32_t> compared_indices;
+    uint64_t flag_bytes = 0;
     for (uint32_t i = 0; i < uses.size(); ++i) {
-      if (uses[i].resource && uses[i].writes && uses[i].baseline)
+      if (uses[i].resource && uses[i].writes && uses[i].baseline) {
+        uses[i].dirty_offset = flag_bytes;
+        flag_bytes += uses[i].baseline_tiles * sizeof(uint32_t);
         compared_indices.push_back(i);
+      }
     }
     WMT::Reference<WMT::Buffer> dirty_flags;
     if (!compared_indices.empty()) {
       WMTBufferInfo info{};
-      info.length = uint64_t(uses.size()) * sizeof(uint32_t);
+      info.length = flag_bytes;
       info.options = WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate;
       info.memory.set(nullptr);
       dirty_flags = device_->GetMTLDevice().newBuffer(info);
@@ -6793,10 +6880,11 @@ public:
       blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
       blit.updateFence(fence_);
       blit.endEncoding();
+      uint64_t remaining_scratch = 512 * 1024;
       for (auto index : compared_indices)
         if (!EncodeStandardSwizzle(cmdbuf, inflight, uses[index].resource.ptr(), true,
-                                   dirty_flags, uint64_t(index) * sizeof(uint32_t), true,
-                                   uses[index].baseline, uses[index].volume_source, false, &uses[index].exports))
+                                   dirty_flags, uses[index].dirty_offset, true, uses[index].baseline,
+                                   uses[index].volume_source, false, &uses[index].exports, &uses[index], &remaining_scratch))
           return false;
     }
     for (uint32_t i = 0; i < uses.size(); ++i) {
@@ -6805,7 +6893,7 @@ public:
         continue;
       if (!EncodeStandardSwizzle(cmdbuf, inflight, use.resource.ptr(), true,
                                  use.baseline ? WMT::Buffer(dirty_flags) : WMT::Buffer{},
-                                 uint64_t(i) * sizeof(uint32_t), false, {}, use.volume_source, false, &use.exports))
+                                 use.dirty_offset, false, {}, use.volume_source, false, &use.exports, &uses[i]))
         return false;
     }
     return true;
@@ -6922,12 +7010,11 @@ public:
           // Addresses are chosen by the GPU. Pin the live registry once for this
           // Execute task, and publish each native allocation to every segment.
           // Do not keep this conservative snapshot in the replayable recording.
-          auto pins = device_->SnapshotBufferAllocations();
-          for (const auto &allocation : pins) remember(allocation->buffer());
+          auto &pins = resolved_resources->indirect_buffer_owners;
+          pins = device_->SnapshotBufferAllocations();
+          for (const auto &allocation : *pins) remember(allocation->buffer());
           owned_graphics::Trace("indirect_gpu_buffer_pins", ",\"queue\":", owned_id_,
-                                ",\"allocations\":", pins.size());
-          resolved_resources->buffer_owners.insert(resolved_resources->buffer_owners.end(),
-              std::make_move_iterator(pins.begin()), std::make_move_iterator(pins.end()));
+                                ",\"allocations\":", pins->size());
         }
         task_metadata_ready = true;
       }
@@ -7617,8 +7704,10 @@ public:
             node.placed_attachments |= (render.depth.attachment && bool(render.depth.attachment->allocation->canonicalHeap)) ||
                 (render.stencil.attachment && bool(render.stencil.attachment->allocation->canonicalHeap));
             const uint32_t samples = render.native_msaa_sample_count ? render.native_msaa_sample_count : 1;
-            node.rejection = fenced ? "fence_segment" : OrdinaryRenderRejection(render, device_, true);
             const char *merge_rejection = fenced ? nullptr : OrdinaryRenderRejection(render, device_);
+            // Every mergeable pass already passed all access checks.
+            node.rejection = fenced ? "fence_segment" :
+                merge_rejection ? OrdinaryRenderRejection(render, device_, true) : nullptr;
             node.access_complete = !node.rejection;
             if (node.access_complete) append_buffers(render.submission_buffers, render_stages);
             if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, shape);
@@ -7667,8 +7756,19 @@ public:
             else if (compute.submission_snapshot_budget) node.rejection = "recorded_buffer_budget";
             node.access_complete = !node.rejection && !fenced && compute.submission_access_complete && !compute.atomic64_phase &&
                 compute.atomic64_indirect.empty() && !compute.atomic64_ray && compute.cast_textures.empty();
-            if (node.access_complete) append_buffers(compute.submission_buffers, WMTMetal4StageDispatch);
-            if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, shape);
+            std::vector<SubmissionAccess> dispatch_buffers;
+            const SubmissionDescriptorCache *dispatch_tables = nullptr;
+            if (node.access_complete && shape.dispatch_access_complete) {
+              dispatch_buffers.resize(compute.submission_buffers.size());
+              for (size_t i = 0; i < dispatch_buffers.size(); ++i) {
+                const auto &use = compute.submission_buffers[i];
+                if (!AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes,
+                    use.stages ? use.stages : WMTMetal4StageDispatch, &dispatch_buffers[i])) {
+                  node.access_complete = false; break;
+                }
+              }
+            } else if (node.access_complete) append_buffers(compute.submission_buffers, WMTMetal4StageDispatch);
+            if (node.access_complete) node.access_complete = ResolveSubmissionTables(plan, node, device_, shape, &dispatch_tables);
             if (node.access_complete) {
               // Helper collection scans bound ranges, including shader-unused
               // descriptors. Import/export touches every slice, not just the UAV view.
@@ -7698,7 +7798,7 @@ public:
             node.access_complete &= shape.compute_commands_complete;
             if (node.sparse_resource_used) node.rejection = "sparse_alias";
             if (node.access_complete && !node.helper_passes)
-              node.concurrent_dispatches = IndependentComputeDispatches(plan, node, device_, compute, shape);
+              node.concurrent_dispatches = IndependentComputeDispatches(plan, node, device_, shape, dispatch_buffers, dispatch_tables);
           } else if (record->type == EncoderType::Blit) {
             const auto &blit = *static_cast<const BlitEncoderData *>(record);
             node.access_complete = !fenced && blit.submission_access_complete &&
@@ -7715,6 +7815,24 @@ public:
                   use.key, aspects ? uint8_t(aspects) : uint8_t(4), use.writes, false, WMTMetal4StageBlit);
             }
             if (node.sparse_resource_used) node.rejection = "sparse_alias";
+          } else if (record->type == EncoderType::Resolve) {
+            const auto &resolve = *static_cast<const ResolveEncoderData *>(record);
+            auto append = [&](const TextureViewRef &ref, bool writes) {
+              const auto *view = ref.ptr();
+              auto *allocation = view->allocation;
+              auto *texture = allocation->descriptor;
+              if (allocation->mappedMemory || !texture->directViewOfAllocation(view->key) ||
+                  view->castBlockSize || view->msaaSampleAddress || view->reservedCast ||
+                  view->reservedVolumeRender || view->reservedVolumeAtlasCast)
+                return false;
+              const auto planes = DepthStencilPlanarFlags(texture->pixelFormat());
+              return AppendSubmissionTexture(node, device_, texture, allocation, view->key,
+                  planes ? uint8_t(planes) : uint8_t(4), writes, writes, WMTMetal4StageFragment, texture->sampleCount());
+            };
+            // A native store-and-resolve writes back the source samples too. A
+            // shader resolve only reads them. Predication adds a separate GPU read.
+            node.access_complete = !fenced && !resolve.parameters.predicate_enabled &&
+                append(resolve.src, !resolve.pipeline) && append(resolve.dst, true);
           } else if (record->type == EncoderType::CaptureFrontier) {
             node.rejection = "capture_frontier";
             node.access_complete = false;
@@ -7934,11 +8052,14 @@ public:
           // The folded record encodes nothing; its accesses moved into the pass.
           consumer.access_complete = true;
           consumer.resolve_folded_into_previous = true;
+          consumer.accesses.clear();
+          consumer.access_slots.clear();
           consumer.scopes_before.clear();
           owned_graphics::Trace("resolve_folded_standalone", ",\"submission\":", scope->seq, ",\"encoder\":", render.id,
                                 ",\"resolve\":", resolve.id, ",\"slot\":", slot);
         }
       }
+      std::vector<size_t> overwrite_clears;
       std::list<std::pair<size_t, uint8_t>> pending_clears;
       using PendingIterator = decltype(pending_clears)::iterator;
       struct PendingKey {
@@ -8027,6 +8148,7 @@ public:
         if (node.boundary_before || !node.access_complete) flush_clears(node.clears_before);
         else if (!node.scopes_before.empty()) flush_clears(node.clears_before,&node.scopes_before);
         if (node.record->type == EncoderType::Clear && node.access_complete) {
+          if (index) overwrite_clears.push_back(index);
           const auto &clear = *static_cast<const ClearEncoderData *>(node.record);
           // Zero is the recording/descriptor sentinel for a nonlayered view.
           const bool batchable = !clear.sample_positions.count && clear.array_length <= 1 && clear.attachment &&
@@ -8264,6 +8386,8 @@ public:
         }
         if (!node.access_complete || node.boundary_after) { history.Clear(); partition = index + 1; }
       }
+      for (size_t i : overwrite_clears)
+        DiscardOverwrittenStores(plan, i, *static_cast<const ClearEncoderData *>(plan.nodes[i].record));
       owned_graphics::Trace("submission_plan_work", ",\"submission\":", scope->seq,
           ",\"history_checks\":", plan.history_checks, ",\"candidate_checks\":", plan.candidate_checks,
           ",\"metadata_copies\":", plan.metadata_copies, ",\"scope_checks\":", plan.scope_checks,
@@ -8513,11 +8637,10 @@ public:
           native_fence_required = !node.access_complete || inflight_stages == WMTMetal4StageAll || ordering_boundary ||
               node.helper_passes ||
               node.force_fence_before || (replay_group && replay_group->force_fence_before);
-          // Only render, blit, compute and in-place clear replay honor a
-          // skipped wait; every other emitted encoder waits on the fence
-          // itself and needs the drain.
+          // Encoders that always wait on the fence still require the drain.
           if (!node.skip_clear && node.record->type != EncoderType::Render && node.record->type != EncoderType::Clear &&
-              node.record->type != EncoderType::Blit && node.record->type != EncoderType::Compute)
+              node.record->type != EncoderType::Blit && node.record->type != EncoderType::Compute &&
+              node.record->type != EncoderType::Resolve)
             native_fence_required = true;
           // A conflict only with tracked in-flight work of known producer
           // stages waits for those stages through a consumer queue barrier
@@ -9088,6 +9211,7 @@ public:
         bool as_rebuild_update = false;
         bool as_fast_refit = false;
         bool as_preserve_index_shadow = false;
+        bool as_plain_deserialize = false;
         if (current->type == EncoderType::Raytracing) {
           auto *as = static_cast<RTASEncoderData *>(current);
           const char *refit_reason = "not_refit";
@@ -9153,30 +9277,60 @@ public:
             WMT::Reference<WMT::Buffer> readback;
             const uint8_t *mapped = nullptr;
             uint64_t readbackCapacity = 0;
-            auto read_source = [&](uint64_t offset, uint64_t length) {
+            constexpr uint64_t packet_header = raytracing::kSerializedHeaderSize + D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE;
+            constexpr uint64_t packet_geom = packet_header + raytracing::kHeaderSize;
+            constexpr uint64_t geom_capacity = 8 * sizeof(raytracing::ShadowGeometry);
+            const bool gather = as->operation == RTASOperation::Deserialize && !(readLocation.offset & 7);
+            auto read_source = [&](uint64_t offset, uint64_t length, bool packet = false) {
               if (offset > readLocation.available || length > readLocation.available - offset) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return false;
               }
-              if (length > readbackCapacity) {
+              const uint64_t capacity = packet ? packet_geom + geom_capacity : length;
+              if (capacity > readbackCapacity) {
                 WMTBufferInfo info{};
-                info.length = std::max<uint64_t>(length, raytracing::kHeaderSize);
+                info.length = std::max<uint64_t>(capacity, raytracing::kHeaderSize);
                 info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
                 readback = device_->GetMTLDevice().newBuffer(info);
                 mapped = static_cast<const uint8_t *>(info.memory.get_accessible_or_null());
                 readbackCapacity = info.length;
                 if (!readback || !mapped) { device_->ReportRemoval(E_OUTOFMEMORY); return false; }
               }
-              auto blit = scope->inflight.cmdbuf.blitCommandEncoder();
-              blit.waitForFence(fence_);
-              wmtcmd_blit_copy_from_buffer_to_buffer copy{};
-              copy.type = WMTBlitCommandCopyFromBufferToBuffer;
-              copy.src = readLocation.buffer;
-              copy.src_offset = readLocation.offset + offset;
-              copy.dst = readback;
-              copy.copy_length = length;
-              blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
-              blit.updateFence(fence_);
-              blit.endEncoding();
+              if (packet) {
+                if (!as_metadata_pipeline_) {
+                  WMT::Error error;
+                  as_metadata_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(
+                      WMT4::Library(device_->GetLib().getLibrary()).newFunction("d3dalloy_as_gather_metadata"), error);
+                  if (!as_metadata_pipeline_) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return false; }
+                }
+                uint64_t limits[] = {readLocation.available, geom_capacity};
+                wmtcmd_compute_setpso pso{};
+                wmtcmd_compute_setbuffer source{}, destination{};
+                wmtcmd_compute_setbytes params{};
+                wmtcmd_compute_dispatch dispatch{};
+                pso.type = WMTComputeCommandSetPSO; pso.pso = as_metadata_pipeline_;
+                pso.threadgroup_size = {32, 1, 1}; pso.next.set(&source);
+                source.type = destination.type = WMTComputeCommandSetBuffer;
+                source.buffer = readLocation.buffer; source.offset = readLocation.offset; source.index = 0;
+                source.next.set(&destination); destination.buffer = readback; destination.index = 1;
+                destination.next.set(&params); params.type = WMTComputeCommandSetBytes;
+                params.bytes.set(&limits[0]); params.length = sizeof(limits); params.index = 2; params.next.set(&dispatch);
+                dispatch.type = WMTComputeCommandDispatchThreads; dispatch.size = {32, 1, 1};
+                auto compute = scope->inflight.cmdbuf.computeCommandEncoder(false);
+                compute.waitForFence(fence_); compute.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pso));
+                compute.updateFence(fence_); compute.endEncoding();
+              } else {
+                auto blit = scope->inflight.cmdbuf.blitCommandEncoder();
+                blit.waitForFence(fence_);
+                wmtcmd_blit_copy_from_buffer_to_buffer copy{};
+                copy.type = WMTBlitCommandCopyFromBufferToBuffer;
+                copy.src = readLocation.buffer;
+                copy.src_offset = readLocation.offset + offset;
+                copy.dst = readback;
+                copy.copy_length = length;
+                blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
+                blit.updateFence(fence_);
+                blit.endEncoding();
+              }
               const auto producer = scope->seq;
               scope.reset();
               owned_graphics::Trace("rtas_metadata_readback", ",\"queue\":", owned_id_,
@@ -9187,7 +9341,7 @@ public:
               if (device_->RemovedReason() != S_OK) return false;
               return start_segment();
             };
-            if (bytes && !read_source(0, bytes)) return;
+            if (bytes && !read_source(0, bytes, gather)) return;
             if (ommBuild) {
               if (!raytracing::PlanOmmShadow(as->deferredInputs, mapped, bytes, as->shadowPlan)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
@@ -9199,24 +9353,33 @@ public:
               if (d3dalloy_rtas_serialized_prefix(&serialized, sizeof(serialized), as->sourceLocation.available, &layout)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
+              const auto *packet = mapped;
               if (layout.blocks) {
-                if (!read_source(D3DALLOY_RTAS_SERIALIZED_HEADER_SIZE, D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE) ||
-                    d3dalloy_rtas_serialized_block(&layout, mapped, D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE, &layout)) {
+                if ((!gather && !read_source(D3DALLOY_RTAS_SERIALIZED_HEADER_SIZE, D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE)) ||
+                    d3dalloy_rtas_serialized_block(&layout, gather ? packet + raytracing::kSerializedHeaderSize : mapped,
+                                                  D3DALLOY_RTAS_SERIALIZED_BLOCK_SIZE, &layout)) {
                   device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
                 }
               }
-              if (!read_source(layout.header_offset, raytracing::kHeaderSize)) return;
-              memcpy(&as_source_header, mapped, sizeof(as_source_header));
+              if (!gather && !read_source(layout.header_offset, raytracing::kHeaderSize)) return;
+              memcpy(&as_source_header, gather ? packet + packet_header : mapped, sizeof(as_source_header));
               uint64_t geometryBytes;
               if (d3dalloy_rtas_serialized_geometry_bytes(&layout, &as_source_header, sizeof(as_source_header), &geometryBytes)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
-              if (geometryBytes && !read_source(layout.header_offset + raytracing::kHeaderSize, geometryBytes)) return;
+              if (gather && geometryBytes <= geom_capacity) mapped = packet + packet_geom;
+              else if (geometryBytes && !read_source(layout.header_offset + raytracing::kHeaderSize, geometryBytes)) return;
               if (FAILED(raytracing::ParseSerialized(serialized, layout, as_source_header, mapped, geometryBytes,
                       device_->GetMTLDevice().registryID(), as->destinationLocation, as_deserialized))) {
                 ERR("Invalid serialized acceleration structure");
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
+              // Without relocation entries or a resized header, deserialization copies a single span.
+              as_plain_deserialize = layout.header_offset == D3DALLOY_RTAS_SERIALIZED_HEADER_SIZE &&
+                  as_source_header.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL &&
+                  as_source_header.currentSize == as_deserialized.deserializedSize &&
+                  as->sourceLocation.allocationIdentity != as->destinationLocation.allocationIdentity &&
+                  HasUnaliasedRTASStorage(as->sourceLocation) && HasUnaliasedRTASStorage(as->destinationLocation);
               raytracing::NativeSizes sizes;
               if (FAILED(device_->QueryRTASSizes(as_deserialized.inputs, sizes)) ||
                   (as_source_header.type != 2 && !device_->AllocateRTAS(as->destination, sizes.accelerationStructureSize, as_deserialized.inputs.instanceCount)) ||
@@ -9641,6 +9804,13 @@ public:
             return;
           }
           if (replay_group) render_pass_info = replay_group->descriptor;
+          else if (replay_current_node && replay_current_node->discard_store_mask) {
+            const auto mask = replay_current_node->discard_store_mask;
+            for (unsigned slot = 0; slot < 8; ++slot)
+              if (mask & (1u << slot)) render_pass_info.colors[slot].store_action = WMTStoreActionDontCare;
+            if (mask & (1u << 8)) render_pass_info.depth.store_action = WMTStoreActionDontCare;
+            if (mask & (1u << 9)) render_pass_info.stencil.store_action = WMTStoreActionDontCare;
+          }
           if (data->visibility_intervals && data->visibility_interval_count) {
             // GPU-driven draws can contain zero work: initialize every interval
             // even when native visibility Reset never encounters a fragment.
@@ -9902,55 +10072,73 @@ public:
             }
             auto batch = cmdbuf.computeCommandEncoder(false);
             batch.waitForFence(fence_);
-            for (size_t entry = first; entry < end; ++entry) {
+            uint32_t native_dispatches = 0;
+            for (size_t entry = first; entry < end;) {
               const auto &target = data->visibility_targets[entry];
-            if (target.reset) {
-              wmtcmd_blit_fillbuffer fill{};
-              fill.type = WMTBlitCommandFillBuffer;
-              fill.next.set(nullptr);
-              fill.buffer = target.destination;
-              fill.offset = uint64_t(target.index) * sizeof(uint64_t);
-              fill.length = sizeof(uint64_t);
-              batch.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
-              owned_graphics::Trace("query_reset", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
-                  ",\"encoder\":", data->id, ",\"heap\":", target.heap_id, ",\"index\":", target.index,
-                  ",\"reset_count\":1");
-              continue;
-            }
-            wmtcmd_compute_nop head{};
-            head.type = WMTComputeCommandNop;
-            wmtcmd_compute_setpso set_pso{};
-            set_pso.type = WMTComputeCommandSetPSO;
-            set_pso.pso = target.accumulate_pipeline;
-            set_pso.threadgroup_size = {1, 1, 1};
-            wmtcmd_compute_setbuffer set_source{};
-            set_source.type = WMTComputeCommandSetBuffer;
-            set_source.buffer = data->visibility_scratch;
-            set_source.offset = target.source_offset;
-            set_source.index = 0;
-            wmtcmd_compute_setbuffer set_destination{};
-            set_destination.type = WMTComputeCommandSetBuffer;
-            set_destination.buffer = target.destination;
-            set_destination.offset = uint64_t(target.index) * sizeof(uint64_t);
-            set_destination.index = 1;
-            wmtcmd_compute_dispatch dispatch{};
-            dispatch.type = WMTComputeCommandDispatchThreads;
-            dispatch.size = {1, 1, 1};
-            head.next.set(&set_pso);
-            set_pso.next.set(&set_source);
-            set_source.next.set(&set_destination);
-            set_destination.next.set(&dispatch);
-            dispatch.next.set(nullptr);
-            batch.encodeCommands(&head);
-            owned_graphics::Trace("query_accumulate", ",\"queue\":", owned_id_,
-                                  ",\"submission\":", scope->seq, ",\"heap\":", target.heap_id,
-                                  ",\"index\":", target.index, ",\"source_offset\":", target.source_offset);
+              if (target.reset) {
+                wmtcmd_blit_fillbuffer fill{};
+                fill.type = WMTBlitCommandFillBuffer;
+                fill.next.set(nullptr);
+                fill.buffer = target.destination;
+                fill.offset = uint64_t(target.index) * sizeof(uint64_t);
+                fill.length = sizeof(uint64_t);
+                batch.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&fill));
+                owned_graphics::Trace("query_reset", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
+                    ",\"encoder\":", data->id, ",\"heap\":", target.heap_id, ",\"index\":", target.index,
+                    ",\"reset_count\":1");
+                ++entry;
+                continue;
+              }
+              size_t group_end = entry + 1;
+              while (group_end < end && data->visibility_targets[group_end].destination == target.destination)
+                ++group_end;
+              if (group_end > entry + 1 && !visibility_batch_pipeline_) {
+                WMT::Reference<WMT::Error> error;
+                auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_accumulate_visibility_batch");
+                if (function) visibility_batch_pipeline_ = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+                if (!visibility_batch_pipeline_) group_end = entry + 1;
+              }
+              const size_t count = group_end - entry;
+              wmtcmd_compute_setpso pso{};
+              pso.type = WMTComputeCommandSetPSO;
+              pso.pso = count == 1 ? target.accumulate_pipeline : visibility_batch_pipeline_;
+              pso.threadgroup_size = {std::min<size_t>(count, 32), 1, 1};
+              wmtcmd_compute_setbuffer source{}, destination{};
+              source.type = destination.type = WMTComputeCommandSetBuffer;
+              source.index = 0; source.buffer = data->visibility_scratch;
+              destination.index = 1; destination.buffer = target.destination;
+              source.offset = count == 1 ? target.source_offset : 0;
+              destination.offset = count == 1 ? uint64_t(target.index) * sizeof(uint64_t) : 0;
+              wmtcmd_compute_dispatch dispatch{};
+              dispatch.type = WMTComputeCommandDispatchThreads;
+              dispatch.size = {count, 1, 1};
+              pso.next.set(&source); source.next.set(&destination);
+              wmtcmd_compute_setbytes pairs{};
+              uint64_t indices[64][2];
+              if (count > 1) {
+                for (size_t i = 0; i < count; ++i) {
+                  const auto &item = data->visibility_targets[entry + i];
+                  indices[i][0] = item.source_offset / sizeof(uint64_t);
+                  indices[i][1] = item.index;
+                }
+                pairs.type = WMTComputeCommandSetBytes; pairs.index = 2;
+                pairs.length = count * sizeof(indices[0]); pairs.bytes.set(indices);
+                destination.next.set(&pairs); pairs.next.set(&dispatch);
+              } else destination.next.set(&dispatch);
+              batch.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pso));
+              ++native_dispatches;
+              for (; entry < group_end; ++entry) {
+                const auto &item = data->visibility_targets[entry];
+                owned_graphics::Trace("query_accumulate", ",\"queue\":", owned_id_,
+                    ",\"submission\":", scope->seq, ",\"heap\":", item.heap_id,
+                    ",\"index\":", item.index, ",\"source_offset\":", item.source_offset);
+              }
             }
             batch.updateFence(fence_);
             batch.endEncoding();
             owned_graphics::Trace("query_fanout_batch", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
                 ",\"encoder\":", data->id, ",\"targets\":", end-first, ",\"reset\":", unsigned(resets),
-                ",\"native_encoders\":1");
+                ",\"native_encoders\":1,\"native_dispatches\":", native_dispatches);
             first = end;
           }
           if (atomic_render) {
@@ -9982,7 +10170,22 @@ public:
                         !EncodeASHelper(cmdbuf, data->pipelines.visualizeDescriptors, params, sizeof(params))) fail();
                     break;
                   }
-                  if (deserialize) {
+                  if (as_plain_deserialize) {
+                    constexpr size_t offset = offsetof(raytracing::AccelerationStructureHeader, magic);
+                    wmtcmd_blit_copy_from_buffer_to_buffer payload{};
+                    payload.type = WMTBlitCommandCopyFromBufferToBuffer;
+                    payload.src = data->sourceLocation.buffer;
+                    payload.src_offset = data->sourceLocation.offset + D3DALLOY_RTAS_SERIALIZED_HEADER_SIZE + offset;
+                    payload.dst = data->destinationLocation.buffer;
+                    payload.dst_offset = data->destinationLocation.offset + offset;
+                    payload.copy_length = raytracing::kHeaderSize - offset + as_deserialized.shadowSize;
+                    auto blit = cmdbuf.blitCommandEncoder();
+                    blit.waitForFence(fence_);
+                    blit.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&payload));
+                    blit.updateFence(fence_);
+                    blit.endEncoding();
+                    owned_graphics::Trace("rtas_deserialize_blit", ",\"bytes\":", payload.copy_length);
+                  } else if (deserialize) {
                     raytracing::DeserializeParams params{data->sourceLocation.address, data->destinationLocation.address,
                         as_deserialized.deserializedSize};
                     if (!EncodeASHelper(cmdbuf, data->pipelines.deserialize, &params, sizeof(params))) { fail(); break; }
@@ -10593,7 +10796,7 @@ public:
         case EncoderType::Resolve: {
           auto data = static_cast<ResolveEncoderData *>(current);
           std::vector<SwizzlePassResource> swizzle_uses;
-          {
+          if (!replay_current_node->access_complete) {
             if (data->src)
               AppendStandardTexture(swizzle_uses, data->src.ptr()->allocation->descriptor, false,
                                     data->src.ptr()->key, data->src.ptr()->allocation);
@@ -10608,6 +10811,8 @@ public:
 
           WMTRenderPassInfo info;
           WMT::InitializeRenderPassInfo(info);
+          const bool discard_color = data->overwrite_color && replay_current_node->access_complete &&
+              !HeapAttachmentViewsOverlap(data->src, data->dst);
           if (data->pipeline) {
             if (data->dsv_flags & 1) {
               info.sample_positions = data->sample_positions;
@@ -10620,7 +10825,7 @@ public:
               info.stencil.store_action = WMTStoreActionStore;
             } else {
               info.colors[0].texture = data->dst.texture();
-              info.colors[0].load_action = WMTLoadActionLoad;
+              info.colors[0].load_action = discard_color ? WMTLoadActionDontCare : WMTLoadActionLoad;
               info.colors[0].store_action = WMTStoreActionStore;
             }
           } else {
@@ -10631,7 +10836,14 @@ public:
           }
 
           auto encoder = cmdbuf.renderCommandEncoder(info);
-          encoder.waitForFence(fence_, WMTRenderStageFragment);
+          if (native_fence_required)
+            encoder.waitForFence(fence_, WMTRenderStageFragment);
+          else if (consumer_barrier_after)
+            encoder.barrierAfterQueueStages(consumer_barrier_after, WMTMetal4StageFragment | WMTMetal4StageTile,
+                                           consumer_visibility);
+          owned_graphics::Trace("native_resolve_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
+              ",\"tracked\":", replay_current_node->access_complete, ",\"fence_wait\":", native_fence_required,
+              ",\"after\":", consumer_barrier_after, ",\"overwrite_color\":", discard_color);
           encoder.setLabel(resolve_pass_label_);
           if (data->pipeline) {
             encoder.setRenderPipelineState(data->pipeline);
@@ -11064,14 +11276,6 @@ public:
           history.push_back(D3D12_AUTO_BREADCRUMB_OP_ENDSUBMISSION);
           submission.breadcrumb = device_->diagnostics.BeginSubmission(list, this, std::move(history), contexts);
         }
-        if (!task.contains_temporal) {
-          for (auto *encoder = list->entry; encoder; encoder = encoder->next) {
-            if (encoder->type == EncoderType::Temporal) {
-              task.contains_temporal = true;
-              break;
-            }
-          }
-        }
       }
       // Only contradictions within this submission are definitive at API
       // capture; another queue may produce the preceding state behind a Wait.
@@ -11091,13 +11295,9 @@ public:
       // Capture generations at API enqueue time, before a worker can block.
       // Every replay owns fresh tickets; canceled tasks unregister wait latches.
       for (auto &list : task.lists) {
-        size_t count = 0;
-        for (auto *encoder = list.entry; encoder; encoder = encoder->next)
-          if (encoder->type == EncoderType::FenceBarrier) count += static_cast<FenceBarrierEncoderData *>(encoder)->operands.size();
-        list.fence_operations.reserve(count);
-        for (auto *encoder = list.entry; encoder; encoder = encoder->next) {
-          if (encoder->type != EncoderType::FenceBarrier) continue;
-          const auto *barrier = static_cast<FenceBarrierEncoderData *>(encoder);
+        const auto &head = *static_cast<const RecordingHead *>(list.entry);
+        list.fence_operations.reserve(head.fence_operand_count);
+        for (const auto *barrier : head.fence_barriers) {
           for (const auto &operand : barrier->operands) {
             auto *native = static_cast<MTLD3D12Fence *>(operand.fence.ptr());
             auto &operation = list.fence_operations.emplace_back();
@@ -11430,8 +11630,8 @@ public:
         }
       }
       task.state.reset();
-      if (task.completion_handle && task.credit->exchange(false, std::memory_order_acq_rel))
-        task.latency->complete(task.completion_handle.get());
+      if (task.latency && task.credit->exchange(false, std::memory_order_acq_rel))
+        task.latency->complete();
       return;
     }
     try {
@@ -11461,6 +11661,47 @@ public:
     task.state.reset();
   }
 
+  // The public flip-sequential buffer already contains every dirty pixel.
+  // Bound planner and blit costs to four spans. Fragmented regions use the
+  // single-largest-rect policy below.
+  static bool
+  PresentDirtyComplement(const D3DalloyPresentComposition &composition,
+                         std::array<RECT, 4> &spans, unsigned &count, uint64_t &area) {
+    if (composition.dirty_rects.size() < 2 || composition.dirty_rects.size() > 16)
+      return false;
+    spans[0] = {0, 0, LONG(composition.width), LONG(composition.height)};
+    count = 1;
+    for (const auto &dirty : composition.dirty_rects) {
+      std::array<RECT, 4> remaining;
+      unsigned used = 0;
+      auto add = [&](RECT rect) {
+        if (rect.left >= rect.right || rect.top >= rect.bottom) return true;
+        if (used == remaining.size()) return false;
+        remaining[used++] = rect;
+        return true;
+      };
+      for (unsigned i = 0; i < count; ++i) {
+        const auto &r = spans[i];
+        const RECT cut{std::max(r.left, dirty.left), std::max(r.top, dirty.top),
+                       std::min(r.right, dirty.right), std::min(r.bottom, dirty.bottom)};
+        if (cut.left >= cut.right || cut.top >= cut.bottom) {
+          if (!add(r)) return false;
+        } else if (!add({r.left, r.top, r.right, cut.top}) ||
+                   !add({r.left, cut.bottom, r.right, r.bottom}) ||
+                   !add({r.left, cut.top, cut.left, cut.bottom}) ||
+                   !add({cut.right, cut.top, r.right, cut.bottom})) {
+          return false;
+        }
+      }
+      std::copy_n(remaining.begin(), used, spans.begin());
+      count = used;
+    }
+    area = 0;
+    for (unsigned i = 0; i < count; ++i)
+      area += uint64_t(spans[i].right - spans[i].left) * (spans[i].bottom - spans[i].top);
+    return true;
+  }
+
   void
   EncodePresentCommitted(PresentTask &task, WMT::SharedEvent order_event, uint64_t frame_id,
                          std::vector<SignalTask> *folded_signals) {
@@ -11488,7 +11729,6 @@ public:
     MarkUntracked(scope.seq);
     // Its encoders wait on the queue fence; skipped work of earlier Executes drains first.
     DrainSkippedWork(cmdbuf, scope.seq);
-    scope.inflight.semaphore = task.completion_handle.release();
     scope.inflight.reflex_work = task.reflex_work;
     if (task.reflex_work) scope.inflight.reflex_driver_start = ReflexState::NowUs();
     scope.inflight.latency = std::move(task.latency);
@@ -11514,7 +11754,13 @@ public:
       }
     }
     const uint64_t frame_area = uint64_t(composition.width) * composition.height;
-    const bool full_image_dirty = largest_dirty && dirty_area == frame_area;
+    std::array<RECT, 4> complement;
+    unsigned complement_count = 0;
+    uint64_t complement_area = 0;
+    const bool use_complement = largest_dirty && composition.has_previous && dirty_area < frame_area &&
+        PresentDirtyComplement(composition, complement, complement_count, complement_area) &&
+        complement_area <= frame_area / 2 && complement_area < frame_area - dirty_area;
+    const bool full_image_dirty = (largest_dirty && dirty_area == frame_area) || (use_complement && !complement_count);
     const bool full_history = composition.full || !composition.has_previous || full_image_dirty;
     uint64_t history_copies = 0, history_texels = 0, backbuffer_copies = 0, backbuffer_texels = 0;
     if (task.composition.history) {
@@ -11603,7 +11849,12 @@ public:
       // Dirty pixels came from this exact public buffer, *after* scroll. They
       // already equal history. Restore everything else (including pixels
       // outside SetSourceSize), bounded to at most four nonempty blits.
-      if (largest_dirty && dirty_area * 2 >= frame_area) {
+      if (use_complement) {
+        for (unsigned i = 0; i < complement_count; ++i) {
+          const auto &r = complement[i];
+          restore(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        }
+      } else if (largest_dirty && dirty_area * 2 >= frame_area) {
         const uint32_t l = largest_dirty->left, t = largest_dirty->top;
         const uint32_t r = largest_dirty->right, b = largest_dirty->bottom;
         restore(0, 0, w, t);
@@ -11671,16 +11922,6 @@ public:
     const bool native_composition = bool(composition.surface);
     uint64_t captured_frame_id = 0;
     try {
-      // The swapchain owns its public handle and may be released while this
-      // task is waiting behind a queue fence. Keep a duplicate until the
-      // resulting GPU command buffer completes.
-      HANDLE completion_handle = nullptr;
-      if (hLantecyWaitable && !DuplicateHandle(GetCurrentProcess(), hLantecyWaitable,
-                                              GetCurrentProcess(), &completion_handle, 0,
-                                              FALSE, DUPLICATE_SAME_ACCESS))
-        return HRESULT_FROM_WIN32(GetLastError());
-      OwnedHandle retained_completion_handle(completion_handle);
-
       std::unique_lock<d3dalloy::mutex> enqueue_lock(mutex_enqueue_, std::defer_lock);
       if (do_not_wait) {
         if (!enqueue_lock.try_lock())
@@ -11713,7 +11954,6 @@ public:
       task.composition = std::move(composition);
       task.present_id = present_id;
       task.backbuffer = static_cast<MTLD3D12Resource *>(backbuffer);
-      task.completion_handle = std::move(retained_completion_handle);
       task.after = after;
       task.credit = std::make_shared<std::atomic<bool>>(true);
       presenter->prepareQueuedPresent();

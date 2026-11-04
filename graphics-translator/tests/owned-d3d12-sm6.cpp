@@ -1389,7 +1389,7 @@ void testCalculateLodShapes(Compute &c) {
 
 void testWideIntegerHierarchy(Compute &c) {
   struct Case {const char* entry;uint32_t width,threads;};
-  for (const auto& test : {Case{"cs_wide_exact64",64,173},Case{"cs_wide_exact128",128,173},
+  for (const auto& test : {Case{"cs_wide_exact64",64,173},Case{"cs_wide_exact128",128,161},
       Case{"cs_wide_exact64_short",64,17},Case{"cs_wide_exact128_short",128,17}}) {
     begin();
     auto result=c.run(test.entry,filled(test.threads*256),filled(64),filled(64),{0,0,0,0},1);
@@ -1419,8 +1419,8 @@ void testWideIntegerHierarchy(Compute &c) {
       expected[6]=uint64_t(minimum);expected[7]=uint64_t(maximum);
       for(uint32_t i=0;i<13;++i)EXPECT_EQ(test.entry,"i64",gi*13+i,load<uint64_t>(result[0],gi*256+i*8),expected[i]);
       const uint32_t other[]={sum16,prefix16,min16,max16,uint32_t(int32_t(minSigned16)),uint32_t(int32_t(maxSigned16)),
-          count,prefixCount,uint32_t(live>33),1};
-      for(uint32_t i=0;i<10;++i)EXPECT_EQ(test.entry,"i16_vote",gi*10+i,load<uint32_t>(result[0],gi*256+104+i*4),other[i]);
+          count,prefixCount,uint32_t(live>33),1,1,uint32_t(live<=32),uint32_t(live<=16)};
+      for(uint32_t i=0;i<13;++i)EXPECT_EQ(test.entry,"i16_vote",gi*13+i,load<uint32_t>(result[0],gi*256+104+i*4),other[i]);
     }
     end(test.entry);
   }

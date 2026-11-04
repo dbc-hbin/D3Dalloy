@@ -83,7 +83,7 @@ struct D3DalloyPresentLatency {
   HRESULT initializeWakeHandle(HANDLE semaphore);
   bool reserve(bool do_not_wait, UINT replaceable_queued = 0, bool *borrowed = nullptr);
   void cancel();
-  void complete(HANDLE semaphore);
+  void complete();
   void discardQueuedForRestart(UINT canceled, bool borrowed, HANDLE semaphore);
   void remove();
   HRESULT setMaximum(UINT maximum, HANDLE semaphore);
@@ -956,7 +956,7 @@ public:
   ) = 0;
 
   virtual Rc<BufferAllocation> LookupBufferByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset) = 0;
-  virtual std::vector<Rc<BufferAllocation>> SnapshotBufferAllocations() = 0;
+  virtual std::shared_ptr<const std::vector<Rc<BufferAllocation>>> SnapshotBufferAllocations() = 0;
   /* LookupBufferByVA that also reports the VA interval [*pBegin, *pEnd) over which the same
    * allocation is returned and the map generation observed; *pEnd is 0 for a null result. */
   virtual Rc<BufferAllocation> LookupBufferRangeByVA(D3D12_GPU_VIRTUAL_ADDRESS VA, uint64_t *pOffset, uint64_t *pBegin,

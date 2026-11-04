@@ -3293,7 +3293,7 @@ public:
     return LookupBufferRangeByVA(VA, pOffset, &begin, &end, &generation);
   }
 
-  std::vector<Rc<BufferAllocation>> SnapshotBufferAllocations() override {
+  std::shared_ptr<const std::vector<Rc<BufferAllocation>>> SnapshotBufferAllocations() override {
     return va_registry_.Snapshot();
   }
 

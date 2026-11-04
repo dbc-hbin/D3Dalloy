@@ -619,7 +619,7 @@ void accumulateUsage(std::vector<ResourceBinding> &resources, const HandleOrigin
   }
 }
 
-void scanUsage(llvm::Module &module, std::vector<ResourceBinding> &resources) {
+llvm::Error scanUsage(llvm::Module &module, std::vector<ResourceBinding> &resources, bool uses_matrices) {
   for (llvm::Function &function : module) {
     for (llvm::BasicBlock &block : function) {
       for (llvm::Instruction &instruction : block) {
@@ -645,19 +645,26 @@ void scanUsage(llvm::Module &module, std::vector<ResourceBinding> &resources) {
           continue;
         }
         OpUsage usage = usageOfOpcode(opcode);
-        if (!usage.read && !usage.written)
-          continue;
+        const llvm::Value *handle = call->arg_size() >= 2 ? call->getArgOperand(1) : nullptr;
+        if (!usage.read && !usage.written) {
+          if (!uses_matrices) continue;
+          auto access = GetMatrixBufferAccess(*call);
+          if (!access) return access.takeError();
+          if (!access->handle) continue;
+          handle = access->handle;
+          usage.read = access->read;
+          usage.written = access->written;
+        }
         if (opcode == 71) /* CheckAccessFullyMapped takes a status value, not a handle */
           continue;
-        if (call->arg_size() < 2)
-          continue;
-        HandleOrigin origin = resolveHandle(call->getArgOperand(1));
+        HandleOrigin origin = resolveHandle(handle);
         if (!origin.has_declaration && !origin.has_binding && !origin.symbol)
           continue;
         accumulateUsage(resources, origin, usage);
       }
     }
   }
+  return llvm::Error::success();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1166,7 +1173,8 @@ llvm::Error extractMetadata(
   applyMetadataSignature(metadata_patch, out.patch_constant_sig);
 
 
-  scanUsage(module, out.resources);
+  if (auto error = scanUsage(module, out.resources, *matrix_contract))
+    return error;
   scanOutputWrites(module, out);
   return llvm::Error::success();
 }

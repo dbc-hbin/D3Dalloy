@@ -28,9 +28,7 @@ static void wg_scheduler_frame(device WorkGraphSchedulerFrame &frame, uint node,
 // Queue capacity proves one nonterminal producer group at a time: descendants
 // drain before that producer is allowed to reset and reuse its backing level.
 kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buffer(0)]],
-                                    constant WorkGraphSchedulerParams &p [[buffer(1)]],
-                                    uint invocation [[thread_position_in_grid]]) {
-  if (invocation) return;
+                                    constant WorkGraphSchedulerParams &p [[buffer(1)]]) {
   device auto *indirect = reinterpret_cast<device WorkGraphSchedulerIndirect *>(p.Indirect);
   if (state.PendingPacket < p.NodeCount) {
     indirect[state.PendingPacket] = WorkGraphSchedulerIndirect{};
@@ -40,54 +38,33 @@ kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buf
 
   state.SelectedNode = kWorkGraphSchedulerNone;
   state.InputAddress = 0;
-  if (!p.Depth || p.Depth > kWorkGraphSchedulerMaxDepth || state.Depth > p.Depth ||
-      !p.TransitionBudget || p.TransitionBudget > kWorkGraphSchedulerMaxTransitions ||
-      !p.GroupBudget || p.GroupBudget > kWorkGraphSchedulerMaxGroups || state.QuantumGroups > p.GroupBudget) {
+  if (state.Depth > p.Depth || state.QuantumGroups > kWorkGraphSchedulerMaxGroups) {
     wg_scheduler_fail(state, kWorkGraphSchedulerInvalidMetadata, kWorkGraphSchedulerNone, state.Depth);
     return;
   }
   // Slots remaining in a preencoded quantum become no-ops once its group
   // budget is reached. The CPU resets only this budget after GPU retirement;
   // all traversal state and suspended producer queues remain GPU-owned.
-  if (state.QuantumGroups == p.GroupBudget) return;
+  if (state.QuantumGroups == kWorkGraphSchedulerMaxGroups) return;
   device const auto *nodes = reinterpret_cast<device const WorkGraphSchedulerNode *>(p.Nodes);
   device const auto *templates = reinterpret_cast<device const WorkGraphSchedulerQueueTemplate *>(p.Queues);
-  device const auto *seeds = reinterpret_cast<device const WorkGraphSchedulerSeed *>(p.Seeds);
+  device const auto &seed = *reinterpret_cast<device const WorkGraphSchedulerSeed *>(p.Seeds);
   device const auto *targets = reinterpret_cast<device const uint *>(p.Targets);
   device const auto *shares = reinterpret_cast<device const uint *>(p.Shares);
   device auto *frames = reinterpret_cast<device WorkGraphSchedulerFrame *>(p.Frames);
 
-  for (uint transition = 0; transition < p.TransitionBudget; ++transition) {
-    ++state.TransitionSteps;
+  for (uint transition = 0; transition < kWorkGraphSchedulerMaxTransitions; ++transition) {
     if (!state.Depth) {
-      if (state.SeedIndex >= p.SeedCount) {
+      if (state.SeedRecord >= seed.Count) {
         state.Status = kWorkGraphSchedulerDone;
         return;
-      }
-      const auto seed = seeds[state.SeedIndex];
-      if (state.SeedRecord >= seed.Count) {
-        ++state.SeedIndex;
-        state.SeedRecord = 0;
-        continue;
       }
       if (seed.Node >= p.NodeCount) {
         wg_scheduler_fail(state, kWorkGraphSchedulerInvalidNode, seed.Node, 0);
         return;
       }
-      // r and each stride limb are uint32. Both products and their sum fit
-      // uint64. Check the upper limb without a 64-bit divide, which fails
-      // native Metal pipeline compilation on the validated runtime.
-      const ulong low_product = ulong(state.SeedRecord) * uint(seed.Stride);
-      const ulong high_product = ulong(state.SeedRecord) * uint(seed.Stride >> 32);
-      if (high_product + (low_product >> 32) > 0xfffffffful) {
-        wg_scheduler_fail(state, kWorkGraphSchedulerInvalidRecord, seed.Node, 0);
-        return;
-      }
+      // RunFrontier validates the full seed span before publishing it.
       const ulong offset = ulong(state.SeedRecord) * seed.Stride;
-      if (seed.Records > (~0ul) - offset) {
-        wg_scheduler_fail(state, kWorkGraphSchedulerInvalidRecord, seed.Node, 0);
-        return;
-      }
       wg_scheduler_frame(frames[0], seed.Node, seed.Records + offset, nodes[seed.Node].Recursion);
       ++state.SeedRecord;
       state.Depth = 1;
@@ -108,9 +85,7 @@ kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buf
     device auto *sharing = reinterpret_cast<device uint *>(level_address + p.SharingOffset);
 
     if (frame.Phase == kWorkGraphSchedulerEnter) {
-      if (node.Launch < 1 || node.Launch > 3 || !node.GroupLimit || node.GroupLimit > 65535u ||
-          (!(node.Flags & kWorkGraphSchedulerTerminal) && node.GroupLimit != 1) ||
-          node.TargetCount > p.MaxOutputs || node.ShareCount > 255u) {
+      if (node.Launch < 1 || node.Launch > 3) {
         wg_scheduler_fail(state, kWorkGraphSchedulerInvalidMetadata, frame.Node, level);
         return;
       }
@@ -165,14 +140,10 @@ kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buf
         return;
       }
       const uint groups = min(min(frame.GroupCount - frame.NextGroup, node.GroupLimit),
-                              p.GroupBudget - state.QuantumGroups);
+                              kWorkGraphSchedulerMaxGroups - state.QuantumGroups);
       for (uint i = 0; i < node.DrainCount; ++i) {
         const uint target = targets[ulong(node.DrainOffset) + i];
         const auto description = templates[target];
-        if (description.Mask == 0xffffffffu || ((description.Mask + 1) & description.Mask) || !description.Stride) {
-          wg_scheduler_fail(state, kWorkGraphSchedulerInvalidMetadata, frame.Node, level);
-          return;
-        }
         queues[target] = WorkGraphSchedulerQueue{
           p.Backing + ulong(level) * p.LevelBytes + description.Offset, 0,
           description.Mask, description.Stride, 0, 0};
@@ -186,10 +157,6 @@ kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buf
       device auto *outputs = reinterpret_cast<device uint *>(p.Context + sizeof(WorkGraphSchedulerContext));
       for (uint element = 0; element < node.TargetCount; ++element) {
         const uint target = targets[ulong(node.TargetOffset) + element];
-        if (target != kWorkGraphSchedulerNone && target >= p.NodeCount) {
-          wg_scheduler_fail(state, kWorkGraphSchedulerInvalidNode, frame.Node, level);
-          return;
-        }
         outputs[element] = target == frame.Node && !frame.Remaining ? kWorkGraphSchedulerNone : target;
       }
       frame.NextGroup += groups;

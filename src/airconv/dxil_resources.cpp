@@ -46,6 +46,7 @@
  * shared 4096-byte counter convention), so it is used verbatim.
  */
 
+#include <bit>
 #include "dxil_converter.hpp"
 
 #include <functional>
@@ -363,8 +364,7 @@ private:
 
   /* ---- handle resolution ---- */
 
-  void collectAnnotations();
-  void collectCounterHandles();
+  void collectAnnotation(llvm::CallInst *call);
   void collectHeapUsage();
   void markCounterHandle(llvm::Value *value);
 
@@ -739,7 +739,7 @@ ResourceLowering::bufferTileStatus(llvm::Value *status_base, llvm::Value *first_
       auto *pointer = builder.CreateIntToPtr(builder.CreateAdd(status_base, builder.CreateLShr(address, 16)), byte_ptr);
       return builder.CreateICmpNE(builder.CreateLoad(builder.getInt8Ty(), pointer), builder.getInt8(0));
     };
-    /* An access never spans more than two 64KB tiles (at most 16 bytes). */
+    /* A contiguous raw vector is at most 8192 bytes and touches at most two 64KB tiles. */
     auto *mapped = builder.CreateAnd(tile_byte(first_byte), tile_byte(last_byte));
     return {builder.CreateZExt(mapped, builder.getInt32Ty())};
   });
@@ -1172,38 +1172,28 @@ ResourceLowering::writeTexture(
 /* ----------------------------------------------------------------------- */
 
 void
-ResourceLowering::collectAnnotations() {
-  for (auto &function : *info.module) {
-    for (auto &block : function) {
-      for (auto &instruction : block) {
-        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-        uint32_t opcode;
-        if (!call || !IsDxilCall(call, opcode) || opcode != kAnnotateHandle)
-          continue;
-        auto *properties = llvm::dyn_cast<llvm::ConstantAggregate>(call->getArgOperand(2));
-        if (!properties || properties->getNumOperands() < 1)
-          continue;
-        auto *shape = llvm::dyn_cast<llvm::ConstantInt>(properties->getOperand(0));
-        if (!shape)
-          continue;
-        /* ResourceKind lives in the low byte of the first property word, the
-         * upper bits are sampling/coherence/ROV flags. */
-        uint32_t kind = shape->getZExtValue() & 0xffu;
-        if (kind == 0 || kind >= 19)
-          continue;
-        auto *handle = call->getArgOperand(1);
-        uint32_t dword1 = 0;
-        if (properties->getNumOperands() >= 2)
-          if (auto *second = llvm::dyn_cast<llvm::ConstantInt>(properties->getOperand(1)))
-            dword1 = second->getZExtValue();
-        annotation_properties.try_emplace(handle, uint32_t(shape->getZExtValue()), dword1);
-        auto entry = annotations.find(handle);
-        if (entry != annotations.end() && entry->second != (ResourceKind)kind)
-          continue; /* the validator guarantees one shape; keep the first */
-        annotations[handle] = (ResourceKind)kind;
-      }
-    }
-  }
+ResourceLowering::collectAnnotation(llvm::CallInst *call) {
+  auto *properties = llvm::dyn_cast<llvm::ConstantAggregate>(call->getArgOperand(2));
+  if (!properties || properties->getNumOperands() < 1)
+    return;
+  auto *shape = llvm::dyn_cast<llvm::ConstantInt>(properties->getOperand(0));
+  if (!shape)
+    return;
+  /* ResourceKind lives in the low byte of the first property word, the
+   * upper bits are sampling/coherence/ROV flags. */
+  uint32_t kind = shape->getZExtValue() & 0xffu;
+  if (kind == 0 || kind >= 19)
+    return;
+  auto *handle = call->getArgOperand(1);
+  uint32_t dword1 = 0;
+  if (properties->getNumOperands() >= 2)
+    if (auto *second = llvm::dyn_cast<llvm::ConstantInt>(properties->getOperand(1)))
+      dword1 = second->getZExtValue();
+  annotation_properties.try_emplace(handle, uint32_t(shape->getZExtValue()), dword1);
+  auto entry = annotations.find(handle);
+  if (entry != annotations.end() && entry->second != (ResourceKind)kind)
+    return; /* the validator guarantees one shape; keep the first */
+  annotations[handle] = (ResourceKind)kind;
 }
 
 void
@@ -1224,21 +1214,6 @@ ResourceLowering::markCounterHandle(llvm::Value *value) {
   if (auto *select = llvm::dyn_cast<llvm::SelectInst>(value)) {
     markCounterHandle(select->getTrueValue());
     markCounterHandle(select->getFalseValue());
-  }
-}
-
-void
-ResourceLowering::collectCounterHandles() {
-  for (auto &function : *info.module) {
-    for (auto &block : function) {
-      for (auto &instruction : block) {
-        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-        uint32_t opcode;
-        if (!call || !IsDxilCall(call, opcode) || opcode != kBufferUpdateCounter)
-          continue;
-        markCounterHandle(call->getArgOperand(1));
-      }
-    }
   }
 }
 
@@ -2296,12 +2271,52 @@ ResourceLowering::lowerRawBufferVector(llvm::CallInst *call, bool store) {
   auto *integer_type = builder.getIntNTy(width);
   llvm::Value *vector = llvm::PoisonValue::get(vector_type);
   llvm::Value *status = builder.getInt32(1);
+  const bool need_status = !store && buffer->StatusBase && usesStatus(call);
+  const unsigned count = vector_type->getNumElements();
+  llvm::Instruction *slow_term = call;
+  llvm::BasicBlock *fast_block = nullptr;
+  llvm::Value *fast_vector = llvm::PoisonValue::get(vector_type), *fast_status = nullptr;
+  if (!coherent && buffer->Metadata) {
+    // A proven contiguous access can use short native vectors. Only a partial view needs a guard per lane.
+    llvm::Instruction *fast_term;
+    auto *full = bufferBytesInBounds(*buffer, byte_offset, count * (width / 8));
+    llvm::SplitBlockAndInsertIfThenElse(full, call, &fast_term, &slow_term);
+    builder.SetInsertPoint(fast_term);
+    for (unsigned i = 0; i < count;) {
+      const unsigned chunk = std::bit_floor(std::min(count - i, width == 64 ? 2u : 4u));
+      auto *at = builder.CreateAdd(byte_offset, builder.getInt64(i * (width / 8)));
+      auto *lanes = llvm::FixedVectorType::get(element_type, chunk);
+      // Keep 64-bit values in dword pairs, including at four-byte aligned raw offsets.
+      auto *words = llvm::FixedVectorType::get(builder.getIntNTy(std::min(width, 32u)),
+                                                chunk * (width == 64 ? 2 : 1));
+      auto *ptr = bufferBytePointer(*buffer, at, words);
+      llvm::Align align(std::min<uint64_t>(alignment->getZExtValue(), std::min(width, 32u) / 8));
+      if (store) {
+        llvm::SmallVector<int, 4> indices;
+        for (unsigned j = 0; j < chunk; ++j) indices.push_back(i + j);
+        auto *slice = builder.CreateShuffleVector(call->getArgOperand(4), llvm::PoisonValue::get(vector_type), indices);
+        builder.CreateAlignedStore(builder.CreateBitCast(slice, words), ptr, align);
+      } else {
+        auto *slice = builder.CreateBitCast(builder.CreateAlignedLoad(words, ptr, align), lanes);
+        for (unsigned j = 0; j < chunk; ++j)
+          fast_vector = builder.CreateInsertElement(fast_vector, builder.CreateExtractElement(slice, j), i+j);
+      }
+      i += chunk;
+    }
+    if (need_status) {
+      // At most 8192 contiguous bytes: the first and last residency tiles cover the entire access.
+      auto *first = builder.CreateAdd(builder.CreatePtrToInt(buffer->Pointer, builder.getInt64Ty()), byte_offset);
+      fast_status = bufferTileStatus(buffer->StatusBase, first, builder.CreateAdd(first, builder.getInt64(count * (width / 8) - 1)));
+    }
+    fast_block = builder.GetInsertBlock();
+    builder.SetInsertPoint(slow_term);
+  }
   for (unsigned i = 0; i < vector_type->getNumElements(); ++i) {
     auto *byte = builder.CreateAdd(byte_offset, builder.getInt64(i * width / 8));
     auto *condition = bufferBytesInBounds(*buffer, byte, width / 8);
     llvm::Value *value = store ? builder.CreateBitCast(
         builder.CreateExtractElement(call->getArgOperand(4), i), integer_type) : nullptr;
-    auto accessed = emitGuardedAccess(condition, call,
+    auto accessed = emitGuardedAccess(condition, slow_term,
         store ? llvm::ArrayRef<llvm::Type *>{} : llvm::ArrayRef<llvm::Type *>{integer_type},
         [&]() -> llvm::SmallVector<llvm::Value *, 4> {
           auto load = [&](llvm::Value *at, llvm::Type *type) -> llvm::Value * {
@@ -2341,13 +2356,27 @@ ResourceLowering::lowerRawBufferVector(llvm::CallInst *call, bool store) {
         });
     if (!store) {
       vector = builder.CreateInsertElement(vector, builder.CreateBitCast(accessed[0], element_type), i);
-      if (buffer->StatusBase && usesStatus(call)) {
+      if (need_status) {
         // OOB reads are zero and do not consult the residency table.
         auto *base = builder.CreateSelect(condition, buffer->StatusBase, builder.getInt64(0));
         auto *first = builder.CreateAdd(builder.CreatePtrToInt(buffer->Pointer, builder.getInt64Ty()), byte);
         status = builder.CreateAnd(status, bufferTileStatus(base, first,
             builder.CreateAdd(first, builder.getInt64(width / 8 - 1))));
       }
+    }
+  }
+  if (fast_block) {
+    auto *slow_block = builder.GetInsertBlock();
+    builder.SetInsertPoint(call);
+    if (!store) {
+      auto merge = [&](llvm::Value *fast, llvm::Value *slow) {
+        auto *phi = builder.CreatePHI(slow->getType(), 2);
+        phi->addIncoming(fast, fast_block);
+        phi->addIncoming(slow, slow_block);
+        return phi;
+      };
+      vector = merge(fast_vector, vector);
+      if (need_status) status = merge(fast_status, status);
     }
   }
   if (!store) {
@@ -4430,16 +4459,21 @@ ResourceLowering::run() {
   quad_derivative_stage = kernel_stage || info.stage == Stage::Mesh || info.stage == Stage::Amplification;
   // shortcut: DXIL helper references are not always direct calls; lower every
   // defined function until the module carries authoritative call-graph metadata.
-  collectAnnotations();
-  collectCounterHandles();
-  collectHeapUsage();
-
   llvm::SmallVector<llvm::CallInst *, 64> worklist;
+  llvm::SmallVector<llvm::CallInst *, 8> status_checks;
+  llvm::SmallPtrSet<llvm::Instruction *, 32> handle_nodes;
+  bool uses_heap = false;
   for (auto &function : *info.module) {
     if (function.isDeclaration())
       continue;
     for (auto &block : function) {
       for (auto &instruction : block) {
+        if (llvm::isa<llvm::PHINode>(instruction) || llvm::isa<llvm::SelectInst>(instruction)) {
+          auto *type = llvm::dyn_cast<llvm::StructType>(instruction.getType());
+          if (type && type->hasName() && type->getName() == "dx.types.Handle")
+            handle_nodes.insert(&instruction);
+          continue;
+        }
         auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
         if (!call)
           continue;
@@ -4447,6 +4481,24 @@ ResourceLowering::run() {
         if (!IsDxilCall(call, opcode))
           continue;
         switch (opcode) {
+        case kAnnotateHandle:
+          collectAnnotation(call);
+          handle_nodes.insert(call);
+          break;
+        case kCreateHandleFromHeap:
+          uses_heap = true;
+          [[fallthrough]];
+        case kCreateHandle:
+        case kCreateHandleForLib:
+        case kCreateHandleFromBinding:
+          handle_nodes.insert(call);
+          break;
+        case kCheckAccessFullyMapped:
+          status_checks.push_back(call);
+          break;
+        case kBufferUpdateCounter:
+          markCounterHandle(call->getArgOperand(1));
+          [[fallthrough]];
         case kCBufferLoadLegacy:
         case kTextureLoad:
         case kTextureStore:
@@ -4473,7 +4525,6 @@ ResourceLowering::run() {
         case kSampleCmpGrad:
         case kTextureGatherRaw:
         case kGetDimensions:
-        case kBufferUpdateCounter:
         case kAtomicBinOp:
         case kAtomicCompareExchange:
         case kWriteSamplerFeedback:
@@ -4492,24 +4543,13 @@ ResourceLowering::run() {
     }
   }
 
+  if (uses_heap) collectHeapUsage();
   for (auto *call : worklist) {
     if (auto error = lowerCall(call))
       return error;
   }
 
   /* CheckAccessFullyMapped consumes the status member the resource operations above just built. */
-  llvm::SmallVector<llvm::CallInst *, 8> status_checks;
-  for (auto &function : *info.module) {
-    if (function.isDeclaration())
-      continue;
-    for (auto &block : function)
-      for (auto &instruction : block)
-        if (auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction)) {
-          uint32_t opcode;
-          if (IsDxilCall(call, opcode) && opcode == kCheckAccessFullyMapped)
-            status_checks.push_back(call);
-        }
-  }
   for (auto *call : status_checks)
     if (auto error = lowerCheckAccessFullyMapped(call))
       return error;
@@ -4517,30 +4557,6 @@ ResourceLowering::run() {
   /* Resource consumers now use native descriptors. Remove the whole obsolete
    * handle graph, including phi/select and annotation chains, but never erase
    * a graph with an unlowered consumer. */
-  llvm::SmallPtrSet<llvm::Instruction *, 32> handle_nodes;
-  for (auto &function : *info.module) {
-    if (function.isDeclaration())
-      continue;
-    for (auto &block : function) {
-      for (auto &instruction : block) {
-        auto *type = llvm::dyn_cast<llvm::StructType>(instruction.getType());
-        if (type && type->hasName() && type->getName() == "dx.types.Handle" &&
-            (llvm::isa<llvm::PHINode>(instruction) || llvm::isa<llvm::SelectInst>(instruction))) {
-          handle_nodes.insert(&instruction);
-          continue;
-        }
-        auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-        if (!call)
-          continue;
-        uint32_t opcode;
-        if (!IsDxilCall(call, opcode))
-          continue;
-        if (opcode == kCreateHandle || opcode == kCreateHandleForLib || opcode == kAnnotateHandle ||
-            opcode == kCreateHandleFromBinding || opcode == kCreateHandleFromHeap)
-          handle_nodes.insert(call);
-      }
-    }
-  }
   for (auto *node : handle_nodes)
     for (auto *user : node->users())
       if (!handle_nodes.contains(llvm::dyn_cast<llvm::Instruction>(user))) {

@@ -150,11 +150,16 @@ struct TFrameInterpolationPresentInfo
 // No modifications to this type are permitted to maintain ABI stability
 typedef TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPacingDataSDK2> FrameinterpolationPresentInfoSDK2;
 
+struct IMTLD3D12ResourcePresent1;
+struct IMTLD3D12GeneratedPresent;
+
 // This type can be extended without breaking the ABI
 struct FrameinterpolationPresentInfoExt : public TFrameInterpolationPresentInfo<32, FfxApiResource, FrameInterpolationPacingDataExt>
 {
     // D3Dalloy: unlike compositionFenceGPU (pacing readiness), this protects source reuse.
     ID3D12Fence* sourceReleaseFence = nullptr;
+    IMTLD3D12ResourcePresent1* direct = nullptr;
+    IMTLD3D12GeneratedPresent* generated = nullptr;
 };
 
 typedef struct ReplacementResource

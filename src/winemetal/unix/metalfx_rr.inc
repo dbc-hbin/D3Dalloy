@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -138,21 +139,18 @@ inline float4 d3dalloy_rr_value(float4 value, constant Params &p, uint2 gid) {
 kernel void d3dalloy_rr_convert(texture2d<float,access::read> source [[texture(0)]],
   texture2d<float,access::write> destination [[texture(1)]],
   constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= p.width || gid.y >= p.height) return;
   destination.write(d3dalloy_rr_value(source.read(d3dalloy_rr_source(p,gid)),p,gid),
     gid + uint2(p.destinationX,p.destinationY));
 }
 kernel void d3dalloy_rr_convert_depth(depth2d<float,access::read> source [[texture(0)]],
   texture2d<float,access::write> destination [[texture(1)]],
   constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= p.width || gid.y >= p.height) return;
   destination.write(d3dalloy_rr_value(float4(source.read(d3dalloy_rr_source(p,gid)),0,0,1),p,gid),gid);
 }
 kernel void d3dalloy_rr_normal_roughness(texture2d<float,access::read> source [[texture(0)]],
   texture2d<float,access::write> normal [[texture(1)]],
   texture2d<float,access::write> roughness [[texture(2)]],
   constant Params &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  if (gid.x >= p.width || gid.y >= p.height) return;
   float4 value = source.read(d3dalloy_rr_source(p,gid));
   normal.write(value,gid);
   roughness.write(float4(value.w,0,0,1),gid);
@@ -544,16 +542,15 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     [resources.residency addAllocation:resources.params]; [resources.residency commit];
     resources.residencyDirty = false;
   }
+  const bool fusedNormalRoughness = d3dalloyRRFusesNormalRoughness(frame,bound);
   for (size_t i = 0; i < Count; ++i) {
-    // Only conversion dispatches consume these slots. Direct inputs have no
-    // parameter read, and the output conversion uses its separate slot below.
-    if (i == 3 || !bound[i] || bound[i] == frame->inputs[i]) continue;
+    if (i == 3 || !bound[i] || bound[i] == frame->inputs[i] || (i == 10 && fusedNormalRoughness)) continue;
     Params values{}; const auto &r = frame->rects[i]; values.x = r.x; values.y = r.y;
     values.width = uint32_t(bound[i].width); values.height = uint32_t(bound[i].height);
     values.sourceWidth = r.width; values.sourceHeight = r.height;
     values.mode = i == 10 && p.roughness_packed ? 1 : i == 1 && p.depth_linear ? 2 : i == 2 ? 3 : 0;
-    values.motionX = p.motion_scale_x; values.motionY = p.motion_scale_y;
     if (i == 2) {
+      values.motionX = p.motion_scale_x; values.motionY = p.motion_scale_y;
       if (!(core.info.feature_flags & 2)) {
         values.motionX *= float(p.input_width) / p.output_rect.width;
         values.motionY *= float(p.input_height) / p.output_rect.height;
@@ -563,15 +560,13 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
         values.jitterX = p.jitter_x - core.lastJitterX; values.jitterY = p.jitter_y - core.lastJitterY;
       }
     }
-    simd_float4x4 projection; matrix(projection,p.view_to_clip);
-    std::memcpy(values.projection,&projection,sizeof(projection));
-    std::memcpy(static_cast<char *>(resources.params.contents) + i * 256,&values,sizeof(values));
+    if (values.mode == 2) {
+      simd_float4x4 projection; matrix(projection,p.view_to_clip);
+      std::memcpy(values.projection,&projection,sizeof(projection));
+    }
+    std::memcpy(static_cast<char *>(resources.params.contents) + i * 256,&values,
+                values.mode == 2 ? sizeof(values) : offsetof(Params,projection));
   }
-  // Each dispatch reads immutable parameters, including a separate output slot.
-  Params outputParams{}; outputParams.width = p.output_rect.width; outputParams.height = p.output_rect.height;
-  outputParams.sourceWidth = outputParams.width; outputParams.sourceHeight = outputParams.height;
-  outputParams.destinationX = p.output_rect.x; outputParams.destinationY = p.output_rect.y;
-  std::memcpy(static_cast<char *>(resources.params.contents) + Count * 256,&outputParams,sizeof(outputParams));
   id<MTL4CommandBuffer> command = (id<MTL4CommandBuffer>)winemetal_metal4_command_buffer(call->args[0]);
   id<MTLFence> fence = (id<MTLFence>)call->args[2];
   if (!command || command.device != core.device || !fence || fence.device != core.device) {
@@ -582,7 +577,6 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   // behind one fence wait needs no intra-encoder barrier.
   // Both results must be computed from the original packed value. Reading the
   // rounded normal scratch for roughness would change high-precision inputs.
-  const bool fusedNormalRoughness = d3dalloyRRFusesNormalRoughness(frame,bound);
   id<MTL4ComputeCommandEncoder> prepass = nil;
   for (size_t i = 0; i < Count; ++i) {
     if (i == 3 || !bound[i] || bound[i] == frame->inputs[i]) continue;
@@ -647,6 +641,10 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
         [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
       } else {
         // Conversion also supports UAV outputs with a different channel precision.
+        Params outputParams{}; outputParams.width = p.output_rect.width; outputParams.height = p.output_rect.height;
+        outputParams.sourceWidth = outputParams.width; outputParams.sourceHeight = outputParams.height;
+        outputParams.destinationX = p.output_rect.x; outputParams.destinationY = p.output_rect.y;
+        std::memcpy(static_cast<char *>(resources.params.contents) + Count * 256,&outputParams,offsetof(Params,projection));
         [resources.table setTexture:bound[3].gpuResourceID atIndex:0];
         [resources.table setTexture:frame->inputs[3].gpuResourceID atIndex:1];
         [resources.table setAddress:resources.params.gpuAddress + Count * 256 atIndex:0];

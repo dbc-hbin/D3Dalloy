@@ -63,7 +63,6 @@ public:
     sample_float,
     sample_int,
     sample_uint,
-    sample_half,
   };
 
   enum MemoryAccess {
@@ -639,6 +638,9 @@ protected:
   raw_ostream &debug;
   AIRBuilderOptions options;
 
+  Value *CreateIntegerBorderTexel(const Texture &texture, Texture::ResourceKind logical, Value *handle,
+      Value *flags, Value *border, Value *lod_range, Value *resource_min_lod, Value *texel,
+      Value *coord, Value *offset, Value *lod, Value *format_metadata, Value *gather_component);
   std::pair<Value *, Value *> CreateAtomicPhaseTypedAccess(
       const Texture &texture, Value *handle, Value *position, Value *arrayIndex, Value *sample, Value *level,
       Value *value, Value *comparison, AtomicRMWInst::BinOp operation, unsigned access, uint32_t writeMask,
@@ -657,6 +659,8 @@ protected:
   Value *VolumeMapped(const Texture &texture, Value *tile);
   Value *VolumeInBounds(const Texture &texture, Value *position, Value *level);
   Value *VolumeDefaults(const Texture &texture, Value *handle);
+  std::pair<Value *, Value *> CreateVolumeReadInBounds(const Texture &texture, Value *handle, Value *position,
+      Value *level, Value *defaults, bool coherent);
   std::pair<Value *, Value *> CreateVolumeRead(const Texture &texture, Value *handle, Value *position,
                                               Value *level, bool coherent);
   std::pair<Value *, Value *> CreateVolumeSample(const Texture &texture, Value *handle, Value *coord,

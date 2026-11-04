@@ -91,6 +91,7 @@ struct ClosedDescriptorSpan {
   uint32_t first, count;
   uint64_t stages;
   bool writable;
+  bool operator==(const ClosedDescriptorSpan &) const = default;
 };
 struct SubmissionDescriptorCache;
 struct ClosedDescriptorShape {
@@ -99,6 +100,7 @@ struct ClosedDescriptorShape {
   mutable std::shared_ptr<const SubmissionDescriptorCache> descriptor_cache;
 };
 struct ClosedDispatchShape : ClosedDescriptorShape {
+  bool uses_pass_descriptors = false;
   small_vector<uint8_t, 4> buffers;
 };
 struct ClosedPassShape : ClosedDescriptorShape {
@@ -122,6 +124,8 @@ struct RecordingHead : EncoderData {
   // checking descriptor versions and current backing; GPU values are never cached.
   std::vector<ClosedPassShape> pass_shapes;
   std::unordered_map<const EncoderData *, size_t> pass_indices;
+  std::vector<const FenceBarrierEncoderData *> fence_barriers;
+  size_t fence_operand_count = 0;
   size_t raytracing_passes = 0;
   // Internal render templates belong to the recording even if a later
   // allocation fails before its logical frontier node can be published.

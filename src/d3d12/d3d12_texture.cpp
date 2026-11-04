@@ -809,6 +809,9 @@ public:
       texture->rename(texture->allocate(flags));
     if (!texture->current() || !texture->current()->texture())
       return shared && share ? E_INVALIDARG : E_OUTOFMEMORY;
+    texture->privateAttachmentStore = !pHeap && !shared && flags.test(TextureAllocationFlag::GpuPrivate) &&
+        !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
+        desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc_.DepthOrArraySize == 1 && desc_.SampleDesc.Count == 1;
     if (pHeap && texture->current()->canonicalHeap) {
       // Native tiled storage includes padding/metadata not derivable from texels.
       // Cache the created object's extent before publishing descriptors; replay

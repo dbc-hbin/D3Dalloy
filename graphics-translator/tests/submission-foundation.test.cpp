@@ -96,7 +96,7 @@ void registryProof() {
       }
       const auto owners=registry.Snapshot();
       std::this_thread::yield();
-      for (const auto& owner : owners)
+      for (const auto& owner : *owners)
         for (auto value : owner->immutable) assert(value==owner->tag);
     }
   });
@@ -107,30 +107,30 @@ void registryProof() {
 }
 void registrySnapshotProof() {
   std::atomic<uint64_t> generation{0};OwnedVARegistry<std::shared_ptr<Owner>> registry(generation);
-  assert(registry.Snapshot().empty());
+  assert(registry.Snapshot()->empty());
   auto first=std::make_shared<Owner>(1),second=std::make_shared<Owner>(2);
   std::weak_ptr<Owner> old_first=first,old_second=second;
   assert(registry.Insert(100,64,first));assert(registry.Insert(200,64,second));
   auto original=registry.Snapshot();
-  assert(original.size()==2);
+  assert(original->size()==2 && original==registry.Snapshot());
   const auto before=generation.load();
   registry.Remove(100,first);registry.Remove(200,second);first.reset();second.reset();
-  assert(!old_first.expired() && !old_second.expired() && registry.Snapshot().empty());
+  assert(!old_first.expired() && !old_second.expired() && registry.Snapshot()->empty());
   auto replacement=std::make_shared<Owner>(3);
   assert(registry.Insert(100,64,replacement));
   auto current=registry.Snapshot();
-  assert(generation.load()>before && current.size()==1 && current[0]==replacement);
+  assert(generation.load()>before && original!=current && current->size()==1 && (*current)[0]==replacement);
   std::set<unsigned> original_tags;
-  for(const auto& owner:original) {
+  for(const auto& owner:*original) {
     original_tags.insert(owner->tag);
     for(auto value:owner->immutable)assert(value==owner->tag);
   }
   assert(original_tags==std::set<unsigned>({1,2}));
-  original.clear();assert(old_first.expired() && old_second.expired());
+  original.reset();assert(old_first.expired() && old_second.expired());
   std::weak_ptr<Owner> latest=replacement;
   registry.Remove(100,replacement);replacement.reset();
-  assert(!latest.expired() && current[0]->tag==3 && registry.Snapshot().empty());
-  current.clear();assert(latest.expired());
+  assert(!latest.expired() && (*current)[0]->tag==3 && registry.Snapshot()->empty());
+  current.reset();assert(latest.expired());
   std::puts("PINNED_VA_SNAPSHOT_PASS empty=1 complete_owner_set=1 remove_and_replace_lifetime=1 fresh_generation_owners=1 release_after_consumers=1");
 }
 void registryAliasProof() {
@@ -152,7 +152,7 @@ void registryAliasProof() {
   assert(pin.owner==a && pin.begin==4096 && pin.end==4608 && pin.offset==511);
   auto remove_b=registry.Remove(4096,b);
   assert(remove_b.removed && remove_b.remaining==1 && !remove_b.retired_identity);
-  assert(registry.Lookup(4096).owner==a && registry.Snapshot().size()==1);
+  assert(registry.Lookup(4096).owner==a && registry.Snapshot()->size()==1);
   assert(registry.Insert(4096,512,b,same) && registry.Insert(4096,512,c,same));
   auto remove_a=registry.Remove(4096,a);
   assert(remove_a.removed && remove_a.remaining==2 && !remove_a.retired_identity && generation>before);
@@ -160,15 +160,15 @@ void registryAliasProof() {
   a.reset(); pin={};
   assert(!canonical.expired() && registry.Lookup(4100).owner==canonical.lock());
   auto snapshot=registry.Snapshot();
-  assert((std::set<std::shared_ptr<Owner>>(snapshot.begin(),snapshot.end()) ==
-          std::set<std::shared_ptr<Owner>>{canonical.lock(),b,c}) && snapshot.size()==3);
+  assert((std::set<std::shared_ptr<Owner>>(snapshot->begin(),snapshot->end()) ==
+          std::set<std::shared_ptr<Owner>>{canonical.lock(),b,c}) && snapshot->size()==3);
   assert(registry.Remove(4096,b).remaining==1);
   auto last=registry.Remove(4096,c);
   assert(last.removed && !last.remaining && last.retired_identity==canonical.lock());
-  assert(!registry.Lookup(4096).owner && registry.Snapshot().empty());
+  assert(!registry.Lookup(4096).owner && registry.Snapshot()->empty());
   assert(registry.Insert(4096,128,b)); // Independent address reuse after group retirement.
   assert(!registry.Remove(4096,last.retired_identity).removed && registry.Lookup(4097).owner==b);
-  last={}; snapshot.clear(); assert(canonical.expired());
+  last={}; snapshot.reset(); assert(canonical.expired());
   std::puts("PLACED_VA_ALIAS_PASS equal_extent=1 unequal_rejected=1 physical_proof_required=1 wrong_owner_noop=1 stable_rtas_identity=1 removal_orders=2 snapshot_all_pinned=1 reuse=1");
 }
 void heapExtentProof() {

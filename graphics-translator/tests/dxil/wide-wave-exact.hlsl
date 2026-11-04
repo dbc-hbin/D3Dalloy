@@ -31,8 +31,12 @@ void exact_values(uint gi) {
   Out.Store(base+132,WavePrefixCountBits((lane%5)==0));
   Out.Store(base+136,WaveActiveAnyTrue(lane==33));
   Out.Store(base+140,WaveActiveAllTrue(lane<WaveGetLaneCount()));
+  uint64_t common=(uint64_t(0x80000000u | (gi-lane))<<32) | 0xffffffffu;
+  Out.Store(base+144,WaveActiveAllEqual(common));
+  Out.Store(base+148,WaveActiveAllEqual(common ^ (uint64_t(lane >= 32)<<63)));
+  Out.Store(base+152,WaveActiveAllEqual(common ^ uint64_t(lane == 16)));
 }
 [WaveSize(64)] [numthreads(173,1,1)] void cs_wide_exact64(uint gi:SV_GroupIndex) {exact_values(gi);}
-[WaveSize(128)] [numthreads(173,1,1)] void cs_wide_exact128(uint gi:SV_GroupIndex) {exact_values(gi);}
+[WaveSize(128)] [numthreads(161,1,1)] void cs_wide_exact128(uint gi:SV_GroupIndex) {exact_values(gi);}
 [WaveSize(64)] [numthreads(17,1,1)] void cs_wide_exact64_short(uint gi:SV_GroupIndex) {exact_values(gi);}
 [WaveSize(128)] [numthreads(17,1,1)] void cs_wide_exact128_short(uint gi:SV_GroupIndex) {exact_values(gi);}

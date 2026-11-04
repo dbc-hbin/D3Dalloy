@@ -77,7 +77,7 @@ struct PipelineStage {
   std::unique_ptr<ModuleInfo> info;
   EntrySignature signature;
   /** Matches the linked DXIL VS's raw-half output register representation. */
-  bool raw_half_inputs = false;
+  std::vector<uint32_t> raw_half_inputs;
   /** Entry point (and HS patch-constant function) inside the converter's module once linked. */
   llvm::Function *entry = nullptr;
   llvm::Function *patch_constant = nullptr;

@@ -1924,6 +1924,25 @@ _MetalLayer_nextDrawable(void *obj) {
 }
 
 static NTSTATUS
+_MetalLayer_acquirePresentDrawable(void *obj) {
+  struct WMTPresentDrawable *present = obj;
+  id<CAMetalDrawable> drawable = composition_next_drawable((CAMetalLayer *)present->layer);
+  present->drawable = (obj_handle_t)drawable;
+  if (drawable) {
+    id<MTLTexture> source = (id<MTLTexture>)present->source;
+    id<MTLTexture> destination = drawable.texture;
+    present->texture = (obj_handle_t)destination;
+    present->source_width = (uint32_t)source.width;
+    present->source_height = (uint32_t)source.height;
+    present->destination_width = (uint32_t)destination.width;
+    present->destination_height = (uint32_t)destination.height;
+    present->source_format = (enum WMTPixelFormat)source.pixelFormat;
+    present->destination_format = (enum WMTPixelFormat)destination.pixelFormat;
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLDevice_supportsFXSpatialScaler(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   params->ret = [MTLFXSpatialScalerDescriptor supportsDevice:(id<MTLDevice>)params->handle];
@@ -6812,8 +6831,9 @@ const void *__wine_unix_call_funcs[] = {
     &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
     &thunk_SM50GetErrorKind, /* 319: fixed-width error kind */
     &thunk_SM50CloneError, /* 320: fixed-width independent error handle */
+    &_MetalLayer_acquirePresentDrawable, /* 321: inline drawable and texture metadata */
 };
-_Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 321,
+_Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == 322,
                "PE64/native composition dispatch index");
 
 #ifndef D3DALLOY_NATIVE
@@ -7130,7 +7150,8 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_WMTGetGuestWindowBase, /* 318: native typed guest-window query */
     &thunk_SM50GetErrorKind, /* 319: identical fixed-width layout on PE32 */
     &thunk_SM50CloneError, /* 320: inline handle needs no pointer conversion */
+    &_MetalLayer_acquirePresentDrawable, /* 321: inline drawable and texture metadata */
 };
-_Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == 321,
+_Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == 322,
                "PE32/native composition dispatch index");
 #endif

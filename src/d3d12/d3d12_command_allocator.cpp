@@ -178,7 +178,8 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
   auto &head = *recording_head_;
   std::vector<ClosedPassShape> shapes;
   std::unordered_map<const EncoderData *, size_t> indices;
-  size_t rtas = 0;
+  std::vector<const FenceBarrierEncoderData *> fence_barriers;
+  size_t fence_operand_count = 0, rtas = 0;
   auto append_table = [](ClosedDescriptorShape &shape, const StandardSwizzleTableUse &table, uint64_t stages) {
     if (!shape.descriptors_complete) return;
     D3D12_DESCRIPTOR_HEAP_DESC desc{}; D3D12_GPU_DESCRIPTOR_HANDLE start{};
@@ -219,13 +220,18 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
       size_t dispatch_index = 0;
       for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); cmd;
            cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null())) {
+        const bool indirect = cmd->type == WMTComputeCommandDispatchIndirect;
         if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
             cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
-            cmd->type != WMTComputeCommandDispatch) shape.compute_commands_complete = false;
-        if (cmd->type == WMTComputeCommandDispatch) {
+            cmd->type != WMTComputeCommandDispatch && !indirect) shape.compute_commands_complete = false;
+        if (cmd->type == WMTComputeCommandDispatch || indirect) {
           if (dispatch_index >= compute.dispatch_accesses.size() ||
               compute.dispatch_accesses[dispatch_index].command != cmd ||
-              !compute.dispatch_accesses[dispatch_index].complete) shape.dispatch_access_complete = false;
+              !compute.dispatch_accesses[dispatch_index].complete) {
+            shape.dispatch_access_complete = false;
+            // Internal helpers and predicated dispatches do not capture an application argument range.
+            if (indirect) shape.compute_commands_complete = false;
+          }
           ++dispatch_index;
         }
       }
@@ -253,9 +259,17 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
       shape.descriptors_complete = false;
     }
     if (tables && *tables) for (const auto &table : **tables) append_table(shape, table, stages);
+    for (auto &dispatch : shape.dispatches)
+      dispatch.uses_pass_descriptors = dispatch.descriptors == shape.descriptors;
+    if (record->type == EncoderType::FenceBarrier) {
+      const auto *barrier = static_cast<const FenceBarrierEncoderData *>(record);
+      fence_barriers.push_back(barrier);
+      fence_operand_count += barrier->operands.size();
+    }
     rtas += record->type == EncoderType::Raytracing;
     indices.emplace(record,shapes.size()); shapes.push_back(std::move(shape));
   }
+  head.fence_barriers = std::move(fence_barriers); head.fence_operand_count = fence_operand_count;
   head.pass_shapes = std::move(shapes); head.pass_indices = std::move(indices); head.raytracing_passes = rtas;
   owned_graphics::Trace("recording_plan_sealed", ",\"allocator\":", trace_id_,
       ",\"passes\":", head.pass_shapes.size(), ",\"descriptor_values_captured\":0");

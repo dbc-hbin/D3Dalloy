@@ -13,6 +13,8 @@
 
 #include <algorithm>
 
+#include "llvm/ADT/STLExtras.h"
+
 #include "air_signature.hpp"
 #include "capture_frontier.hpp"
 #include "airconv_context.hpp"
@@ -1082,7 +1084,8 @@ llvm::Error lower_store_output(
     return llvm::Error::success();
   }
 
-  if (signature.raw_half_outputs && element->comp_type == kComponentFloat16 && value->getType()->isHalfTy())
+  if (element->comp_type == kComponentFloat16 && value->getType()->isHalfTy() &&
+      llvm::is_contained(signature.raw_half_outputs, element->element_id))
     value = builder.CreateZExt(builder.CreateBitCast(value, builder.getInt16Ty()), builder.getInt32Ty());
   else
     value = widen_io_value(builder, value, element->comp_type);

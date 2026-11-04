@@ -4,6 +4,12 @@ struct HalfInput {
   float4 position : POSITION;
   float16_t4 value : HALFVALUE;
 };
+// A producer may export an additional native-half semantic that the hull shader does not read.
+struct HalfVertex {
+  float4 position : POSITION;
+  float16_t4 value : HALFVALUE;
+  float16_t spare : UNUSED_HALF;
+};
 struct HalfOutput {
   float4 position : POSITION;
   uint valid : CHECK;
@@ -18,11 +24,12 @@ struct HalfPixel {
   nointerpolation uint valid : CHECK;
 };
 
-HalfInput vs_half(float2 position : POSITION, uint id : SV_VertexID) {
-  HalfInput o;
+HalfVertex vs_half(float2 position : POSITION, uint id : SV_VertexID) {
+  HalfVertex o;
   o.position = float4(position, 0, 1);
   uint4 bits = (asuint(edges.x) + id * 4 + uint4(0, 1, 2, 3)) & 0xffff;
   o.value = asfloat16(uint16_t4(bits));
+  o.spare = o.value.x;
   return o;
 }
 uint check_half(HalfInput input, uint id) {

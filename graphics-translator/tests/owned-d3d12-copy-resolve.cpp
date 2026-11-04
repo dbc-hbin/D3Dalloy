@@ -177,9 +177,17 @@ int main() {
   check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &msaaDesc,
                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                         IID_PPV_ARGS(&predicateSnapshotMsaa)), "Create snapshot MSAA texture");
-  check(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &resolvedDesc,
-                                        D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue,
-                                        IID_PPV_ARGS(&resolved)), "Create resolve texture");
+  // The resolve and subsequent copy must track the nonzero physical heap range.
+  const auto allocation = device->GetResourceAllocationInfo(0, 1, &resolvedDesc);
+  D3D12_HEAP_DESC resolveHeapDesc{};
+  resolveHeapDesc.Properties = defaultHeap;
+  resolveHeapDesc.SizeInBytes = allocation.Alignment + allocation.SizeInBytes;
+  resolveHeapDesc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+  ComPtr<ID3D12Heap> resolveHeap;
+  check(device->CreateHeap(&resolveHeapDesc, IID_PPV_ARGS(&resolveHeap)), "Create resolve heap");
+  check(device->CreatePlacedResource(resolveHeap.Get(), allocation.Alignment, &resolvedDesc,
+                                     D3D12_RESOURCE_STATE_RENDER_TARGET, &clearValue,
+                                     IID_PPV_ARGS(&resolved)), "Create placed resolve texture");
   device->CreateRenderTargetView(msaa.Get(), nullptr, msaaRtv);
   device->CreateRenderTargetView(resolved.Get(), nullptr, resolvedRtv);
   device->CreateRenderTargetView(predicateFalseMsaa.Get(), nullptr, predicateFalseRtv);

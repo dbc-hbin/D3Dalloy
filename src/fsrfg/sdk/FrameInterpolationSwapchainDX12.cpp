@@ -287,16 +287,6 @@ using PresentType = FrameinterpolationPresentInfoExt;
 using PresentCallbackType = ffxCallbackDescFrameGenerationPresent;
 
 // D3Dalloy: TEST shares PresentResource's validation without consuming a frame or latency credit.
-bool canPresentSource(IDXGISwapChain4* swapChain, ID3D12Resource* source)
-{
-    IMTLD3D12ResourcePresent* direct = nullptr;
-    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&direct))))
-        return false;
-    const HRESULT hr = direct->PresentResource(source, 0, DXGI_PRESENT_TEST, TRUE);
-    direct->Release();
-    return SUCCEEDED(hr);
-}
-
 void setSwapChainBufferResourceInfo(IDXGISwapChain4* swapChain, bool isInterpolated)
 {
     uint32_t        currBackbufferIndex = swapChain->GetCurrentBackBufferIndex();
@@ -338,7 +328,7 @@ HRESULT compositeSwapChainFrame(PresentType* presenter, PacingData* pacingEntry,
     frameInfo.presentSourceDirectly =
         !pacingEntry->drawDebugPacingLines && !pacingEntry->uiSurface.resource &&
         pacingEntry->presentCallback == ffxFrameInterpolationUiComposition &&
-        canPresentSource(presenter->swapChain, static_cast<ID3D12Resource*>(frameInfo.resource.resource));
+        presenter->direct && presenter->direct->CanPresentResource(static_cast<ID3D12Resource*>(frameInfo.resource.resource));
     if (frameInfo.presentSourceDirectly)
     {
         presenter->presentQueue->Signal(presenter->compositionFenceGPU, frameInfo.presentIndex);
@@ -403,30 +393,18 @@ void presentToSwapChain(PresentType* presenter, PacingData* pacingEntry, FrameTy
     const typename PacingData::FrameInfo& frameInfo = pacingEntry->frames[frameType];
 
     const UINT uSyncInterval            = pacingEntry->vsync ? 1 : 0;
-    const bool bExclusiveFullscreen     = isExclusiveFullscreen(presenter->swapChain);
-    const bool bSetAllowTearingFlag     = pacingEntry->tearingSupported && !bExclusiveFullscreen && (0 == uSyncInterval);
+    const bool bSetAllowTearingFlag = pacingEntry->tearingSupported && !uSyncInterval &&
+        !isExclusiveFullscreen(presenter->swapChain);
     const UINT uFlags                   = bSetAllowTearingFlag * DXGI_PRESENT_ALLOW_TEARING;
 
     // AntiLag2 AMD driver transport is not part of the host adapter.
     // An interpolated frame followed by its real member belongs to that real
     // frame: only the real Present ends the application frame on D3Dalloy.
-    IMTLD3D12GeneratedPresent* generated = nullptr;
     if (frameInfo.presentSourceDirectly)
-    {
-        IMTLD3D12ResourcePresent* direct = nullptr;
-        if (SUCCEEDED(presenter->swapChain->QueryInterface(IID_PPV_ARGS(&direct))))
-        {
-            direct->PresentResource(static_cast<ID3D12Resource*>(frameInfo.resource.resource), uSyncInterval, uFlags,
-                                    !(frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent));
-            direct->Release();
-        }
-    }
-    else if (frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent &&
-        SUCCEEDED(presenter->swapChain->QueryInterface(__uuidof(IMTLD3D12GeneratedPresent), reinterpret_cast<void**>(&generated))))
-    {
-        generated->PresentGenerated(uSyncInterval, uFlags);
-        generated->Release();
-    }
+        presenter->direct->PresentResource(static_cast<ID3D12Resource*>(frameInfo.resource.resource), uSyncInterval, uFlags,
+            !(frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent));
+    else if (frameType == FrameType::Interpolated_1 && pacingEntry->frames[FrameType::Real].doPresent && presenter->generated)
+        presenter->generated->PresentGenerated(uSyncInterval, uFlags);
     else
         presenter->swapChain->Present(uSyncInterval, uFlags);
 
@@ -741,6 +719,8 @@ HRESULT FrameInterpolationSwapChainDX12::init(HWND                              
             if (SUCCEEDED(hr = pSwapChain1->QueryInterface(IID_PPV_ARGS(&presentInfo.swapChain))))
             {
 
+                pSwapChain1->QueryInterface(IID_PPV_ARGS(&presentInfo.direct));
+                pSwapChain1->QueryInterface(IID_PPV_ARGS(&presentInfo.generated));
                 SafeRelease(pSwapChain1);
             }
             else
@@ -876,6 +856,8 @@ HRESULT FrameInterpolationSwapChainDX12::shutdown()
         SafeRelease(presentInfo.compositionFenceGPU);
         SafeRelease(presentInfo.compositionFenceCPU);
 
+        SafeRelease(presentInfo.generated);
+        SafeRelease(presentInfo.direct);
         std::ignore = SafeRelease(presentInfo.swapChain);
 
         if (presentInfo.gameFence)
@@ -1343,15 +1325,12 @@ void FrameInterpolationSwapChainDX12::presentWithUiComposition(UINT SyncInterval
         !presentInfo.currentUiSurface.resource &&
         (!(presentInfo.uiCompositionFlags & FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING) ||
          !uiReplacementBuffer.resource) &&
-        canPresentSource(presentInfo.swapChain, replacementSwapBuffers[replacementSwapBufferIndex].resource))
+        presentInfo.direct && presentInfo.direct->CanPresentResource(replacementSwapBuffers[replacementSwapBufferIndex].resource))
     {
-        IMTLD3D12ResourcePresent* direct = nullptr;
-        presentInfo.swapChain->QueryInterface(IID_PPV_ARGS(&direct));
         ++framesSentForPresentation;
         presentInfo.presentQueue->Signal(presentInfo.compositionFenceGPU, framesSentForPresentation);
         presentInfo.compositionFenceCPU->Signal(framesSentForPresentation);
-        direct->PresentResource(replacementSwapBuffers[replacementSwapBufferIndex].resource, SyncInterval, Flags, TRUE);
-        direct->Release();
+        presentInfo.direct->PresentResource(replacementSwapBuffers[replacementSwapBufferIndex].resource, SyncInterval, Flags, TRUE);
         presentInfo.presentQueue->Signal(presentInfo.sourceReleaseFence, framesSentForPresentation);
         presentInfo.presentQueue->Signal(presentInfo.presentFence, framesSentForPresentation);
         presentInfo.gameQueue->Wait(presentInfo.presentFence, framesSentForPresentation);

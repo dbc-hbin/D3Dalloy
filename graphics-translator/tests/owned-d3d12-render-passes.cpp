@@ -967,6 +967,28 @@ void clearPreserve() {
         ExitProcess(1);
       }
   std::printf("%s_CLEAR_PRESERVE pixel=%08x\n", kPrefix, out.at<uint32_t>(0, 0));
+  // An unconditional full clear kills the previous draw. Capture the partial-clear case
+  // separately: its untouched pixels still need the first pass's store.
+  for (bool partial : {false, true}) {
+    auto commands = c.list();
+    transition(commands.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commands.list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    commands.list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    add.draw(commands.list.Get(), 4, 4, red);
+    D3D12_RECT left{0, 0, 2, 4};
+    const float blue[] = {0, 0, 1, 1};
+    commands.list->ClearRenderTargetView(rtv, blue, partial ? 1 : 0, partial ? &left : nullptr);
+    transition(commands.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto pixels = copyOut(c.dev.Get(), commands.list.Get(), rt.Get());
+    c.execute({commands.list.Get()});
+    for (UINT y = 0; y < 4; ++y)
+      for (UINT x = 0; x < 4; ++x)
+        if (pixels.at<uint32_t>(x, y) != (partial && x >= 2 ? 0xff400080u : 0xffff0000u)) {
+          std::fprintf(stderr, "%s_FAIL full/partial store x=%u y=%u partial=%d got=%08x\n",
+                       kPrefix, x, y, partial, pixels.at<uint32_t>(x, y));
+          ExitProcess(1);
+        }
+  }
   pass("clear-then-preserve");
 }
 

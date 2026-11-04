@@ -734,29 +734,30 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     }
   }
   if (kind == PipelineKind::TessellationObject && stages[0].info && stages[1].info) {
-    // Only this register file is wholly inside one compiled object function.
-    // Native F16 container signatures must agree in both directions. Mixed
-    // bytecode, minimum precision, position and raster varyings keep float32.
+    // Match whole elements in both directions: an HS load may index its row dynamically.
+    // Unconsumed VS outputs and separately packed neighbours do not affect a matched element.
     const auto &outputs = stages[0].info->output_sig;
     const auto &inputs = stages[1].info->input_sig;
-    const auto matching_half = [](const SigElement &element, const std::vector<SigElement> &other) {
-      return element.semantic_kind == 0 && std::any_of(other.begin(), other.end(), [&](const SigElement &match) {
-        return match.comp_type == element.comp_type && match.semantic_kind == element.semantic_kind &&
-               match.name == element.name && match.semantic_index == element.semantic_index &&
-               match.start_row == element.start_row && match.start_col == element.start_col &&
-               match.rows == element.rows && match.mask == element.mask;
+    auto same_row = [](const SigElement &a, const SigElement &b) {
+      return a.comp_type == 6 && b.comp_type == 6 && !a.semantic_kind && !b.semantic_kind &&
+             a.name == b.name && a.semantic_index == b.semantic_index && a.start_row == b.start_row &&
+             a.start_col == b.start_col && a.element_row == b.element_row && a.rows == b.rows && a.mask == b.mask;
+    };
+    auto covers = [&](const auto &from, uint32_t id, const auto &to, uint32_t other_id) {
+      return std::all_of(from.begin(), from.end(), [&](const SigElement &row) {
+        return row.id != id || std::any_of(to.begin(), to.end(), [&](const SigElement &other) {
+          return other.id == other_id && same_row(row, other);
+        });
       });
     };
-    bool has_half = false, compatible = true;
-    for (const auto &element : outputs)
-      if (element.comp_type == 6) { // D3D_REGISTER_COMPONENT_FLOAT16
-        has_half = true;
-        compatible &= matching_half(element, inputs);
-      }
-    for (const auto &element : inputs)
-      if (element.comp_type == 6)
-        compatible &= matching_half(element, outputs);
-    stages[0].vertex_signature.raw_half_outputs = stages[1].raw_half_inputs = has_half && compatible;
+    for (const auto &out : outputs) {
+      if (out.element_row || out.comp_type != 6 || out.semantic_kind) continue;
+      auto in = std::find_if(inputs.begin(), inputs.end(), [&](const SigElement &row) { return same_row(out,row); });
+      if (in == inputs.end() || !covers(outputs, out.id, inputs, in->id) ||
+          !covers(inputs, in->id, outputs, out.id)) continue;
+      stages[0].vertex_signature.raw_half_outputs.push_back(out.id);
+      stages[1].raw_half_inputs.push_back(in->id);
+    }
   }
   for (auto &stage : stages) {
     if (!stage.info)

@@ -182,7 +182,7 @@ struct FsrLibrary {
     mutable id<MTLLibrary> library = nil;
     mutable id<MTLComputePipelineState> exposure = nil;
     mutable std::mutex pipelineMutex;
-    mutable std::array<std::pair<NSString*, id<MTLComputePipelineState>>, 10> pipelines{};
+    mutable std::array<std::pair<NSString*, id<MTLComputePipelineState>>, 11> pipelines{};
 
     bool ensureLibrary() const noexcept {
         std::lock_guard lock(pipelineMutex);
@@ -554,6 +554,7 @@ struct Feature::Impl {
     id<MTLComputePipelineState> linearizeAlphaPipeline = nil;
     id<MTLComputePipelineState> combineMaskPipeline = nil;
     id<MTLComputePipelineState> finishPipeline = nil;
+    id<MTLComputePipelineState> pairedRcasPipeline = nil;
     id<MTLComputePipelineState> alphaPipeline = nil;
     id<MTLComputePipelineState> debugPipeline = nil;
     id<MTLComputePipelineState> debugDepthPipeline = nil;
@@ -865,6 +866,7 @@ struct Feature::Impl {
         releaseObject(debugDepthPipeline);
         releaseObject(debugPipeline);
         releaseObject(alphaPipeline);
+        releaseObject(pairedRcasPipeline);
         releaseObject(finishPipeline);
         releaseObject(combineMaskPipeline);
         releaseObject(linearizePipeline);
@@ -998,6 +1000,7 @@ struct PreparedFrame::Impl {
     NSUInteger placementY = 0;
     bool cappedOutput = false;
     bool directCenter = false;
+    bool pairedRcas = false;
     // Caller-backed views live with this immutable frame, never with the feature pool.
     id<MTLTexture> directAlphaView = nil;
     bool allowScratchAlphaView = false;
@@ -2275,7 +2278,14 @@ bool encodeFsrFinishMetal4(const PreparedFrame::Impl& frame, ExecutionLease::Imp
             isDepthPixelFormat(frame.depth.pixelFormat)
                 ? frame.feature->debugDepthPipeline : frame.feature->debugPipeline,
             lease.debugParams, lease.privateOutput, frame.depth, frame.motion, frame.frame.outputRect, frame.output);
-    // Unchanged scalar arithmetic; only the large RCAS dispatch shape changes.
+    if (frame.pairedRcas) {
+        Rect grid = frame.frame.outputRect;
+        grid.width /= 2;
+        return encodeFsrPassMetal4(lease, command, fence, frame.feature->pairedRcasPipeline,
+            lease.finishParams, lease.privateOutput, frame.output, nil, grid, nil,
+            uint64_t(frame.temporalOutputWidth) * frame.temporalOutputHeight >= 2560u * 1440u
+                ? MTLSizeMake(16, 8, 1) : kFsrDefaultThreadgroup);
+    }
     auto group = kFsrDefaultThreadgroup;
     if (frame.operations.sharpening && !frame.cappedOutput &&
         frame.operations.colorTransfer == ColorTransfer::Linear && !lease.alphaOutput && !frame.exposure &&
@@ -2629,6 +2639,19 @@ std::shared_ptr<const PreparedFrame> Feature::prepare(
         // The debug view replaces the finish pass.
         needs.finish = !needs.debug &&
                        (needs.linearize || operations.sharpening || temporal.capped || generation->alphaScaler);
+        // Non-unit exposure changes RCAS rounding near UNORM thresholds.
+        // An even-width scratch image gives every thread two valid centers.
+        if (operations.sharpening && !needs.debug && !needs.linearize && !temporal.capped &&
+            !generation->alphaScaler && !exposure && info.preExposure == 1.0f && !(temporal.width & 1u) &&
+            uint64_t(temporal.width) * temporal.height >= 1920u * 1080u &&
+            output.pixelFormat == MTLPixelFormatRGBA8Unorm &&
+            (impl_->pairedRcasPipeline || (ensureFsrLibrary(*impl_) &&
+             ensureFsrPipeline(*impl_, true, impl_->pairedRcasPipeline, @"yaagl_sr_rcas_pair"))) &&
+            impl_->pairedRcasPipeline.threadExecutionWidth == 32 &&
+            impl_->pairedRcasPipeline.maxTotalThreadsPerThreadgroup >= 128) {
+            frame->pairedRcas = true;
+            needs.finish = false;
+        }
         needs.padding = needs.linearize && smallerThanInputCapacity;
         // Both passes read the same color subrect. Keep alpha linear and the
         // existing converted-color padding; only the redundant read/dispatch goes.

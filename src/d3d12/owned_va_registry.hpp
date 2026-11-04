@@ -24,6 +24,7 @@ template<class Owner> class OwnedVARegistry {
   };
   struct NoAliases { bool operator()(const Owner &, const Owner &) const { return false; } };
   std::map<uint64_t,Entry> intervals_;
+  mutable std::shared_ptr<const std::vector<Owner>> snapshot_;
   mutable std::shared_mutex mutex_;
   std::atomic<uint64_t>& generation_;
 public:
@@ -39,6 +40,7 @@ public:
               size_t *alias_members = nullptr) {
     if (alias_members) *alias_members = 0;
     if (!owner || !length || length > UINT64_MAX-address) return false;
+    decltype(snapshot_) previous; // Drop obsolete pins after unlocking.
     std::unique_lock lock(mutex_);
     auto [where, inserted] = intervals_.try_emplace(address, length, std::move(owner));
     if (!inserted) {
@@ -56,9 +58,11 @@ public:
       }
       if (alias_members) *alias_members = size_t(entry.original_registered) + entry.aliases->size();
     }
+    previous = std::move(snapshot_);
     generation_.fetch_add(1,std::memory_order_release);return true;
   }
   Removal Remove(uint64_t address,const Owner &expected) {
+    decltype(snapshot_) previous; // Drop obsolete pins after unlocking.
     std::unique_lock lock(mutex_);auto it=intervals_.find(address);
     if (it == intervals_.end() || !expected) return {};
     auto &entry = it->second;
@@ -78,6 +82,7 @@ public:
       result.retired_identity = std::move(entry.owner);
       intervals_.erase(it);
     }
+    previous = std::move(snapshot_);
     generation_.fetch_add(1,std::memory_order_release);return result;
   }
   Pin Lookup(uint64_t address) const {
@@ -90,19 +95,21 @@ public:
     result.owner=it->second.owner;result.offset=offset;result.begin=it->first;
     result.end=it->first+std::min(it->second.length,next-it->first);return result;
   }
-  std::vector<Owner> Snapshot() const {
-    // Keep the result outside the lock scope: allocation/copy failure releases
-    // the registry lock before unwinding any owners that were already pinned.
-    std::vector<Owner> owners;
+  std::shared_ptr<const std::vector<Owner>> Snapshot() const {
     {
       std::shared_lock lock(mutex_);
-      owners.reserve(intervals_.size());
-      for (const auto& [address,entry] : intervals_) {
-        owners.push_back(entry.owner);
-        if (entry.aliases) owners.insert(owners.end(), entry.aliases->begin(), entry.aliases->end());
-      }
+      if (snapshot_) return snapshot_;
     }
-    return owners;
+    // Also keep partial pins alive until the lock unwinds if a copy fails.
+    auto owners = std::make_shared<std::vector<Owner>>();
+    std::unique_lock lock(mutex_);
+    if (snapshot_) return snapshot_;
+    owners->reserve(intervals_.size());
+    for (const auto &[address, entry] : intervals_) {
+      owners->push_back(entry.owner);
+      if (entry.aliases) owners->insert(owners->end(), entry.aliases->begin(), entry.aliases->end());
+    }
+    return snapshot_ = std::move(owners);
   }
 };
 } // namespace d3dalloy

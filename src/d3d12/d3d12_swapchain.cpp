@@ -117,7 +117,7 @@ D3DalloyPresentLatency::cancel() {
 }
 
 void
-D3DalloyPresentLatency::complete(HANDLE semaphore) {
+D3DalloyPresentLatency::complete() {
   {
     std::lock_guard lock(mutex_);
     assert(outstanding_);
@@ -125,7 +125,7 @@ D3DalloyPresentLatency::complete(HANDLE semaphore) {
     if (credit_debt_)
       --credit_debt_;
     else
-      ReleaseSemaphore(semaphore, 1, nullptr);
+      ReleaseSemaphore(wake_semaphore_, 1, nullptr);
   }
   cv_.notify_all();
 }
@@ -255,7 +255,7 @@ public:
 
 class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D12Device>,
                               public IMTLDXGICompositionSurface,
-                              public IMTLD3D12GeneratedPresent, public IMTLD3D12ResourcePresent {
+                              public IMTLD3D12GeneratedPresent, public IMTLD3D12ResourcePresent1 {
 
   Com<IDXGIFactory1> factory_;
   Com<MTLD3D12CommandQueue> queue_;
@@ -558,6 +558,11 @@ public:
     }
     if (riid == __uuidof(IMTLD3D12GeneratedPresent)) {
       *ppvObject = static_cast<IMTLD3D12GeneratedPresent *>(this);
+      AddRef();
+      return S_OK;
+    }
+    if (riid == __uuidof(IMTLD3D12ResourcePresent1)) {
+      *ppvObject = static_cast<IMTLD3D12ResourcePresent1 *>(this);
       AddRef();
       return S_OK;
     }
@@ -1258,6 +1263,28 @@ public:
     return PresentImpl(SyncInterval, Flags, nullptr, false, nullptr, true);
   }
 
+  bool ValidPresentResource(ID3D12Resource *source) const {
+    Com<ID3D12Device> owner;
+    const auto desc = source->GetDesc();
+    if (FAILED(source->GetDevice(IID_PPV_ARGS(&owner))) ||
+        owner.ptr() != static_cast<ID3D12Device *>(device_) ||
+        desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD ||
+        desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+        desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
+        desc.Width != backbuffer_desc_.Width || desc.Height != backbuffer_desc_.Height ||
+        desc.Format != backbuffer_desc_.Format || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+      return false;
+    auto *owned = static_cast<MTLD3D12Resource *>(source);
+    if (!owned->texture || !owned->texture->current())
+      return false;
+    return true;
+  }
+
+  BOOL STDMETHODCALLTYPE CanPresentResource(ID3D12Resource *source) final {
+    std::lock_guard<d3dalloy::mutex> lock(mutex_);
+    return source && device_->RemovedReason() == S_OK && ValidPresentResource(source);
+  }
+
   HRESULT STDMETHODCALLTYPE PresentResource(ID3D12Resource *source, UINT sync, UINT flags, BOOL closes_frame) final {
     if (!source)
       return E_INVALIDARG;
@@ -1279,21 +1306,8 @@ public:
     }
     if (device_->RemovedReason() != S_OK)
       return DXGI_ERROR_DEVICE_REMOVED;
-    if (source) {
-      Com<ID3D12Device> owner;
-      const auto desc = source->GetDesc();
-      if (FAILED(source->GetDevice(IID_PPV_ARGS(&owner))) ||
-          owner.ptr() != static_cast<ID3D12Device *>(device_) ||
-          desc_.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD ||
-          desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
-          desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality != 0 ||
-          desc.Width != backbuffer_desc_.Width || desc.Height != backbuffer_desc_.Height ||
-          desc.Format != backbuffer_desc_.Format || (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
-        return E_INVALIDARG;
-      auto *owned = static_cast<MTLD3D12Resource *>(source);
-      if (!owned->texture || !owned->texture->current())
-        return E_INVALIDARG;
-    }
+    if (source && !ValidPresentResource(source))
+      return E_INVALIDARG;
     if (kind_ != D3DalloySwapChainKind::Composition && !wsi::isWindow(hWnd))
       return DXGI_ERROR_INVALID_CALL;
     if (SyncInterval > 4)
@@ -1430,7 +1444,7 @@ public:
     geometry.destination_height = drawable_height_ * scale_factor;
     geometry.rotation = rotation_;
     geometry.scaling_none = desc_.Scaling == DXGI_SCALING_NONE;
-    geometry.right_to_left = hWnd && (::GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
+    geometry.right_to_left = geometry.scaling_none && hWnd && (::GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_LAYOUTRTL);
     geometry.background[0] = background_.r;
     geometry.background[1] = background_.g;
     geometry.background[2] = background_.b;
@@ -1465,19 +1479,22 @@ public:
       }
     }
 
-    double refresh_rate = init_refresh_rate_;
-    if (composition_surface_) {
-      WMTDisplayRefreshSample sample{};
-      if (presentation_observer_.getRefreshSample(sample) && sample.video_refresh_period > 0 &&
-          sample.video_time_scale > 0 && std::isfinite(sample.rate_scalar) && sample.rate_scalar > 0)
-        refresh_rate = double(sample.video_time_scale) * sample.rate_scalar / sample.video_refresh_period;
-    }
-    const double cadence = preferred_max_frame_rate > 0 ? preferred_max_frame_rate : refresh_rate;
     double vsync_duration = 0;
-    // An unattached composition surface has no display cadence. Use the normal
-    // native Present path until attachment provides one; never divide a sentinel.
-    if (!(PresentFlags & DXGI_PRESENT_ALLOW_TEARING) && std::isfinite(cadence) && cadence > 0)
-      vsync_duration = std::max(SyncInterval / cadence, preferred_max_frame_rate > 0 ? 1.0 / cadence : 0);
+    if (!(PresentFlags & DXGI_PRESENT_ALLOW_TEARING)) {
+      if (preferred_max_frame_rate > 0) {
+        vsync_duration = double(std::max(SyncInterval, 1u)) / preferred_max_frame_rate;
+      } else if (SyncInterval) {
+        double cadence = init_refresh_rate_;
+        if (composition_surface_) {
+          WMTDisplayRefreshSample sample{};
+          if (presentation_observer_.getRefreshSample(sample) && sample.video_refresh_period > 0 &&
+              sample.video_time_scale > 0 && std::isfinite(sample.rate_scalar) && sample.rate_scalar > 0)
+            cadence = double(sample.video_time_scale) * sample.rate_scalar / sample.video_refresh_period;
+        }
+        if (std::isfinite(cadence) && cadence > 0)
+          vsync_duration = SyncInterval / cadence;
+      }
+    }
 
     auto *backbuffer = source ? static_cast<MTLD3D12Resource *>(source) : backbuffers_[current_buffer_].ptr();
     auto &present_queue = present_queues_[current_buffer_];

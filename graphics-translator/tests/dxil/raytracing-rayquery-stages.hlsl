@@ -59,7 +59,7 @@ void launch(float x, uint flags) {
   ray.TMin = 0; ray.TMax = 100; RPayload p; p.unused = 0;
   TraceRay(Scene, flags, 0xff, 0, 1, 0, ray, p);
 }
-[shader("raygeneration")] void RQSClosestGen() { launch(10.5, RAY_FLAG_FORCE_OPAQUE); }
+[shader("raygeneration")] void RQSClosestGen() { launch(10.5, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES); }
 [shader("raygeneration")] void RQSAnyGen() { launch(10.5, RAY_FLAG_FORCE_NON_OPAQUE); }
 [shader("raygeneration")] void RQSIntersectionGen() { launch(30.5, RAY_FLAG_FORCE_OPAQUE); }
 [shader("raygeneration")] void RQSMissGen() { launch(50.5, RAY_FLAG_NONE); }

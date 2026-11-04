@@ -74,6 +74,31 @@ inline void copy_shadow_linear(device uchar *dst, device const uchar *src,
   }
 }
 
+// Gather only documented metadata spans. The CPU parser still validates the wire format
+// and all relocation records. Larger geometry tables use one additional exact-range blit.
+kernel void d3dalloy_as_gather_metadata(device const uchar *src [[buffer(0)]], device uchar *packet [[buffer(1)]],
+                                        constant ulong2 &limits [[buffer(2)]], uint lane [[thread_position_in_grid]]) {
+  constexpr ulong prefix = 56, block = 16, header = sizeof(ASHeader);
+  copy_shadow_linear(packet, src, prefix, prefix, lane, 32);
+  const ulong size = *(device const ulong *)(src + 32);
+  ulong pointers = *(device const ulong *)(src + 48), offset = prefix;
+  if (size < prefix + header || size > limits.x) return;
+  if ((pointers >> 32) == 0xffffffffu) {
+    if (pointers != 0xffffffff00000001ul || size < prefix + block + header) return;
+    copy_shadow_linear(packet + prefix, src + prefix, block, block, lane, 32);
+    if (*(device const uint *)(src + prefix) != 0) return;
+    pointers = *(device const ulong *)(src + prefix + 8);
+    offset += block;
+  }
+  if (pointers > (size - offset - header) / 8) return;
+  offset += 8 * pointers;
+  copy_shadow_linear(packet + prefix + block, src + offset, header, header, lane, 32);
+  device const ASHeader &h = *(device const ASHeader *)(src + offset);
+  const ulong bytes = h.type ? ulong(h.descCount) * sizeof(ShadowGeometry) : 0;
+  if (bytes <= limits.y && bytes <= size - offset - header)
+    copy_shadow_linear(packet + prefix + block + header, src + offset + header, bytes, bytes, lane, 32);
+}
+
 inline void copy_shadow_element(device uchar *dst, device const uchar *src,
     uint bytes, uint stride) {
   if (bytes == 2 && stride == 4 && (ulong(dst) & 3) == 0 && (ulong(src) & 1) == 0) {
@@ -156,7 +181,8 @@ kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]
   }
 }
 struct SerializeParams { ulong source, destination; uint identifier[8]; };
-kernel void d3dalloy_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_serialize(constant SerializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]],
+    uint lanes [[threads_per_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   const ulong pointers = h->type == 0 ? h->descCount : 0;
   const ulong ommPointers = h->type == 1 && h->reserved0 ? h->reserved0 - 1 : 0;
@@ -176,10 +202,10 @@ kernel void d3dalloy_as_serialize(constant SerializeParams &p [[buffer(0)]], uin
     for (uint i = 0; i < h->descCount; ++i)
       if (g[i].ommArrayAddress) ((device ulong *)(dst + 72))[pointer++] = g[i].ommArrayAddress;
   }
-  for (ulong i = tid; i < pointers; i += 4096)
+  for (ulong i = tid; i < pointers; i += lanes)
     ((device ulong *)(dst + 56))[i] = ((device const ulong *)(p.source + 64 + i * 64))[7];
-  for (ulong i = tid; i < 64 + h->shadowSize; i += 4096)
-    dst[offset + i] = ((device const uchar *)h)[i];
+  const ulong bytes = 64 + h->shadowSize;
+  copy_shadow_linear(dst + offset, (device const uchar *)h, bytes, bytes, tid, lanes);
 }
 struct DeserializeParams { ulong source, destination, currentSize; };
 kernel void d3dalloy_as_deserialize(constant DeserializeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
@@ -206,13 +232,13 @@ kernel void d3dalloy_as_deserialize(constant DeserializeParams &p [[buffer(0)]],
   if (tid == 0) dst->currentSize = p.currentSize;
 }
 struct VisualizeParams { ulong source, destination; };
-kernel void d3dalloy_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+kernel void d3dalloy_as_visualize(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]],
+    uint lanes [[threads_per_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;
   device uchar *dst = (device uchar *)p.destination;
   if (tid == 0) { ((device uint *)dst)[0] = h->type; ((device uint *)dst)[1] = h->descCount; }
   // BLAS geometry descriptors are written by a separate invocation after this payload copy.
-  for (ulong i = tid; i < h->shadowSize; i += 4096)
-    dst[8 + i] = ((device const uchar *)h)[64 + i];
+  copy_shadow_linear(dst + 8, (device const uchar *)h + 64, h->shadowSize, h->shadowSize, tid, lanes);
 }
 kernel void d3dalloy_as_visualize_descriptors(constant VisualizeParams &p [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   device const ASHeader *h = (device const ASHeader *)p.source;

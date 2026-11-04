@@ -25,6 +25,7 @@ struct Pixel { float x,y,z,w; };
 static id<MTLDevice> gpu;
 static id<MTLCommandQueue> commandQueue;
 static id<MTLLibrary> libraries[2];
+static id<MTLComputePipelineState> compactFilterPSO, compactWritePSO;
 static id<MTLComputePipelineState> geometryPSO, unpackPSO, filterPSO[2], preparePSO[2], resolvePSO, fusedPSO;
 static id<MTLComputePipelineState> commonPSO[2];
 static uint64_t checkedComponents = 0, nonfiniteComponents = 0, failures = 0, checkedImages = 0;
@@ -77,7 +78,10 @@ static id<MTLComputePipelineState> pso(unsigned which,NSString *name) {
 static void encode(id<MTLCommandBuffer> cb,id<MTLComputePipelineState> state,NSArray<id<MTLTexture>>* textures,const RrParams& p) {
   auto e=[cb computeCommandEncoder];[e setComputePipelineState:state];[e setBytes:&p length:sizeof(p) atIndex:0];
   for(NSUInteger i=0;i<textures.count;++i)[e setTexture:textures[i] atIndex:i];
-  [e dispatchThreadgroups:MTLSizeMake((p.width+7)/8,(p.height+7)/8,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+  if(state==filterPSO[0]||state==filterPSO[1]||state==preparePSO[0]||state==preparePSO[1]||state==fusedPSO||state==compactFilterPSO||state==compactWritePSO)
+    [e dispatchThreadgroups:MTLSizeMake((p.width+7)/8,(p.height+7)/8,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
+  else
+    [e dispatchThreads:MTLSizeMake(p.width,p.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
   [e endEncoding];
 }
 static void finish(id<MTLCommandBuffer> cb) {
@@ -86,7 +90,9 @@ static void finish(id<MTLCommandBuffer> cb) {
 }
 static void run(unsigned width,unsigned height,unsigned signal,unsigned variant,unsigned formatIndex,bool timing=false) {
   RrParams p{};p.width=width;p.height=height;p.signal=signal;p.checkerboard=variant&1;
-  p.hasHistory=(variant>>1)&1;p.origin=variant&1;p.flags=variant&2;p.legacyMode=variant==3?3:0;
+  p.hasHistory=(variant>>1)&1;p.origin=variant&1;p.flags=variant&2;
+  // Composite mode permits shadow and indirect specular only.
+  p.legacyMode=variant==3&&(signal==3||signal==5)?3:0;
   p.normalStrength=0.37f;p.stability=0.61f;p.maxRadiance=1024;p.clipK=1.75f;
   p.relaxation=0.3f;p.depthThreshold=0.2f;p.depthMin=0.1f;p.depthMax=12;
   p.motionScale[0]=p.motionScale[1]=p.motionScale[2]=1;
@@ -136,8 +142,8 @@ static void run(unsigned width,unsigned height,unsigned signal,unsigned variant,
       after[i]=texture(tw,th);
     }
     auto common=[commandQueue commandBuffer];
-    encode(common,commonPSO[0],@[depth,input[3],normals,input[4],input[5],before[4],before[5],source,
-                                 before[6],before[7],before[8]],p);
+    encode(common,commonPSO[0],@[input[1],input[3],input[2],input[4],input[5],before[4],before[5],source,
+                                 before[6],before[7],before[8],before[0],before[1],before[2],before[3]],p);
     encode(common,commonPSO[1],@[input[1],input[3],input[2],input[4],input[5],after[4],after[5],source,
                                  after[6],after[7],after[8],after[0],after[1],after[2],after[3]],p);
     finish(common);
@@ -150,8 +156,11 @@ static void run(unsigned width,unsigned height,unsigned signal,unsigned variant,
   NSArray<id<MTLTexture>>* afterBindings=@[source,second,depth,input[3],normals,input[4],input[5],input[7],input[8],input[9],input[6],guide,decoded];
   NSArray<id<MTLTexture>>* fusedBindings=@[source,fusedHistory,depth,input[3],normals,input[4],input[5],input[7],input[8],input[9],input[6],guide,decoded,callerAfter];
   bool scalar=signal==0||signal==3||signal==6;
-  auto cb=[commandQueue commandBuffer];encode(cb,filterPSO[0],beforeBindings,p);encode(cb,filterPSO[1],afterBindings,p);
-  if(scalar){encode(cb,resolvePSO,@[first,callerBefore,source,source],p);encode(cb,fusedPSO,fusedBindings,p);}
+  auto cb=[commandQueue commandBuffer];
+  if(scalar){
+    encode(cb,filterPSO[0],beforeBindings,p);encode(cb,signal==3?filterPSO[1]:compactFilterPSO,afterBindings,p);
+    encode(cb,resolvePSO,@[first,callerBefore,source,source],p);encode(cb,signal==3?fusedPSO:compactWritePSO,fusedBindings,p);
+  }
   std::array<std::array<id<MTLTexture>,7>,2> outputs;
   if(!scalar&&!timing)for(unsigned version=0;version<2;++version){
     for(auto& t:outputs[version])t=texture(tw,th);
@@ -159,16 +168,16 @@ static void run(unsigned width,unsigned height,unsigned signal,unsigned variant,
     encode(cb,preparePSO[version],@[source,depth,input[3],normals,input[4],input[5],input[6],input[8],input[9],input[7],
         o[0],o[1],o[2],o[3],o[4],o[5],o[6],input[10],guide,decoded],p);
   }
-  finish(cb);compare("filter",first,second,p);
-  if(scalar){compare("fused-history",first,fusedHistory,p);compare("fused-caller",callerBefore,callerAfter,p);}
+  finish(cb);
+  if(scalar){compare("filter",first,second,p);compare("fused-history",first,fusedHistory,p);compare("fused-caller",callerBefore,callerAfter,p);}
   else if(!timing)for(unsigned i=0;i<7;++i)compare("neural-prepare",outputs[0][i],outputs[1][i],p);
   if(timing){
     std::array<std::vector<double>,2> samples;
     for(unsigned sample=0;sample<12;++sample)for(unsigned turn=0;turn<2;++turn){
       unsigned which=(sample+turn)&1;auto batch=[commandQueue commandBuffer];
       for(unsigned repeat=0;repeat<3;++repeat){
-        if(which)encode(batch,fusedPSO,fusedBindings,p);
-        else {encode(batch,filterPSO[0],beforeBindings,p);encode(batch,resolvePSO,@[first,callerBefore,source,source],p);}
+        if(which)encode(batch,compactFilterPSO,afterBindings,p);
+        else encode(batch,filterPSO[0],beforeBindings,p);
       }
       finish(batch);double ms=(batch.GPUEndTime-batch.GPUStartTime)*1000/3;if(sample>=3)samples[which].push_back(ms);
       std::printf("RR_SAMPLE sample=%u version=%u gpu_ms=%.9f\n",sample,which,ms);
@@ -188,6 +197,8 @@ int main(int argc,char** argv){@autoreleasepool{
     filterPSO[i]=pso(i,@"rr_filter");preparePSO[i]=pso(i,@"rr_neural_prepare");commonPSO[i]=pso(i,@"rr_neural_common");
   }
   geometryPSO=pso(0,@"rr_geometry");unpackPSO=pso(0,@"rr_unpack");resolvePSO=pso(0,@"rr_resolve_write");fusedPSO=pso(1,@"rr_filter_write");
+  compactFilterPSO=pso(1,@"rr_filter_compact");compactWritePSO=pso(1,@"rr_filter_write_compact");
+  std::printf("RR_STATIC_BYTES baseline=%zu compact=%zu\n",size_t(filterPSO[0].staticThreadgroupMemoryLength),size_t(compactFilterPSO.staticThreadgroupMemoryLength));
   bool timing=argc>3&&!std::strcmp(argv[3],"--timing");
   if(timing)run(1920,1080,6,2,2,true);
   else {unsigned index=0;for(auto extent:std::array<std::array<unsigned,2>,5>{{{1,1},{1,17},{17,1},{19,13},{31,29}}})

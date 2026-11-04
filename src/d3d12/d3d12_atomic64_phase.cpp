@@ -1027,6 +1027,14 @@ HRESULT PrepareAtomic64Phase(MTLD3D12Device *device, uint64_t participant_bound,
           }
         }
         atomic64::IndexRawRanges(storage->ranges);
+        // Keep the original first match when several windows share a Metal ResourceID.
+        auto &views = storage->views;
+        std::stable_sort(views.begin(), views.end(), [](const auto &a, const auto &b) {
+          return a.resourceID < b.resourceID;
+        });
+        views.erase(std::unique(views.begin(), views.end(), [](const auto &a, const auto &b) {
+          return a.resourceID == b.resourceID;
+        }), views.end());
         if (storage->ranges.size() > UINT32_MAX || storage->views.size() > UINT32_MAX) return E_OUTOFMEMORY;
         storage->params.cellCount = storage->cells.Count();
         HRESULT hr = storage->Upload<SM50_ATOMIC64_RAW_RANGE>(storage->ranges, storage->raw_ranges);

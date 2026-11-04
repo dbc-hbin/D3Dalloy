@@ -57,7 +57,7 @@ struct StageSignature {
   std::vector<SignatureSlot> inputs;
   std::vector<SignatureSlot> outputs;
   /** Closed native-F16 VS -> HS register transport, never raster interpolation. */
-  bool raw_half_outputs = false;
+  std::vector<uint32_t> raw_half_outputs;
 
   const SignatureSlot *find_input(uint32_t element_id, uint32_t row) const;
   const SignatureSlot *find_output(uint32_t element_id, uint32_t row) const;

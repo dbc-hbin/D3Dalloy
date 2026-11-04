@@ -279,6 +279,8 @@ static void m4_release_residency(D3DALLOYM4Recording *recording);
   D3DALLOYM4Recording *recording;
   id<MTL4CommandEncoder> encoder;
   BOOL tableReady[4], tableBound[4], compute;
+  uint32_t staleStages, staleBuffers[4];
+  uint64_t staleTextures[4][2];
   id<MTLBuffer> buffers[4][31];
   MTLStages orderedFor[3];
   MTLStages fenceWaitStages;
@@ -519,29 +521,42 @@ static id<MTL4ArgumentTable> m4_table(D3DALLOYM4Encoder *context, unsigned stage
     if (context->recording->trace) ++context->recording->counters.tableNew;
   }
   if (!context->tableReady[stage]) {
-    // New encoders formerly received nil-initialized tables. Restore that contract
-    // before publishing any new binding; prior draws/dispatches own native snapshots.
-    for (uint32_t mask=state->bufferMask;mask;mask&=mask-1) {
+    // Ignore bindings overwritten before the first consumer. Unwritten slots must still appear nil.
+    context->staleBuffers[stage]=state->bufferMask;
+    context->staleTextures[stage][0]=state->textureMask[0];
+    context->staleTextures[stage][1]=state->textureMask[1];
+    if (state->bufferMask || state->textureMask[0] || state->textureMask[1]) context->staleStages|=1u<<stage;
+    context->tableReady[stage]=YES; m4_retain(context->recording,state->table);
+  }
+  return state->table;
+}
+static void m4_flush_stale(D3DALLOYM4Encoder *context) {
+  for (uint32_t stages=context->staleStages;stages;stages&=stages-1) {
+    const unsigned stage=__builtin_ctz(stages);
+    M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
+    for (uint32_t mask=context->staleBuffers[stage];mask;mask&=mask-1) {
       const unsigned i=__builtin_ctz(mask);
       if (state->buffers[i].value) {
         state->address(state->table,@selector(setAddress:atIndex:),0,i);
         if (context->recording->trace) ++context->recording->counters.tableSet;
       }
+      state->bufferMask &= ~(1u<<i);
       state->buffers[i]=(typeof(state->buffers[0])){0};
     }
     for (unsigned word=0;word<2;++word)
-      for (uint64_t mask=state->textureMask[word];mask;mask&=mask-1) {
+      for (uint64_t mask=context->staleTextures[stage][word];mask;mask&=mask-1) {
         const unsigned i=word*64+__builtin_ctzll(mask);
         if (state->textures[i]) {
           state->texture(state->table,@selector(setTexture:atIndex:),(MTLResourceID){0},i);
           if (context->recording->trace) ++context->recording->counters.tableSet;
         }
+        state->textureMask[word] &= ~(1ull<<(i%64));
         state->textures[i]=0;
       }
-    state->bufferMask=0; state->textureMask[0]=state->textureMask[1]=0;
-    context->tableReady[stage]=YES; m4_retain(context->recording,state->table);
+    context->staleBuffers[stage]=0;
+    context->staleTextures[stage][0]=context->staleTextures[stage][1]=0;
   }
-  return state->table;
+  context->staleStages=0;
 }
 static const MTLRenderStages m4_render_stages[4]={MTLRenderStageVertex,MTLRenderStageFragment,MTLRenderStageMesh,MTLRenderStageObject};
 static void m4_render_table(D3DALLOYM4RenderEncoder *context, unsigned stage) {
@@ -562,10 +577,12 @@ static void m4_bind_resource(D3DALLOYM4Encoder *context, unsigned stage, MTLReso
   id<MTL4ArgumentTable> table=m4_table(context,stage); if (!table) return;
   M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
   if (texture) {
+    context->staleTextures[stage][index/64]&=~(1ull<<(index%64));
     if (state->textures[index]==resource._impl) return;
     state->texture(table,@selector(setTexture:atIndex:),resource,index); state->textures[index]=resource._impl;
     state->textureMask[index/64]|=1ull<<(index%64);
   } else {
+    context->staleBuffers[stage]&=~(1u<<index);
     if (state->buffers[index].resource && state->buffers[index].value==resource._impl) return;
     state->resource(table,@selector(setResource:atBufferIndex:),resource,index);
     state->buffers[index]=(typeof(state->buffers[0])){.value=resource._impl,.resource=YES};
@@ -746,12 +763,12 @@ static void m4_bind_buffer(D3DALLOYM4Encoder *context, unsigned stage, id<MTLBuf
   if (index>=31 || (buffer && offset>buffer.length)) { m4_error(context->recording,@"Metal4 buffer binding is out of range"); return; }
   context->buffers[stage][index]=buffer;
   M4TableState *state=&context->owner->tables[context->compute ? 4 : stage];
-  /* A ready table was reset when this encoder (and so this recording) first used it, so a matching
-   * entry was bound, and its allocation leased, by this recording. */
-  if (buffer && context->tableReady[stage] && state->buffers[index].object==buffer &&
+  // A stale matching address still needs a lease from this recording.
+  if (buffer && context->tableReady[stage] && !(context->staleBuffers[stage] & (1u<<index)) && state->buffers[index].object==buffer &&
       !state->buffers[index].resource && state->buffers[index].offset==offset) return;
   m4_allocation(context->recording,buffer);
   id<MTL4ArgumentTable> table=m4_table(context,stage); if (!table) return;
+  context->staleBuffers[stage]&=~(1u<<index);
   uint64_t address=buffer ? buffer.gpuAddress+offset : 0;
   if (!state->buffers[index].resource && state->buffers[index].value==address &&
       state->buffers[index].object==buffer && state->buffers[index].offset==offset) return;
@@ -1048,6 +1065,7 @@ static int32_t m4_as_call(struct WMTMetal4Call *call) {
     m4_compute_buffer(context,constants,offset,4); m4_compute_buffer(context,m4obj(a[10]),a[11],5);
     NSUInteger threads=info->convert_instances?MAX(info->instance_count,1u):1u;
     m4_stage_barrier(context,MTLStageDispatch);
+    if (context->staleStages) m4_flush_stale(context);
     [encoder dispatchThreads:MTLSizeMake(threads,1,1) threadsPerThreadgroup:MTLSizeMake(MIN(threads,state.maxTotalThreadsPerThreadgroup),1,1)];
     call->ret[0]=1; return M4_SUCCESS;
   }
@@ -1466,19 +1484,19 @@ int32_t winemetal_metal4_call(void *params) {
 static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const struct wmtcmd_base *next, uint64_t independent) {
   id<MTL4ComputeCommandEncoder> encoder=(id<MTL4ComputeCommandEncoder>)context->encoder;
   while (next) {
+    if (independent && (next->type==WMTComputeCommandDispatch || next->type==WMTComputeCommandDispatchIndirect)) {
+      // Bits follow the sealed dispatch order. Only the Dispatch -> Dispatch dependency may be elided.
+      if (independent & 1) context->orderedFor[0] |= MTLStageDispatch;
+      independent >>= 1;
+    }
     switch ((enum WMTComputeCommandType)next->type) {
     case WMTComputeCommandNop: break;
     case WMTComputeCommandDispatch:
     case WMTComputeCommandDispatchThreads: {
       const struct wmtcmd_compute_dispatch *body=(const void *)next;
       MTLSize size=MTLSizeMake(body->size.width,body->size.height,body->size.depth);
-      if (next->type==WMTComputeCommandDispatch) {
-        // The planner proved only the Dispatch -> Dispatch edge unnecessary.
-        // All other pending stages retain their original ordering.
-        if (independent & 1) context->orderedFor[0] |= MTLStageDispatch;
-        independent >>= 1;
-      }
       m4_stage_barrier(context,MTLStageDispatch);
+      if (context->staleStages) m4_flush_stale(context);
       if (next->type==WMTComputeCommandDispatch) [encoder dispatchThreadgroups:size threadsPerThreadgroup:context->threadgroupSize];
       else [encoder dispatchThreads:size threadsPerThreadgroup:context->threadgroupSize];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_DISPATCH encoder=%llu pso=%llu mode=%s grid_x=%lu grid_y=%lu grid_z=%lu threads_x=%lu threads_y=%lu threads_z=%lu\n",
@@ -1491,6 +1509,7 @@ static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const stru
     case WMTComputeCommandDispatchIndirect: {
       const struct wmtcmd_compute_dispatch_indirect *body=(const void *)next;
       m4_stage_barrier(context,MTLStageDispatch);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder dispatchThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->indirect_args_buffer,body->indirect_args_offset)
                               threadsPerThreadgroup:context->threadgroupSize];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT encoder=%llu pso=%llu argument_buffer=%llu argument_offset=%llu threads_x=%lu threads_y=%lu threads_z=%lu\n",
@@ -1544,6 +1563,7 @@ static int32_t m4_compute_commands(D3DALLOYM4ComputeEncoder *context, const stru
       const struct wmtcmd_compute_executecommands *body=(const void *)next;
       id<MTLIndirectCommandBuffer> buffer=m4obj(body->indirect_command_buffer); m4_allocation(context->recording,buffer);
       m4_stage_barrier(context,MTLStageDispatch);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder executeCommandsInBuffer:buffer withRange:NSMakeRange(body->location,body->length)];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_EXECUTE_ICB stage=compute encoder=%llu buffer=%llu location=%u length=%u\n",
           (unsigned long long)(uintptr_t)encoder,(unsigned long long)body->indirect_command_buffer,body->location,body->length);
@@ -1715,6 +1735,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     }
     case WMTRenderCommandDraw: {
       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                   vertexStart:body->vertex_start
                   vertexCount:body->vertex_count
@@ -1726,6 +1747,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
       struct wmtcmd_render_draw_indexed *body = (struct wmtcmd_render_draw_indexed *)next;
       MTLGPUAddress index_address; NSUInteger index_length;
       m4_index_range(context,body->index_buffer,body->index_buffer_offset,&index_address,&index_length);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                           indexCount:body->index_count
                            indexType:(MTLIndexType)body->index_type
@@ -1738,6 +1760,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     }
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
                 indirectBuffer:m4_address(context->recording,body->indirect_args_buffer,body->indirect_args_offset)];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_DRAW_INDIRECT encoder=%llu argument_buffer=%llu argument_offset=%llu primitive_type=%u\n",
@@ -1749,6 +1772,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
       MTLGPUAddress index_address; NSUInteger index_length;
       m4_index_range(context,body->index_buffer,body->index_buffer_offset,&index_address,&index_length);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
                            indexType:(MTLIndexType)body->index_type
                          indexBuffer:index_address
@@ -1762,6 +1786,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     }
     case WMTRenderCommandDrawMeshThreadgroups: {
       struct wmtcmd_render_draw_meshthreadgroups *body = (struct wmtcmd_render_draw_meshthreadgroups *)next;
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroups:MTLSizeMake(
                                         body->threadgroup_per_grid.width, body->threadgroup_per_grid.height,
                                         body->threadgroup_per_grid.depth
@@ -1779,6 +1804,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->indirect_args_buffer,body->indirect_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(
                                                           body->object_threadgroup_size.width,
@@ -1800,6 +1826,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     case WMTRenderCommandD3DalloyGeometryDraw: {
       struct wmtcmd_render_d3dalloy_geometry_draw *body = (struct wmtcmd_render_d3dalloy_geometry_draw *)next;
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -1809,6 +1836,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
       struct wmtcmd_render_d3dalloy_geometry_draw_indexed *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indexed *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->warp_count, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -1817,6 +1845,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     case WMTRenderCommandD3DalloyGeometryDrawIndirect: {
       struct wmtcmd_render_d3dalloy_geometry_draw_indirect *body = (struct wmtcmd_render_d3dalloy_geometry_draw_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -1828,6 +1857,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
           (struct wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->vertex_per_warp, 1, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -1837,6 +1867,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     case WMTRenderCommandD3DalloyTessellationMeshDraw: {
       struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw *)next;
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -1847,6 +1878,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
           (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_offset(context,3,body->draw_arguments_offset,SM50_BINDING_INDEX_DRAW_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroups:MTLSizeMake(body->patch_per_mesh_instance, body->instance_count, 1)
           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -1856,6 +1888,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     case WMTRenderCommandD3DalloyTessellationMeshDrawIndirect: {
       struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *body = (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -1867,6 +1900,7 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
           (struct wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect *)next;
       m4_render_buffer(context,3,m4obj(body->index_buffer),body->index_buffer_offset,SM50_BINDING_INDEX_INDEX_BUFFER);
       m4_render_buffer(context,3,m4obj(body->indirect_args_buffer),body->indirect_args_offset,SM50_BINDING_INDEX_INDIRECT_ARGUMENTS);
+      if (context->staleStages) m4_flush_stale(context);
       [encoder drawMeshThreadgroupsWithIndirectBuffer:m4_address(context->recording,body->dispatch_args_buffer,body->dispatch_args_offset)
                           threadsPerObjectThreadgroup:MTLSizeMake(body->threads_per_patch, body->patch_per_group, 1)
                             threadsPerMeshThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -1905,12 +1939,14 @@ static int32_t m4_render_commands(D3DALLOYM4RenderEncoder *context, const struct
     }
     case WMTRenderCommandDispatchThreadsPerTile: {
       struct wmtcmd_render_dispatch_threads_per_tile *body = (struct wmtcmd_render_dispatch_threads_per_tile *)next;
+      if (context->staleStages) m4_flush_stale(context);
       [encoder dispatchThreadsPerTile:MTLSizeMake(body->width, body->height, 1)];
       break;
     }
     case WMTRenderCommandExecuteCommandsInBuffer: {
       struct wmtcmd_render_executecommands *body = (struct wmtcmd_render_executecommands *)next;
       m4_allocation(context->recording,m4obj(body->indirect_command_buffer));
+      if (context->staleStages) m4_flush_stale(context);
       [encoder executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)body->indirect_command_buffer
                              withRange:NSMakeRange(body->location, body->length)];
       if (context->recording->trace) fprintf(stderr,"OWNED_GRAPHICS_NATIVE_EXECUTE_ICB stage=render encoder=%llu buffer=%llu location=%u length=%u\n",

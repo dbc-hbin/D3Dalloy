@@ -17,6 +17,8 @@
 
 #include <algorithm>
 
+#include "llvm/ADT/STLExtras.h"
+
 #include "llvm/IR/Instructions.h"
 
 #include "air_signature.hpp"
@@ -114,7 +116,7 @@ llvm::Value *element_row(llvm::IRBuilder<> &builder, const IOElement &element, l
 llvm::Error lower_register_loads(
   dxbc::context &ctx, llvm::StringRef name, llvm::ArrayRef<llvm::CallInst *> calls,
   const std::vector<IOElement> &elements,
-  const dxbc::register_file &registers, unsigned vertex_operand, llvm::StringRef stage, bool raw_half = false
+  const dxbc::register_file &registers, unsigned vertex_operand, llvm::StringRef stage, llvm::ArrayRef<uint32_t> raw_half = {}
 ) {
   auto &builder = ctx.builder;
   for (auto *call : calls) {
@@ -132,7 +134,8 @@ llvm::Error lower_register_loads(
     if (!registers.ptr_int4)
       return createError("DXIL " + stage + " shader dx.op." + name + " has no register file in this stage");
     builder.SetInsertPoint(call);
-    const bool half_bits = raw_half && element->component_type == COMPONENT_F16 && call->getType()->isHalfTy();
+    const bool half_bits = element->component_type == COMPONENT_F16 && call->getType()->isHalfTy() &&
+                           llvm::is_contained(raw_half, element->id);
     const bool as_float = call->getType()->isFloatingPointTy() && !half_bits;
     llvm::SmallVector<llvm::Value *, 1> prefix;
     if (vertex_operand)

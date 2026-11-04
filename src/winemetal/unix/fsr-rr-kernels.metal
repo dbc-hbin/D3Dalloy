@@ -21,8 +21,8 @@ float4x4 loadMatrix(constant float* m) {
                     float4(m[8],m[9],m[10],m[11]), float4(m[12],m[13],m[14],m[15]));
 }
 kernel void rr_zero_albedo(texture2d<float,access::write> output [[texture(0)]],
-    constant RrParams& p [[buffer(0)]], uint2 tid [[thread_position_in_grid]]) {
-    if (tid.x < p.width && tid.y < p.height) output.write(float4(0),tid);
+    uint2 tid [[thread_position_in_grid]]) {
+    output.write(float4(0),tid);
 }
 bool radiance(uint s) { return s == 1 || s == 2 || s == 4 || s == 5; }
 bool specular(uint s) { return s == 2 || s == 5 || s == 6; }
@@ -82,31 +82,26 @@ struct Neighborhood {
     float alpha;
     bool valid, materialBoundary;
 };
-bool usesSpecularAlbedo(constant RrParams& c) { return c.signal == 2 || c.signal == 3 || c.signal == 5; }
-bool usesDiffuseAlbedo(constant RrParams& c) {
-    return c.signal == 1 || c.signal == 3 || c.signal == 4 || (c.legacyMode == 3 && c.signal == 5);
-}
 // The 7x7 neighborhood of an 8x8 threadgroup, staged once in threadgroup
 // memory. Callers dispatch complete RrTileSize x RrTileSize groups covering
 // the image; threads past its edge help fill the tile and then return. Only
 // the channels neighborhood() reads are kept. Decode the material ID and
 // albedo once per tile entry so overlapping 7x7 neighborhoods share the work.
 constant constexpr uint RrTileSize = 8, RrTileSpan = RrTileSize+6;
-template<bool Neural> struct RrTile {
+template<bool Neural, bool Compact = false> struct RrTile {
     float2 normals[RrTileSpan][RrTileSpan]; // roughness, decoded material ID
     float4 source[RrTileSpan][RrTileSpan], guide[RrTileSpan][RrTileSpan];
     packed_float3 decoded[RrTileSpan][RrTileSpan];
-    packed_float3 spec[Neural ? 1 : RrTileSpan][Neural ? 1 : RrTileSpan];
-    packed_float3 material[RrTileSpan][RrTileSpan];
+    packed_float3 spec[Neural || Compact ? 1 : RrTileSpan][Neural || Compact ? 1 : RrTileSpan];
+    packed_float3 material[Compact ? 1 : RrTileSpan][Compact ? 1 : RrTileSpan];
 };
 // Every thread of the group must call this before any early return. Taps
 // outside the image are never stored; neighborhood() skips them unread.
-template<bool Neural> void loadTile(threadgroup RrTile<Neural>& t, texture2d<float,access::read> source,
+template<bool Neural, bool Compact> void loadTile(threadgroup RrTile<Neural,Compact>& t, texture2d<float,access::read> source,
               texture2d<float,access::read> guide, texture2d<float,access::read> normals,
               texture2d<float,access::read> decoded, texture2d<float,access::read> specAlbedo,
               texture2d<float,access::read> diffAlbedo, texture2d<float,access::read> fusedAlbedo,
               uint index, uint2 group, constant RrParams& c) {
-    bool useSpec = usesSpecularAlbedo(c), useDiff = usesDiffuseAlbedo(c);
     int2 origin = int2(group*RrTileSize)-3;
     for (uint i=index;i<RrTileSpan*RrTileSpan;i+=RrTileSize*RrTileSize) {
         uint2 l = uint2(i%RrTileSpan,i/RrTileSpan);
@@ -120,21 +115,21 @@ template<bool Neural> void loadTile(threadgroup RrTile<Neural>& t, texture2d<flo
         t.decoded[l.y][l.x] = packed_float3(decoded.read(u).xyz);
         if (Neural) {
             // Radiance uses a single material edge across its neighborhood.
-            float3 materialColor = c.legacyMode == 3 && c.signal == 5 ? albedo(fusedAlbedo,u,c) :
-                                   useSpec ? albedo(specAlbedo,u,c) : diffuseAlbedo(diffAlbedo,u,c);
+            float3 materialColor = c.legacyMode == 3 ? albedo(fusedAlbedo,u,c) :
+                                   specular(c.signal) ? albedo(specAlbedo,u,c) : diffuseAlbedo(diffAlbedo,u,c);
             t.material[l.y][l.x] = packed_float3(materialColor);
-        } else {
-            if (useSpec) t.spec[l.y][l.x] = packed_float3(albedo(specAlbedo,u,c));
-            if (useDiff) t.material[l.y][l.x] = packed_float3(diffuseAlbedo(diffAlbedo,u,c));
+        } else if ((c.signal == 3)) {
+            // Of the scalar signals (0, 3, 6), only shadows use albedo.
+            t.spec[l.y][l.x] = packed_float3(albedo(specAlbedo,u,c));
+            t.material[l.y][l.x] = packed_float3(diffuseAlbedo(diffAlbedo,u,c));
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 // Signal-independent geometry is decoded once per frame by rr_geometry:
 // guide = (view position, raw depth), decoded = (octahedral normal, 0).
-template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fusedAlbedo,
-                          threadgroup const RrTile<Neural>& tile, uint2 local, float3 neuralSpec, float3 neuralDiff,
-                          uint2 p, constant RrParams& c) {
+template<bool Neural, bool Compact> Neighborhood neighborhood(threadgroup const RrTile<Neural,Compact>& tile, uint2 local,
+                          float specWeight, uint2 p, constant RrParams& c) {
     uint2 centerIndex = local + 3u;
     float4 center = tile.guide[centerIndex.y][centerIndex.x];
     float z = center.w;
@@ -143,16 +138,10 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
     float3 n = float3(tile.decoded[centerIndex.y][centerIndex.x]);
     float3 vn = normalize((loadMatrix(c.view)*float4(n,0)).xyz);
     float3 position = center.xyz;
-    bool useSpec = usesSpecularAlbedo(c), useDiff = usesDiffuseAlbedo(c);
-    bool composite = c.legacyMode == 3 && c.signal == 5;
-    float3 sa = Neural ? neuralSpec :
-                useSpec ? float3(tile.spec[centerIndex.y][centerIndex.x]) : float3(0);
-    float3 da = Neural ? neuralDiff : useDiff ? float3(tile.material[centerIndex.y][centerIndex.x]) : float3(0);
-    float3 fa = Neural ? float3(tile.material[centerIndex.y][centerIndex.x]) : composite ? albedo(fusedAlbedo,p,c) : float3(0);
-    float specWeight = specular(c.signal) ? 1.0f : 0.0f;
-    if (composite) specWeight = dot(sa,float3(1))/max(dot(sa+da,float3(1)),1e-6f);
+    float3 material = Neural || (c.signal == 3) ? float3(tile.material[centerIndex.y][centerIndex.x]) : float3(0);
+    float3 sa = !Neural && (c.signal == 3) ? float3(tile.spec[centerIndex.y][centerIndex.x]) : float3(0);
     float sigma = 0.65f+1.85f*c.relaxation;
-    if (c.signal == 3 && activeSample(raw,p,c) && raw.x < 65504.0f) {
+    if (!Neural && (c.signal == 3) && activeSample(raw,p,c) && raw.x < 65504.0f) {
         uint neighbor = p.x+1 < c.width ? p.x+1 : (p.x ? p.x-1 : 0);
         float pixelWorld = length(viewPosition(uint2(neighbor,p.y),z,c)-position);
         float facing = max(abs(dot(n,-normalize(float3(c.lightDirection[0],c.lightDirection[1],c.lightDirection[2])))),0.1f);
@@ -176,27 +165,26 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
         float exponent = -float(x*x+y*y)/(2*sigma*sigma)
             -abs(dot(vn,delta))/tolerance
             -(1-clamp(dot(n,float3(tile.decoded[t.y][t.x])),0.0f,1.0f))*64*c.normalStrength;
-        float edge;
+        float edge = 0;
         if (Neural) {
-            edge = length(fa-float3(tile.material[t.y][t.x]));
-        } else {
-            float3 qs = useSpec ? float3(tile.spec[t.y][t.x]) : float3(0);
-            float3 qd = useDiff ? float3(tile.material[t.y][t.x]) : float3(0);
-            edge = specular(c.signal) ? length(sa-qs) : length(da-qd);
-            if (c.signal == 3) edge = length(sa-qs)+length(da-qd);
-            if (composite) edge = length(fa-albedo(fusedAlbedo,uint2(q),c));
+            edge = length(material-float3(tile.material[t.y][t.x]));
+        } else if ((c.signal == 3)) {
+            edge = length(sa-float3(tile.spec[t.y][t.x]))+length(material-float3(tile.material[t.y][t.x]));
         }
         float weight = exp(exponent-edge*8-specWeight*abs(np.x-packed.x)*16);
-        float3 value = radiance(c.signal) ? clamp(v.xyz,0.0f,c.maxRadiance) :
-            c.signal == 3 ? float3(v.x >= 65504.0f ? 1 : 0) : float3(clamp(v.x,0.0f,1.0f));
-        sum += value*weight; squareSum += value*value*weight; weights += weight;
-        float distance = float(x*x+y*y);
-        if (weight > 1e-6f && distance < nearestDistance) {
-            nearestDistance = distance; alpha = v.a;
+        float3 value = Neural ? clamp(v.xyz,0.0f,c.maxRadiance) :
+            (c.signal == 3) ? float3(v.x >= 65504.0f ? 1 : 0) : float3(clamp(v.x,0.0f,1.0f));
+        sum += value*weight; weights += weight;
+        if (Neural) {
+            squareSum += value*value*weight;
+            float distance = float(x*x+y*y);
+            if (weight > 1e-6f && distance < nearestDistance) {
+                nearestDistance = distance; alpha = v.a;
+            }
         }
     }
     float3 mean = weights > 1e-8f ? sum/weights : float3(0);
-    return {mean,weights > 1e-8f ? max(squareSum/weights-mean*mean,0.0f) : float3(0),
+    return {mean,Neural && weights > 1e-8f ? max(squareSum/weights-mean*mean,0.0f) : float3(0),
             alpha,weights > 1e-8f,boundary};
 }
 
@@ -205,7 +193,6 @@ template<bool Neural> Neighborhood neighborhood(texture2d<float,access::read> fu
 kernel void rr_snapshot(texture2d<float,access::read> source [[texture(0)]],
                         texture2d<float,access::write> destination [[texture(1)]],
                         constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
     destination.write(source.read(p), p);
 }
 
@@ -219,7 +206,6 @@ kernel void rr_geometry(texture2d<float,access::read> depthSource [[texture(0)]]
                         texture2d<float,access::write> guide [[texture(4)]],
                         texture2d<float,access::write> decoded [[texture(5)]],
                         constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
     float4 d = depthSource.read(p), packed = normalSource.read(p);
     depth.write(d,p);
     normals.write(packed,p);
@@ -230,21 +216,21 @@ kernel void rr_geometry(texture2d<float,access::read> depthSource [[texture(0)]]
 kernel void rr_unpack(texture2d<float,access::read> source [[texture(0)]],
                       texture2d<float,access::write> destination [[texture(1)]],
                       constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
-    bool traced = !c.checkerboard || ((p.x & 1) == ((p.y & 1) ^ c.origin));
-    float4 v = source.read(uint2(c.checkerboard ? p.x/2 : p.x,p.y));
-    if (!traced) v = float4(0,0,0,-1);
-    else if (!radiance(c.signal)) v.a = 1;
+    float4 v = float4(0,0,0,-1);
+    if (traced(p,c)) {
+        v = source.read(uint2(c.checkerboard ? p.x/2 : p.x,p.y));
+        if (!radiance(c.signal)) v.a = 1;
+    }
     destination.write(v,p);
 }
 
-float4 rr_filter_value(texture2d<float,access::read> motion,
+template<bool Compact> float4 rr_filter_value(texture2d<float,access::read> motion,
                        texture2d<float,access::read> normals,
                        texture2d<float,access::read> history,
                        texture2d<float,access::read> previousDepth,
                        texture2d<float,access::read> previousNormals,
                        texture2d<float,access::read> fusedAlbedo,
-                       threadgroup const RrTile<false>& tile, constant RrParams& c,
+                       threadgroup const RrTile<false,Compact>& tile, constant RrParams& c,
                        uint2 p, uint2 lp) {
     const uint2 centerIndex = lp + 3u;
     float z = tile.guide[centerIndex.y][centerIndex.x].w;
@@ -253,10 +239,10 @@ float4 rr_filter_value(texture2d<float,access::read> motion,
     bool inBounds = bounded(z,c);
     // Full-resolution inactive pixels outside bounds are literal passthrough.
     if (!inBounds && (!c.checkerboard || active)) return raw;
-    float3 n = octNormal(packed.xy);
+    float3 n = float3(tile.decoded[centerIndex.y][centerIndex.x]);
     float3 position = viewPosition(p,z,c);
     float specWeight = specular(c.signal) ? 1.0f : 0.0f;
-    Neighborhood local = neighborhood(fusedAlbedo,tile,lp,float3(0),float3(0),p,c);
+    Neighborhood local = neighborhood(tile,lp,specWeight,p,c);
     float3 mean = local.mean;
     float4 result = float4(mean,active ? raw.a : local.alpha);
     bool valid = local.valid;
@@ -312,56 +298,38 @@ float4 rr_filter_value(texture2d<float,access::read> motion,
     return result;
 }
 
-kernel void rr_filter(texture2d<float,access::read> source [[texture(0)]],
-                      texture2d<float,access::write> destination [[texture(1)]],
-                      texture2d<float,access::read> depth [[texture(2)]],
-                      texture2d<float,access::read> motion [[texture(3)]],
-                      texture2d<float,access::read> normals [[texture(4)]],
-                      texture2d<float,access::read> specAlbedo [[texture(5)]],
-                      texture2d<float,access::read> diffAlbedo [[texture(6)]],
-                      texture2d<float,access::read> history [[texture(7)]],
-                      texture2d<float,access::read> previousDepth [[texture(8)]],
-                      texture2d<float,access::read> previousNormals [[texture(9)]],
-                      texture2d<float,access::read> fusedAlbedo [[texture(10)]],
-                      texture2d<float,access::read> guide [[texture(11)]],
-                      texture2d<float,access::read> decoded [[texture(12)]],
-                      constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]],
-                      uint2 lp [[thread_position_in_threadgroup]], uint li [[thread_index_in_threadgroup]],
-                      uint2 group [[threadgroup_position_in_grid]]) {
-    threadgroup RrTile<false> tile;
-    loadTile(tile,source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,li,group,c);
-    if (p.x >= c.width || p.y >= c.height) return;
-    destination.write(rr_filter_value(motion,normals,history,previousDepth,previousNormals,
-                                     fusedAlbedo,tile,c,p,lp),p);
+// Scalar 0/6 never use the two shadow albedo tiles. Instantiate compact PSOs
+// independently of whether this dispatch can also publish the caller's output.
+#define RR_FILTER_KERNEL(name, compact, writeOutput) \
+kernel void name(texture2d<float,access::read> source [[texture(0)]], \
+                            texture2d<float,access::write> destination [[texture(1)]], \
+                            texture2d<float,access::read> depth [[texture(2)]], \
+                            texture2d<float,access::read> motion [[texture(3)]], \
+                            texture2d<float,access::read> normals [[texture(4)]], \
+                            texture2d<float,access::read> specAlbedo [[texture(5)]], \
+                            texture2d<float,access::read> diffAlbedo [[texture(6)]], \
+                            texture2d<float,access::read> history [[texture(7)]], \
+                            texture2d<float,access::read> previousDepth [[texture(8)]], \
+                            texture2d<float,access::read> previousNormals [[texture(9)]], \
+                            texture2d<float,access::read> fusedAlbedo [[texture(10)]], \
+                            texture2d<float,access::read> guide [[texture(11)]], \
+                            texture2d<float,access::read> decoded [[texture(12)]], \
+                            texture2d<float,access::write> output [[texture(13)]], \
+                            constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]], \
+                            uint2 lp [[thread_position_in_threadgroup]], uint li [[thread_index_in_threadgroup]], \
+                            uint2 group [[threadgroup_position_in_grid]]) { \
+    threadgroup RrTile<false,compact> tile; \
+    loadTile(tile,source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,li,group,c); \
+    if (p.x >= c.width || p.y >= c.height) return; \
+    float4 result = rr_filter_value(motion,normals,history,previousDepth,previousNormals,fusedAlbedo,tile,c,p,lp); \
+    destination.write(result,p); \
+    if (writeOutput) output.write(result,p); \
 }
-
-// Scalar history is RGBA32Float, so the resolve's read adds no conversion.
-// This variant publishes the same value to a proven-disjoint caller output.
-kernel void rr_filter_write(texture2d<float,access::read> source [[texture(0)]],
-                            texture2d<float,access::write> destination [[texture(1)]],
-                            texture2d<float,access::read> depth [[texture(2)]],
-                            texture2d<float,access::read> motion [[texture(3)]],
-                            texture2d<float,access::read> normals [[texture(4)]],
-                            texture2d<float,access::read> specAlbedo [[texture(5)]],
-                            texture2d<float,access::read> diffAlbedo [[texture(6)]],
-                            texture2d<float,access::read> history [[texture(7)]],
-                            texture2d<float,access::read> previousDepth [[texture(8)]],
-                            texture2d<float,access::read> previousNormals [[texture(9)]],
-                            texture2d<float,access::read> fusedAlbedo [[texture(10)]],
-                            texture2d<float,access::read> guide [[texture(11)]],
-                            texture2d<float,access::read> decoded [[texture(12)]],
-                            texture2d<float,access::write> output [[texture(13)]],
-                            constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]],
-                            uint2 lp [[thread_position_in_threadgroup]], uint li [[thread_index_in_threadgroup]],
-                            uint2 group [[threadgroup_position_in_grid]]) {
-    threadgroup RrTile<false> tile;
-    loadTile(tile,source,guide,normals,decoded,specAlbedo,diffAlbedo,fusedAlbedo,li,group,c);
-    if (p.x >= c.width || p.y >= c.height) return;
-    float4 result = rr_filter_value(motion,normals,history,previousDepth,previousNormals,
-                                    fusedAlbedo,tile,c,p,lp);
-    destination.write(result,p);
-    output.write(result,p);
-}
+RR_FILTER_KERNEL(rr_filter, false, false)
+RR_FILTER_KERNEL(rr_filter_write, false, true)
+RR_FILTER_KERNEL(rr_filter_compact, true, false)
+RR_FILTER_KERNEL(rr_filter_write_compact, true, true)
+#undef RR_FILTER_KERNEL
 
 kernel void rr_neural_common(texture2d<float,access::read> depth [[texture(0)]],
                              texture2d<float,access::read> motion [[texture(1)]],
@@ -378,7 +346,6 @@ kernel void rr_neural_common(texture2d<float,access::read> depth [[texture(0)]],
                              texture2d<float,access::write> guide [[texture(13)]],
                              texture2d<float,access::write> decoded [[texture(14)]],
                              constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
     float4 rawDepth = depth.read(p), packed = packedNormals.read(p);
     float3 position = viewPosition(p,rawDepth.x,c);
     depthHistory.write(rawDepth,p);
@@ -432,22 +399,22 @@ kernel void rr_neural_prepare(texture2d<float,access::read> source [[texture(0)]
     bool passthrough = !inBounds && (!c.checkerboard || active);
     Neighborhood local = {raw.xyz,float3(0),raw.a,true,false};
     float3 sa = albedo(specAlbedo,p,c), da = diffuseAlbedo(diffAlbedo,p,c);
-    if (!passthrough) local = neighborhood(fusedAlbedo,tile,lp,sa,da,p,c);
     bool composite = c.legacyMode == 3;
     float3 modulator = composite ? albedo(fusedAlbedo,p,c) :
         specular(c.signal) ? sa : da;
     float specWeight = specular(c.signal) ? 1.0f : 0.0f;
     if (composite) specWeight = dot(sa,float3(1))/max(dot(sa+da,float3(1)),1e-6f);
+    if (!passthrough) local = neighborhood(tile,lp,specWeight,p,c);
     float alpha = active ? raw.a : local.alpha;
     float3 fallback = local.valid ? local.mean : active ? clamp(raw.xyz,0.0f,c.maxRadiance) : float3(0);
     float3 deviation = sqrt(local.variance)*c.clipK;
     float3 hsum = 0; float hw = 0, ha = 0, historyDepth = 0, predictedDepth = z;
-    float3 n = octNormal(packed.xy);
+    float3 n = float3(tile.decoded[centerIndex.y][centerIndex.x]);
     bool depthMotionCorrection = false;
     if (c.hasHistory && inBounds) {
         float3 mv = motion.read(p).xyz*float3(c.motionScale[0],c.motionScale[1],c.motionScale[2]);
         predictedDepth = z+mv.z;
-        float3 relative = (loadMatrix(c.inverseView)*float4(viewPosition(p,z,c),0)).xyz;
+        float3 relative = (loadMatrix(c.inverseView)*float4(tile.guide[centerIndex.y][centerIndex.x].xyz,0)).xyz;
         float3 cameraDelta = float3(c.cameraDelta[0],c.cameraDelta[1],c.cameraDelta[2]);
         float cameraDepth = (loadMatrix(c.previousView)*float4(relative-cameraDelta,0)).z;
         // MetalFX can reconstruct camera motion from its matrices, but its
@@ -476,7 +443,7 @@ kernel void rr_neural_prepare(texture2d<float,access::read> source [[texture(0)]
     float confidence = 1;
     float3 camera = float3(c.cameraDelta[0],c.cameraDelta[1],c.cameraDelta[2]);
     if (specWeight > 0 && any(camera != 0)) {
-        float3 relative = (loadMatrix(c.inverseView)*float4(viewPosition(p,z,c),0)).xyz;
+        float3 relative = (loadMatrix(c.inverseView)*float4(tile.guide[centerIndex.y][centerIndex.x].xyz,0)).xyz;
         if (dot(relative,relative) > 0 && dot(relative-camera,relative-camera) > 0) {
             float angular = 1-clamp(dot(normalize(relative),normalize(relative-camera)),-1.0f,1.0f);
             float hit = c.signal == 5 ? max(alpha,0.0f) : 0;
@@ -490,7 +457,7 @@ kernel void rr_neural_prepare(texture2d<float,access::read> source [[texture(0)]
         fallback = mix(fallback,h,local.valid ? blend : 1.0f);
         if (!active && !local.valid) alpha = ha/hw;
     }
-    float d = deviceDepth(viewPosition(p,z,c),c);
+    float d = deviceDepth(tile.guide[centerIndex.y][centerIndex.x].xyz,c);
     // A reactive hint can reject MetalFX history, but cannot force its private
     // depth test to accept a sample under AMD's configurable tolerance.
     bool historyToleranceCorrection = hw > 1e-6f &&
@@ -520,7 +487,7 @@ float4 neuralFinish(float4 fallback, texture2d<float,access::read> neural,
                     texture2d<float,access::read> lower, texture2d<float,access::read> upper,
                     texture2d<float,access::read> specAlbedo, texture2d<float,access::read> diffAlbedo,
                     texture2d<float,access::read> fusedAlbedo, uint2 p, constant RrParams& c) {
-    float4 lo = lower.read(p), hi = upper.read(p);
+    float4 lo = lower.read(p);
     float3 value = fallback.xyz;
     if (lo.a == 0) {
         // MetalFX returns an unjittered image; AMD denoised signals remain on
@@ -537,7 +504,7 @@ float4 neuralFinish(float4 fallback, texture2d<float,access::read> neural,
         // Zero-albedo channels lose their lighting information when modulated.
         // Preserve those through the analytic correction, not division by zero.
         value = select(fallback.xyz,color/select(float3(1),modulator,modulator > 0),modulator > 0);
-        value = clamp(value,lo.xyz,hi.xyz);
+        value = clamp(value,lo.xyz,upper.read(p).xyz);
     }
     return float4(value,fallback.a);
 }
@@ -556,7 +523,6 @@ kernel void rr_neural_resolve(texture2d<float,access::read_write> working [[text
                               texture2d<float,access::read> input [[texture(8)]],
                               texture2d<float,access::read> depth [[texture(9)]],
                               constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
     float4 v = neuralFinish(working.read(p),neural,lower,upper,specAlbedo,diffAlbedo,fusedAlbedo,p,c);
     working.write(v,p);
     // RR 1.2 Atrous3 preserves the destination UAV alpha; passthrough copies input RGBA.
@@ -574,7 +540,6 @@ kernel void rr_neural_resolve_write(texture2d<float,access::read_write> working 
                                     texture2d<float,access::write> output [[texture(7)]],
                                     texture2d<float,access::read> input [[texture(8)]],
                                     constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
     float4 v = neuralFinish(working.read(p),neural,lower,upper,specAlbedo,diffAlbedo,fusedAlbedo,p,c);
     working.write(v,p);
     // Checkerboard and legacy radiance: traced pixels keep input alpha, holes
@@ -584,29 +549,9 @@ kernel void rr_neural_resolve_write(texture2d<float,access::read_write> working 
     output.write(v,p);
 }
 
-kernel void rr_resolve(texture2d<float,access::read> filtered [[texture(0)]],
-                       texture2d<float,access::read_write> output [[texture(1)]],
-                       texture2d<float,access::read> input [[texture(2)]],
-                       texture2d<float,access::read> depth [[texture(3)]],
-                       constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
-    float4 v = filtered.read(p);
-    // RR 1.2 Atrous3 preserves the destination UAV alpha. ComposeRaw first
-    // writes checkerboard reconstruction there; passthrough copies input RGBA.
-    // Internal history validity remains separate from this caller-owned alpha.
-    v.a = bounded(depth.read(p).x,c) ? output.read(p).a : input.read(p).a;
-    output.write(v,p);
-}
-
+// Alias-protected scalar outputs publish the complete stored result.
 kernel void rr_resolve_write(texture2d<float,access::read> filtered [[texture(0)]],
                              texture2d<float,access::write> output [[texture(1)]],
-                             texture2d<float,access::read> input [[texture(2)]],
-                             texture2d<float,access::read> reconstructedAlpha [[texture(3)]],
-                             constant RrParams& c [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
-    if (p.x >= c.width || p.y >= c.height) return;
-    // Scalar, checkerboard and legacy outputs need no destination read.
-    float4 v = filtered.read(p);
-    bool traced = !c.checkerboard || ((p.x & 1) == ((p.y & 1) ^ c.origin));
-    if (radiance(c.signal)) v.a = traced ? input.read(p).a : reconstructedAlpha.read(p).a;
-    output.write(v,p);
+                             uint2 p [[thread_position_in_grid]]) {
+    output.write(filtered.read(p),p);
 }

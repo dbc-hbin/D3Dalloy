@@ -1,4 +1,5 @@
 #include "../src/d3d12/d3d12_standard_swizzle.hpp"
+#include "../src/d3d12/d3d12_standard_swizzle_gpu.hpp"
 
 #include <array>
 #include <cassert>
@@ -39,6 +40,9 @@ int main() {
     for (unsigned i = 0; i < sizes.size(); ++i) {
       const uint32_t b = sizes[i];
       const auto p = pattern(volume, b);
+      const auto xm = d3dalloy::swizzle_bit_moves(p.x_mask);
+      const auto ym = d3dalloy::swizzle_bit_moves(p.y_mask);
+      const auto zm = d3dalloy::swizzle_bit_moves(p.z_mask);
       assert(uint32_t(p.tile_width) * p.tile_height * p.tile_depth * b == tile_bytes);
       auto one = Layout::make(p.tile_width, p.tile_height, p.tile_depth, 1, 1, b, 1, 1, volume);
       assert(one && one->total_tiles == 1);
@@ -50,6 +54,8 @@ int main() {
               auto address = one->offset(0, 0, x, y, z, k);
               assert(address && *address < tile_bytes);
               assert(*address == reference_offset(volume ? bits3d[i] : bits2d[i], x * b, y, z) + k);
+              assert(*address == (d3dalloy::swizzle_deposit(x * b + k, xm) |
+                                  d3dalloy::swizzle_deposit(y, ym) | d3dalloy::swizzle_deposit(z, zm)));
               assert(!visited[*address]);
               visited[*address] = 1;
             }

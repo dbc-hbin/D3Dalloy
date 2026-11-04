@@ -21,7 +21,7 @@ inline constexpr auto kD3D12ShaderMetalVersion = SM50_SHADER_METAL_400;
 
 struct GraphicsPipelineExtras;
 HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key,
-                         const GraphicsPipelineExtras *extras = nullptr);
+                         const GraphicsPipelineExtras *extras = nullptr, Sha1Digest *effective = nullptr);
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key);
 
 /** Native compiler/driver identity every cache and library blob is tied to; false when unavailable. */
@@ -94,7 +94,7 @@ public:
   PipelineCache &operator=(const PipelineCache &) = delete;
 
   HRESULT Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, const Sha1Digest &key,
-                     uint32_t stages, uint64_t adapter);
+                     uint32_t stages, uint64_t adapter, const Sha1Digest *effective = nullptr);
   bool loaded() const { return bool(blob_); }
   sm50_bitcode_t *output(Stage stage) { return &compiled_[stage]; }
   SM50_COMPILED_BITCODE view(Stage stage);
@@ -121,12 +121,12 @@ public:
   void RetryAutomatic(PipelineCache &fresh);
 
 private:
-  HRESULT SerializeBlob(ID3DBlob **blob);
+  HRESULT SerializeBlob(const Sha1Digest &key, ID3DBlob **blob);
   HRESULT LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DBlob *owned = nullptr);
   std::mutex serialized_mutex_;
   Com<ID3DBlob> serialized_;
 
-  Sha1Digest key_{};
+  Sha1Digest key_{}, effective_key_{};
   uint32_t stages_ = 0;
   uint64_t adapter_ = 0;
   std::array<SM50ShaderBitcode, StageCount> compiled_;

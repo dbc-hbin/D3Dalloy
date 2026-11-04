@@ -223,4 +223,26 @@ RWByteAddressBuffer gathered : register(u1);
     std::printf("%s_TILE_TASKS_PASS replay=%u width=%u height=%u samples=%u mask=%08x primitives=%u expected_tiles=84 pixels=%u sample_values=%u ps_invocations=%u guard_pixels=71 counter_guards=8 output_guards=8 ordered_blend=1 exact_depth=1 same_recording=1\n",
                 marker,replay,width,height,samples,sampleMask,primitives,width*height,sampleValues,invocations);
   }
+  GPUList clipped(f);
+  list=clipped.list.Get();
+  list->CopyBufferRegion(counters.Get(),0,counterInit.Get(),0,counterBytes);
+  transition(list,counters.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  list->OMSetRenderTargets(1,&color.target,FALSE,&depth.target);
+  list->SetGraphicsRootSignature(drawRoot.Get()); list->SetPipelineState(drawPSO.Get());
+  list->SetGraphicsRootUnorderedAccessView(0,counters->GetGPUVirtualAddress());
+  const D3D12_RECT outside{LONG(width),0,LONG(width+4),LONG(height)};
+  list->RSSetViewports(1,&viewport); list->RSSetScissorRects(1,&outside);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  list->DrawInstanced(3,1,0,0);
+  transition(list,counters.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->CopyBufferRegion(counterRead.Get(),0,counters.Get(),0,counterBytes);
+  check(list->Close(),"clipped tile close");
+  f.submit(list,"msaa_tile_tasks_clipped",true);
+  D3D12_RANGE readRange{0,counterBytes};
+  check(counterRead->Map(0,&readRange,&mapped),"clipped tile counters");
+  for (UINT i=0;i<counterWords;++i)
+    if (static_cast<const UINT *>(mapped)[i]!=(i<guardWords || i>=guardWords+sampleValues ? guard : 0u))
+      fail("fully clipped tile invoked pixel shader or touched guards");
+  counterRead->Unmap(0,&empty);
+
 }

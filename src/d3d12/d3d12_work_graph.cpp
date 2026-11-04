@@ -952,11 +952,17 @@ struct GraphExecution {
     execution_ticket.Reset();
     return success;
   }
+  Rc<BufferAllocation> ResolveRange(uint64_t address, uint64_t size, uint64_t &offset) {
+    auto allocation = device->LookupBufferByVA(address, &offset);
+    if (!allocation || offset > allocation->byteLength() || size > allocation->byteLength() - offset)
+      return nullptr;
+    return allocation;
+  }
   HRESULT Read(uint64_t address, void *destination, uint64_t size, const char *kind) {
     if (!size) return S_OK;
-    uint64_t offset = 0; auto allocation = device->LookupBufferByVA(address, &offset);
-    if (!allocation || offset > allocation->byteLength() || size > allocation->byteLength() - offset)
-      return E_INVALIDARG;
+    uint64_t offset = 0;
+    auto allocation = ResolveRange(address, size, offset);
+    if (!allocation) return E_INVALIDARG;
     if (size > readback_info.length) {
       readback_info = {}; readback_info.length = (size + 4095) & ~uint64_t(4095);
       readback_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE; readback = device->GetMTLDevice().newBuffer(readback_info);
@@ -983,7 +989,8 @@ struct GraphExecution {
     command.resource = resource; command.usage = WMTResourceUsage(WMTResourceUsageRead | WMTResourceUsageWrite);
     encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&command));
   }
-  HRESULT RunBatch(uint32_t index, uint64_t input_address, uint32_t level, uint32_t batch_groups, bool host) {
+  HRESULT RunBatch(uint32_t index, uint64_t input_address, uint32_t level, uint32_t batch_groups, bool host,
+                   WMT::MTL4CommandBuffer pending = {}) {
     const auto &node = graph.nodes[index];
     const uint64_t base = level * control_stride;
     const uint64_t active_context = host ? context_offset : base + context_offset;
@@ -992,12 +999,14 @@ struct GraphExecution {
     const auto *queues = reinterpret_cast<const SM50_WG_QUEUE *>(words + base);
     const auto &local_roots = node_bindings[index].roots;
     const auto &local_tables = node_bindings[index].tables;
-    auto buffer = Begin(node.atomic64_phase);
+    WMT::Reference<WMT::MTL4CommandBuffer> owned_buffer;
+    if (!pending) owned_buffer = Begin(node.atomic64_phase);
+    WMT::MTL4CommandBuffer buffer = pending ? pending : WMT::MTL4CommandBuffer(owned_buffer);
     if (!buffer) return E_OUTOFMEMORY;
     const auto global_tables = dispatch.atomic64_tables
         ? std::span<const StandardSwizzleTableUse>(*dispatch.atomic64_tables)
         : std::span<const StandardSwizzleTableUse>{};
-    HRESULT texture_result = textures.begin(buffer, atomic_fence, global_tables, local_tables);
+    HRESULT texture_result = pending ? S_FALSE : textures.begin(buffer, atomic_fence, global_tables, local_tables);
     if (FAILED(texture_result)) return texture_result;
     const bool texture_phase = texture_result == S_OK;
     if (node.atomic64_phase) {
@@ -1037,7 +1046,7 @@ struct GraphExecution {
       if (FAILED(hr)) return hr;
     }
     auto encoder = buffer.computeCommandEncoder(false);
-    if (node.atomic64_phase || texture_phase) encoder.waitForFence(atomic_fence);
+    if (node.atomic64_phase || texture_phase || (pending && level)) encoder.waitForFence(atomic_fence);
     Use(encoder, control);
     if (seed_resource) Use(encoder, seed_resource);
     wmtcmd_compute_setpso pipeline{}; pipeline.type = WMTComputeCommandSetPSO;
@@ -1049,7 +1058,7 @@ struct GraphExecution {
     wmtcmd_compute_dispatch launch{}; launch.type = WMTComputeCommandDispatch; launch.size = {batch_groups, 1, 1};
     pipeline.next.set(&launch);
     encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pipeline));
-    if (node.atomic64_phase || texture_phase) encoder.updateFence(atomic_fence);
+    if (node.atomic64_phase || texture_phase || pending) encoder.updateFence(atomic_fence);
     encoder.endEncoding();
     if (node.atomic64_phase) {
       HRESULT hr = atomic_phase->EncodeExport(buffer, atomic_fence);
@@ -1063,7 +1072,7 @@ struct GraphExecution {
       HRESULT hr = atomic_phase->ClearContext(buffer, atomic_fence);
       if (FAILED(hr)) return hr;
     }
-    if (!Complete(buffer)) return E_FAIL;
+    if (!pending && !Complete(buffer)) return E_FAIL;
     if (host) {
       owned_graphics::Trace("work_graph_host_batch", ",\"node\":", index,
           ",\"groups\":", batch_groups, ",\"atomic64\":", unsigned(node.atomic64_phase),
@@ -1080,7 +1089,6 @@ struct GraphExecution {
     std::vector<WorkGraphSchedulerNode> nodes(count);
     std::vector<WorkGraphSchedulerQueueTemplate> queues(count);
     std::vector<uint32_t> targets, shares;
-    uint64_t max_outputs = 0;
     const auto global_tables = dispatch.atomic64_tables
         ? std::span<const StandardSwizzleTableUse>(*dispatch.atomic64_tables)
         : std::span<const StandardSwizzleTableUse>{};
@@ -1097,11 +1105,26 @@ struct GraphExecution {
                 dispatch.program.NodeLocalRootArgumentsTable.StrideInBytes, offset) ||
             !resource_contract::CheckedAdd(dispatch.program.NodeLocalRootArgumentsTable.StartAddress, offset, node.LocalRoot))
           return E_INVALIDARG;
-        if (source.atomic64_phase || dispatch.atomic64_tables || dispatch.atomic64_heap) {
+        const auto &root = *source.local_root.ptr();
+        const uint64_t bytes = uint64_t(root.ParameterQwords) * sizeof(uint64_t);
+        bool needs_snapshot = dispatch.atomic64_heap && root.HasTextureDescriptorTables;
+        if (source.atomic64_phase) {
+          for (uint32_t p = 0; !needs_snapshot && p < root.ParameterSlots; ++p) {
+            const auto type = root.ParameterTypes[p];
+            if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+              const auto ranges = root.GetTableRanges(p);
+              needs_snapshot = dispatch.atomic64_heap && !ranges.empty() &&
+                               ranges.front().type != D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            } else {
+              needs_snapshot = type != D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            }
+          }
+        }
+        if (needs_snapshot) {
           // The local-root table is constant during DispatchGraph. Resolve it
           // once per Execute, after the producing queue work has retired.
           std::vector<uint64_t> arguments(source.local_root->ParameterQwords);
-          HRESULT hr = Read(node.LocalRoot, arguments.data(), arguments.size() * sizeof(uint64_t), "local_root_arguments");
+          HRESULT hr = Read(node.LocalRoot, arguments.data(), bytes, "local_root_arguments");
           if (FAILED(hr)) return hr;
           auto &bindings = node_bindings[index];
           for (uint32_t parameter = 0; parameter < source.local_root->ParameterSlots; ++parameter) {
@@ -1110,10 +1133,14 @@ struct GraphExecution {
             if (!address) continue;
             if (type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && dispatch.atomic64_heap)
               bindings.tables.push_back({source.local_root.ptr(), dispatch.atomic64_heap.ptr(), address, parameter});
-            else if (type == D3D12_ROOT_PARAMETER_TYPE_CBV || type == D3D12_ROOT_PARAMETER_TYPE_SRV ||
-                     type == D3D12_ROOT_PARAMETER_TYPE_UAV)
+            else if (source.atomic64_phase && (type == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                     type == D3D12_ROOT_PARAMETER_TYPE_SRV || type == D3D12_ROOT_PARAMETER_TYPE_UAV))
               bindings.roots.push_back({address, UINT64_MAX, type == D3D12_ROOT_PARAMETER_TYPE_UAV});
           }
+        } else if ((source.atomic64_phase || dispatch.atomic64_tables || dispatch.atomic64_heap) &&
+                   !ResolveRange(node.LocalRoot, bytes, offset)) {
+          // The shader reads this local table directly. Validate its extent without a host blit and wait.
+          return E_INVALIDARG;
         }
       }
       node_bindings[index].host = source.atomic64_phase || textures.needs_publication(global_tables, node_bindings[index].tables);
@@ -1149,7 +1176,6 @@ struct GraphExecution {
       node.DrainCount = targets.size() - node.DrainOffset;
       shares.insert(shares.end(), graph.sharing_nodes[index].begin(), graph.sharing_nodes[index].end());
       queues[index] = {graph.queue_offset[index], graph.queue_capacity[index] - 1, graph.queue_stride[index]};
-      max_outputs = std::max<uint64_t>(max_outputs, source.targets.size());
     }
     if (!use_frontier) return S_OK;
     if (!count || !graph.depth || graph.depth > kWorkGraphSchedulerMaxDepth ||
@@ -1196,9 +1222,8 @@ struct GraphExecution {
     params.Levels = control_info.gpu_address; params.Context = control_info.gpu_address + context_offset;
     params.Indirect = address + indirect_offset; params.Backing = dispatch.program.BackingMemory.StartAddress;
     params.LevelBytes = graph.level_bytes; params.LevelStride = control_stride;
-    params.NodeCount = count; params.Depth = graph.depth; params.SeedCount = 1;
-    params.MaxOutputs = max_outputs; params.BatchOffset = batch_offset; params.SharingOffset = sharing_offset;
-    params.TransitionBudget = kWorkGraphSchedulerMaxTransitions; params.GroupBudget = kWorkGraphSchedulerMaxGroups;
+    params.NodeCount = count; params.Depth = graph.depth;
+    params.BatchOffset = batch_offset; params.SharingOffset = sharing_offset;
     std::memcpy(bytes + nodes_offset, nodes.data(), nodes.size() * sizeof(nodes[0]));
     std::memcpy(bytes + queues_offset, queues.data(), queues.size() * sizeof(queues[0]));
     if (!targets.empty()) std::memcpy(bytes + targets_offset, targets.data(), targets.size() * sizeof(uint32_t));
@@ -1329,9 +1354,9 @@ struct GraphExecution {
     return state.Status == kWorkGraphSchedulerDone ? S_OK : E_FAIL;
   }
 
-  HRESULT RunTerminal(uint32_t index, uint64_t input_address, const uint8_t *input, uint32_t level, uint32_t remaining) {
+  HRESULT RunTerminal(uint32_t index, uint64_t input_address, const uint8_t *input, uint32_t slot, WMT::MTL4CommandBuffer pending) {
     const auto &node = graph.nodes[index];
-    if (node.info.Input.RecordSize && input_address != seed_address) {
+    if (node.info.Input.RecordSize && !input && !pending) {
       // Removing a CPU readback must not remove its bounds validation. The GPU
       // still consumes the complete record, even when the scheduler reads none.
       uint64_t offset = 0; auto allocation = device->LookupBufferByVA(input_address, &offset);
@@ -1363,11 +1388,8 @@ struct GraphExecution {
     // A leaf cannot overflow output queues: there are no descendants to drain
     // between its groups. Dispatch an independent frontier in bounded batches,
     // retaining the original group coordinates and input-completion counter.
-    const bool terminal = std::all_of(node.targets.begin(), node.targets.end(),
-        [](uint32_t target) { return target == SM50_WG_NONE; });
-    if (!terminal || !graph.sharing_nodes[index].empty()) return E_FAIL;
     const uint32_t group_limit = node.atomic64_phase ? 32u : 65535u;
-    const uint64_t base = level * control_stride;
+    const uint64_t base = slot * control_stride;
     auto *words = static_cast<uint8_t *>(control_info.memory.get_accessible_or_null()) + base;
     auto *queues = reinterpret_cast<SM50_WG_QUEUE *>(words);
     auto *context = reinterpret_cast<SM50_WG_NODE_CONTEXT *>(words + context_offset);
@@ -1376,22 +1398,18 @@ struct GraphExecution {
     *sharing = uint32_t(groups); batch->GroupEnd = uint32_t(groups); std::copy_n(grid, 3, batch->Grid);
     for (uint64_t group = 0; group < groups;) {
       const uint32_t batch_groups = static_cast<uint32_t>(std::min<uint64_t>(groups - group, group_limit));
-      for (uint32_t q = 0; q < graph.nodes.size(); ++q) {
-        queues[q] = {dispatch.program.BackingMemory.StartAddress + uint64_t(level) * graph.level_bytes + graph.queue_offset[q],
-                     0, graph.queue_capacity[q] - 1, graph.queue_stride[q], 0, 0};
-      }
-      queues[graph.nodes.size()] = {input_address, control_info.gpu_address + base + sharing_offset, 0,
-                                   node.info.Input.RecordSize, 0, 0};
+      // Leaf roots have no output or shared queue. The input queue is the only reachable entry.
+      queues[0] = {input_address, control_info.gpu_address + base + sharing_offset, 0, node.info.Input.RecordSize, 0, 0};
       *context = {}; context->QueueTable = control_info.gpu_address + base;
       context->BatchTable = control_info.gpu_address + base + batch_offset;
-      context->InputQueue = graph.nodes.size(); context->BatchRecords = 1; context->BatchGroups = batch_groups;
-      context->GroupStart = group; context->RemainingRecursionLevels = remaining;
+      context->InputQueue = 0; context->BatchRecords = 1; context->BatchGroups = batch_groups;
+      context->GroupStart = group; context->RemainingRecursionLevels = node.info.MaxRecursionDepth;
       context->OutputElementCount = node.targets.size();
       if (node.local_root && node.local_root->ParameterQwords) context->LocalRootArguments = dispatch.program.NodeLocalRootArgumentsTable.StartAddress +
           uint64_t(node.info.LocalRootArgumentsTableIndex) * dispatch.program.NodeLocalRootArgumentsTable.StrideInBytes;
       for (uint32_t o = 0; o < node.targets.size(); ++o) context->Outputs[o] =
-          node.targets[o] == index && !remaining ? SM50_WG_NONE : node.targets[o];
-      HRESULT hr = RunBatch(index, input_address, level, batch_groups, false);
+          SM50_WG_NONE;
+      HRESULT hr = RunBatch(index, input_address, slot, batch_groups, false, pending);
       if (FAILED(hr)) return hr;
       group += batch_groups;
     }
@@ -1401,19 +1419,70 @@ struct GraphExecution {
     if (entry >= graph.entries.size()) return E_INVALIDARG;
     const uint32_t index = graph.entries[entry]; const auto &node = graph.nodes[index];
     if (use_frontier) return RunFrontier(index, count, address, stride, cpu);
+    if (!count) return S_OK;
     const uint64_t record_size = node.info.Input.RecordSize;
-    WMTBufferInfo seed_info{}; seed_info.length = std::max<uint64_t>(4096, (record_size + 4095) & ~uint64_t(4095));
-    seed_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE; auto seed = device->GetMTLDevice().newBuffer(seed_info);
-    if (!seed) return E_OUTOFMEMORY;
-    seed_resource = seed;
-    seed_address = seed_info.gpu_address; seed_length = seed_info.length;
-    for (uint32_t i = 0; i < count; ++i) {
-      uint64_t input = address + uint64_t(i) * stride;
-      if (cpu) { if (record_size) std::memcpy(seed_info.memory.get_accessible_or_null(), cpu + uint64_t(i) * stride, record_size);
-        input = seed_info.gpu_address;
+    const uint64_t seed_stride = (record_size + 15) & ~uint64_t(15);
+    uint32_t capacity = 1;
+    const bool fixed = node.info.Launch != SM50_WG_LAUNCH_BROADCASTING || node.info.HasFixedDispatchGrid;
+    const uint64_t groups = node.info.Launch == SM50_WG_LAUNCH_BROADCASTING
+        ? uint64_t(node.info.DispatchGrid[0]) * node.info.DispatchGrid[1] * node.info.DispatchGrid[2] : 1;
+    Rc<BufferAllocation> input_owner;
+    // Each seed owns its mutable context and input-completion word until retirement. Host publication,
+    // changing grids and multi-batch records retain their original per-batch retirement.
+    if (count > 1 && fixed && groups && groups <= 65535 && !node_bindings[index].host &&
+        (!dispatch.atomic64_tables || dispatch.atomic64_tables->empty()) && node_bindings[index].tables.empty()) {
+      capacity = uint32_t(std::min<uint64_t>({count, 64, (256u * 1024u) / std::max(control_stride, seed_stride)}));
+      capacity = std::max(1u, capacity);
+      if (capacity > 1 && record_size && !cpu) {
+        uint64_t extent, offset;
+        if (resource_contract::CheckedMul(count - 1, stride, extent) &&
+            resource_contract::CheckedAdd(extent, record_size, extent))
+          input_owner = ResolveRange(address, extent, offset);
+        if (!input_owner) capacity = 1;
       }
-      HRESULT hr = RunTerminal(index, input, cpu ? cpu + uint64_t(i) * stride : nullptr, 0, node.info.MaxRecursionDepth);
-      if (FAILED(hr)) return hr;
+      if (capacity > 1 && control_info.length < control_stride * capacity) {
+        WMTBufferInfo info{};
+        info.length = control_stride * capacity; info.options = control_info.options;
+        auto storage = device->GetMTLDevice().newBuffer(info);
+        if (storage) { control = std::move(storage); control_info = info; }
+        else capacity = 1;
+      }
+    }
+    WMTBufferInfo seed_info{};
+    seed_resource = {}; seed_address = seed_length = 0;
+    if (cpu && record_size) {
+      seed_info.length = std::max<uint64_t>(4096, (seed_stride * capacity + 4095) & ~uint64_t(4095));
+      seed_info.options = WMTResourceStorageModeShared | WMT_RESOURCE_CPU_ADDRESSABLE;
+      seed_resource = device->GetMTLDevice().newBuffer(seed_info);
+      if (!seed_resource) return E_OUTOFMEMORY;
+      seed_address = seed_info.gpu_address; seed_length = seed_info.length;
+    }
+    for (uint32_t first = 0; first < count;) {
+      const uint32_t chunk = std::min(capacity, count - first);
+      WMT::Reference<WMT::MTL4CommandBuffer> pending;
+      if (chunk > 1) {
+        pending = Begin();
+        if (!pending) return E_OUTOFMEMORY;
+        if (input_owner) pending.useAllocation(input_owner->buffer());
+      }
+      for (uint32_t i = 0; i < chunk; ++i) {
+        const uint64_t source_offset = uint64_t(first + i) * stride;
+        const auto *record = cpu && record_size ? cpu + source_offset : nullptr;
+        uint64_t input = record_size ? address + source_offset : 0;
+        if (record) {
+          const auto offset = uint64_t(i) * seed_stride;
+          std::memcpy(static_cast<uint8_t *>(seed_info.memory.get_accessible_or_null()) + offset, record, record_size);
+          input = seed_address + offset;
+        }
+        HRESULT hr = RunTerminal(index, input, record, i, pending);
+        if (FAILED(hr)) return hr;
+      }
+      if (pending) {
+        if (!Complete(pending)) return E_FAIL;
+        owned_graphics::Trace("work_graph_terminal_chunk", ",\"node\":", index, ",\"records\":", chunk,
+            ",\"gpu_input\":", unsigned(!cpu && record_size), ",\"completions\":1");
+      }
+      first += chunk;
     }
     return S_OK;
   }

@@ -1929,6 +1929,10 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
     if [line for _, line in markers] != expected_phases:
         return failures + ["indirect fenced phase sequence missing, duplicated, or reordered"]
     resolver_psos = {e.get("pso") for e in events if e["event"] == "indirect_compute_resolver"}
+    encoder_records = {
+        "COMPUTE_BEGIN": r"context=[1-9][0-9]* encoder=[1-9][0-9]* concurrent=[01]",
+        "STAGE_BARRIER": r"encoder=[1-9][0-9]* after=[1-9][0-9]* before=[1-9][0-9]* implicit=1",
+    }
     schemas = {
         "DISPATCH": {"encoder", "pso", "mode", "grid_x", "grid_y", "grid_z", "threads_x", "threads_y", "threads_z"},
         "DISPATCH_INDIRECT": {"encoder", "pso", "argument_buffer", "argument_offset", "threads_x", "threads_y", "threads_z"},
@@ -1955,6 +1959,11 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                 continue
             words = line.split()
             kind = words[0].removeprefix("OWNED_GRAPHICS_NATIVE_")
+            if kind in encoder_records:
+                # Encoder creation and ordering can accompany any dispatch; neither launches work.
+                if not re.fullmatch(encoder_records[kind], line.partition(" ")[2]):
+                    failures.append("malformed native encoder record: " + line)
+                continue
             if kind == "BINDING":
                 # Recording table/residency counters, not an encoded GPU command.
                 metadata = dict(word.split("=", 1) for word in words[1:] if "=" in word)
@@ -2019,6 +2028,15 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                 failures.append("actual GPU argument producer dispatch differs")
         else:
             kind = "DRAW_INDIRECT" if fields["format"] == "0" else "DRAW_INDEXED_INDIRECT"
+            if maximum > 64:
+                blit, vertex = 1 << 28, 1
+                dependency = any(e.get("event") == "submission_access_edge" and e.get("raw") and
+                    e.get("stages_before", 0) & blit and e.get("stages_after", 0) & vertex for e in phase_events)
+                ordered = any((e.get("event") == "native_render_queue_barrier" and
+                    e.get("after", 0) & blit and e.get("before", 0) & vertex) or
+                    (e.get("event") == "native_render_wait" and e.get("stages", 0) & vertex) for e in phase_events)
+                if not dependency or not ordered:
+                    failures.append("graphics ICB resolver lacks GPU argument producer ordering: " + marker)
             expected = Counter({"EXECUTE_ICB": 1}) if maximum > 64 else Counter({kind: maximum}) if maximum else Counter()
             if counts != expected or resolver:
                 failures.append("graphics native fixed-count bypass work differs: " + marker)
@@ -2199,7 +2217,7 @@ def msaa_tile_trace_failures(events: list[dict], label: str) -> list[str]:
         extents = [(index, event) for index, event in rows if event["event"] == "msaa_tile_extent"]
         readies = [(index, event) for index, event in rows if event["event"] == "msaa_tile_ready"]
         releases = [(index, event) for index, event in rows if event["event"] == "msaa_tile_release"]
-        if not quanta or len(extents) > 1 or len(readies) != 1:
+        if len(extents) > 1 or len(readies) != 1:
             failures.append(label + ": GPU tile initial batch, continuation or attachmentless extent is missing/duplicated")
         if len(releases) != 1:
             failures.append(label + ": GPU tile completed scratch release is missing/duplicated")
@@ -2243,7 +2261,8 @@ def msaa_tile_trace_failures(events: list[dict], label: str) -> list[str]:
                     not 0 <= ready.get("viewports", -1) <= 16 or not 1 <= ready.get("layers", -1) <= 2048 or
                     (ready.get("ready") == 1 and any(ready[field] == 0 for field in ("width", "height", "viewports")))):
                 failures.append(label + ": GPU tile initial native-scissor batch count/domain differs")
-            if not quanta or index >= quanta[0][0] or not retired(index, ready):
+            if ((ready.get("ready") == 0) != (not quanta) or
+                    (quanta and index >= quanta[0][0]) or not retired(index, ready)):
                 failures.append(label + ": GPU tile descriptors were observed before ordered native retirement")
             else:
                 previous_index, previous_producer = index, ready["producer"]
@@ -2280,9 +2299,10 @@ def msaa_tile_trace_failures(events: list[dict], label: str) -> list[str]:
                     any(release.get(field) != 0 for field in
                         ("retained_buffers", "retained_textures", "retained_markers"))):
                 failures.append(label + ": GPU tile completed scratch ownership counts differ")
-            if (type(release.get("producer")) is not int or not quanta or
-                    release.get("producer") != quanta[-1][1].get("producer") or
-                    index <= quanta[-1][0] or release["event_id"] <= quanta[-1][1]["event_id"]):
+            terminal = quanta or readies
+            if (type(release.get("producer")) is not int or not terminal or
+                    release.get("producer") != terminal[-1][1].get("producer") or
+                    index <= terminal[-1][0] or release["event_id"] <= terminal[-1][1]["event_id"]):
                 failures.append(label + ": GPU tile scratch release is not after its terminal retired producer")
     if {index for index, event in enumerate(events) if event["event"] in tile_names} != claimed:
         failures.append(label + ": GPU tile event has no matching task execution")
@@ -2428,11 +2448,11 @@ def msaa_tile_task_failures(stdout: str, stderr: str) -> list[str]:
         failures.append("MSAA tile exact replay/color/depth/counter/guard observations differ")
     brackets = [(i, m[1], int(m[2]), m[3]) for i, line in enumerate(lines)
                 if (m := re.fullmatch(prefix + r"_SUBMISSION_(BEGIN|END) id=([0-9]+) label=(msaa_tile_tasks_[^ ]+)", line))]
-    labels = ["msaa_tile_tasks_first", "msaa_tile_tasks_replay"]
-    if (len(brackets) != 4 or [b[3] for b in brackets[::2]] != labels or
+    labels = ["msaa_tile_tasks_first", "msaa_tile_tasks_replay", "msaa_tile_tasks_clipped"]
+    if (len(brackets) != 6 or [b[3] for b in brackets[::2]] != labels or
             any(a[1] != "BEGIN" or b[1] != "END" or a[2:] != b[2:]
                 for a, b in zip(brackets[::2], brackets[1::2])) or
-            brackets[0][2] >= brackets[2][2]):
+            not brackets[0][2] < brackets[2][2] < brackets[4][2]):
         return failures + ["MSAA tile closed-list replay brackets differ"]
     identities = []
     for start, end in zip(brackets[::2], brackets[1::2]):
@@ -2446,6 +2466,11 @@ def msaa_tile_task_failures(stdout: str, stderr: str) -> list[str]:
         quanta = [e for e in part if e["event"] == "msaa_tile_quantum"]
         if len(executes) != 1 or any(type(value) is not int or value <= 0 for key in executes for value in key):
             failures.append("MSAA tile execution identity missing: " + label)
+        if label == "msaa_tile_tasks_clipped":
+            if (len(begins) != 1 or begins[0].get("capacity") != 1 or quanta or
+                    [(e.get("ready"), e.get("status")) for e in readies] != [(0, 1)]):
+                failures.append("MSAA fully clipped draw did not retire from initial empty task: " + label)
+            continue
         if len(begins) != 1 or any(e.get("capacity") != 14 for e in begins):
             failures.append("MSAA tile primitive capacity or execution count differs: " + label)
         if [(e.get("ready"), e.get("status"), e.get("width"), e.get("height"), e.get("viewports"), e.get("layers"))
@@ -2877,7 +2902,7 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
                 "constant_hit": (0, 0, 0, 0, 0, 0), "constant_root_abi": (1, 0, 1, 1, 1, 0),
                 "constant_entry": (1, 1, 1, 1, 1, 0), "linked_geometry_cold": (2, 2, 2, 0, 1, 2),
                 "linked_geometry_hit": (0, 0, 0, 0, 0, 0), "linked_geometry_input": (2, 0, 2, 0, 1, 1),
-                "captured_layout_cold": (6, 6, 6, 0, 6, 11), "captured_layout_hit": (0, 0, 0, 0, 0, 0),
+                "captured_layout_cold": (6, 6, 6, 0, 6, 12), "captured_layout_hit": (0, 0, 0, 0, 0, 0),
                 "clear_rebuild": (2, 2, 2, 0, 1, 2)})
     prefix = SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
     failures, completed = [], []
@@ -4893,7 +4918,7 @@ def submission_foundation_output_matches(stdout: str, stderr: str, native_compil
         sum(event.get("proof") == "no_sparse_heap_or_opaque_access" for event in sparse) >= 4 and
         all(event.get("proof") in ("no_sparse_heap_or_opaque_access", "disjoint_sparse_heap_ranges") for event in sparse) and
         len(clears) == 4 and batches and all(event.get("native_encoders") == 1 and event.get("targets",0) > 0 for event in batches) and
-        any(event["targets"] > 1 for event in batches) and
+        any(event["targets"] == 2 and event.get("reset") == 0 and event.get("native_dispatches") == 1 for event in batches) and
         any(event.get("reason") == "sparse_alias" for event in events("submission_access_opaque")) and
         any(event.get("allocations",0) > 1 and event.get("commits") == 1 for event in events("residency_add_batch")) and
         "_FAIL" not in stdout and "OWNED_D3D12_RENDER_PASSES_FAIL" not in stderr)

@@ -81,6 +81,10 @@ DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a023", IMTLD3D12GeneratedP
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a024", IMTLD3D12ResourcePresent) : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE PresentResource(ID3D12Resource *source, UINT sync, UINT flags, BOOL closes_frame) = 0;
 };
+// A source-only capability probe avoids a speculative window presentation.
+DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a025", IMTLD3D12ResourcePresent1) : public IMTLD3D12ResourcePresent {
+  virtual BOOL STDMETHODCALLTYPE CanPresentResource(ID3D12Resource *source) = 0;
+};
 DEFINE_COM_INTERFACE("b2a31090-a1f2-4717-bb50-617a47f2a022", IMTLD3D12FrameGenerationCommandList) : public IUnknown {
   virtual HRESULT STDMETHODCALLTYPE PrepareFrameGeneration(IMTLD3D12FrameGenerationState *state,
       const MTL_FRAME_GENERATION_PREPARE_DESC *desc) = 0;

@@ -40,55 +40,6 @@ static bool msaa_tile_task_rect(D3DALLOYMSAATileBounds bounds,
   return true;
 }
 
-// Generation moves the private cursor only. Completion accounting happens at
-// the following publish, after the generated batch's native consumer fence.
-static void msaa_tile_task_advance(device MSAATileTaskState &state,
-                                   constant MSAATileTaskParams &params,
-                                   device const D3DALLOYMSAATileBounds *bounds) {
-  if (!state.Positioned || state.Primitive >= params.MaxPrimitives) {
-    msaa_tile_task_fail(state, 1);
-    return;
-  }
-  uint4 rect;
-  if (msaa_tile_task_rect(bounds[state.Primitive], params, rect)) {
-    if (state.X < rect.z && rect.z - state.X > 8) {
-      state.X += 8;
-      return;
-    }
-    state.X = rect.x;
-    if (state.Y < rect.w && rect.w - state.Y > 8) {
-      state.Y += 8;
-      return;
-    }
-  }
-  ++state.Primitive;
-  state.Positioned = 0;
-}
-
-static bool msaa_tile_task_position(device MSAATileTaskState &state,
-                                    constant MSAATileTaskParams &params,
-                                    device const D3DALLOYMSAATileBounds *bounds,
-                                    device const D3DALLOYMSAAPrimitiveDraw *draws) {
-  while (state.Primitive < params.MaxPrimitives) {
-    uint4 rect;
-    const D3DALLOYMSAAPrimitiveDraw draw = draws[state.Primitive];
-    if (!draw.index_count || !draw.instance_count ||
-        !msaa_tile_task_rect(bounds[state.Primitive], params, rect)) {
-      ++state.Primitive;
-      state.Positioned = 0;
-      continue;
-    }
-    if (!state.Positioned) {
-      state.X = rect.x;
-      state.Y = rect.y;
-      state.Positioned = 1;
-    }
-    return true;
-  }
-  state.Positioned = 0;
-  return false;
-}
-
 static void msaa_tile_task_fill(device MSAATileTaskSlot &slot,
                                 device MSAATileTaskDescriptor &descriptor,
                                 device const MSAATileTaskState &state,
@@ -144,8 +95,7 @@ static void msaa_tile_task_fill(device MSAATileTaskSlot &slot,
     device const D3DALLOYMSAATileBounds *bounds [[buffer(2)]],
     device const D3DALLOYMSAAPrimitiveDraw *draws [[buffer(3)]],
     device MSAATileTaskCompletion &completion [[buffer(4)]],
-    constant uint &mode [[buffer(5)]], uint index [[thread_position_in_grid]]) {
-  if (index) return;
+    constant uint &mode [[buffer(5)]]) {
   uint budget = kMSAATileFirstQuantum;
   if (mode == kMSAATilePrepare) {
     if (state.Status != kMSAATileRunning || state.BatchCount ||
@@ -172,17 +122,36 @@ static void msaa_tile_task_fill(device MSAATileTaskSlot &slot,
   if (state.Status != kMSAATileError) {
     // Preserve primitive -> row -> column order. Only these bounded descriptors
     // cross to the host for native scissor state; original bounds stay private.
-    while (state.BatchCount < budget &&
-           msaa_tile_task_position(state, params, bounds, draws)) {
-      const uint slot = state.BatchCount;
-      msaa_tile_task_fill(state.Slots[slot], completion.Descriptors[slot], state, params,
-                         bounds[state.Primitive], draws[state.Primitive]);
-      ++state.BatchCount;
-      msaa_tile_task_advance(state, params, bounds);
-      if (state.Status == kMSAATileError) break;
+    while (state.BatchCount < budget && state.Primitive < params.MaxPrimitives) {
+      const auto draw = draws[state.Primitive];
+      const auto bound = bounds[state.Primitive];
+      uint4 rect;
+      if (draw.index_count && draw.instance_count && msaa_tile_task_rect(bound, params, rect)) {
+        if (!state.Positioned) {
+          state.X = rect.x;
+          state.Y = rect.y;
+          state.Positioned = 1;
+        }
+        do {
+          const uint slot = state.BatchCount++;
+          msaa_tile_task_fill(state.Slots[slot], completion.Descriptors[slot], state, params, bound, draw);
+          if (rect.z - state.X > 8) {
+            state.X += 8;
+          } else {
+            state.X = rect.x;
+            if (rect.w - state.Y <= 8) {
+              state.Positioned = 0;
+              break;
+            }
+            state.Y += 8;
+          }
+        } while (state.BatchCount < budget);
+        if (state.Positioned) break; // Resume this primitive after the batch retires.
+      }
+      ++state.Primitive;
+      state.Positioned = 0;
     }
-    if (state.Status != kMSAATileError)
-      state.Status = state.BatchCount ? kMSAATileRunning : kMSAATileDone;
+    state.Status = state.BatchCount ? kMSAATileRunning : kMSAATileDone;
   }
 
   // The host encodes exactly ReadyTasks slots after retirement. No padding

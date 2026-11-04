@@ -2036,6 +2036,14 @@ WINEMETAL_API obj_handle_t MetalDrawable_texture(obj_handle_t drawable);
 
 WINEMETAL_API obj_handle_t MetalLayer_nextDrawable(obj_handle_t layer);
 
+// Inline fixed-width fields are shared with the PE32 Unix-call table.
+struct WMTPresentDrawable {
+  obj_handle_t layer, source, drawable, texture;
+  uint32_t source_width, source_height, destination_width, destination_height;
+  enum WMTPixelFormat source_format, destination_format;
+};
+WINEMETAL_API void MetalLayer_acquirePresentDrawable(struct WMTPresentDrawable *present);
+
 WINEMETAL_API bool MTLDevice_supportsFXSpatialScaler(obj_handle_t device);
 
 WINEMETAL_API bool MTLDevice_supportsFXTemporalScaler(obj_handle_t device);

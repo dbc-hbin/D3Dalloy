@@ -311,7 +311,7 @@ class RunnerFailures(unittest.TestCase):
                                ("constant_distinct", 0, 0, 1, 1, 0), ("constant_hit", 0, 0, 0, 0, 0),
                                ("constant_root_abi", 1, 0, 1, 1, 0), ("constant_entry", 1, 1, 1, 1, 0),
                                ("linked_geometry_cold", 2, 2, 0, 1, 2), ("linked_geometry_hit", 0, 0, 0, 0, 0),
-                               ("linked_geometry_input", 2, 0, 0, 1, 1), ("captured_layout_cold", 6, 6, 0, 6, 11),
+                               ("linked_geometry_input", 2, 0, 0, 1, 1), ("captured_layout_cold", 6, 6, 0, 6, 12),
                                ("captured_layout_hit", 0, 0, 0, 0, 0), ("clear_rebuild", 2, 2, 0, 1, 2)])):
             prefix = runner.SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
             rows = []
@@ -356,6 +356,16 @@ class RunnerFailures(unittest.TestCase):
                     sixth=cold.replace(f'{1 if kind == "air_compile" else 101:040x}',f'{6 if kind == "air_compile" else 106:040x}')
                     for changed in (text.replace(sixth,cold,1),text.replace(warm,warm.replace("pipeline_artifact_hit","ignored_work"),1),text.replace(warm,warm.replace(json.loads(warm.split("OWNED_GRAPHICS_TRACE ",1)[1])["key"],"f"*40),1),text.replace(warm,warm+"\n"+warm,1),text.replace(cold,cold.replace('"cache": '+("1" if kind == "air_compile" else "2"),'"cache": 3'),1)):
                         self.assertTrue(runner.pipeline_artifact_failures(changed,suite),kind)
+                function = "OWNED_GRAPHICS_TRACE " + json.dumps(
+                    {"event": "pipeline_artifact_operation", "kind": "new_function"})
+                for name in ("captured_layout_cold", "captured_layout_hit"):
+                    marker = prefix + "end=" + name
+                    self.assertTrue(runner.pipeline_artifact_failures(
+                        text.replace(marker, function + "\n" + marker, 1), suite))
+                cold_start = prefix + "begin=captured_layout_cold"
+                start, cold = text.split(cold_start, 1)
+                self.assertTrue(runner.pipeline_artifact_failures(
+                    start + cold_start + cold.replace('"new_function"', '"omitted_function"', 1), suite))
                 before,cold_and_after=text.split(prefix+"begin=captured_layout_cold",1)
                 self.assertTrue(runner.pipeline_artifact_failures(before+prefix+"begin=captured_layout_cold"+cold_and_after.replace("pipeline_artifact_operation","ignored_work",1),suite))
                 extra="OWNED_GRAPHICS_TRACE "+json.dumps(dict(event="pipeline_artifact_operation",kind="shader_initialize"))
@@ -3038,8 +3048,8 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         records += [dict(event="sparse_publication_elided",proof="no_sparse_heap_or_opaque_access") for _ in range(4)]
         records += [dict(event="submission_access_opaque",reason="sparse_alias")]
         records += [dict(event="native_compute_begin",reason="dispatch_external_backing",dispatches=3,concurrent=0)]
-        records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,reset=0),
-                    dict(event="query_fanout_batch",targets=1,native_encoders=1,reset=0),
+        records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,native_dispatches=1,reset=0),
+                    dict(event="query_fanout_batch",targets=1,native_encoders=1,native_dispatches=1,reset=0),
                     dict(event="submit",queue=1,submission=1),dict(event="complete",queue=1,submission=1,status=4)]
         for name,hit in [("cold",False),("payload",True),("unrelated",True),("copy",False),
                          ("copy_payload",True),("null",False),("null_replay",True),("restore",False),
@@ -3103,6 +3113,10 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         changed=[dict(row) for row in records]
         for row in changed:
             if row["event"]=="query_fanout_batch":row["native_encoders"]=2
+        self.assertFalse(check(changed))
+        changed=[dict(row) for row in records]
+        for row in changed:
+            if row["event"]=="query_fanout_batch":row["native_dispatches"]=row["targets"]
         self.assertFalse(check(changed))
         self.assertFalse(check(records,text=output+"OWNED_D3D12_SUBMISSION_FOUNDATION_CASE_PASS case=query_fanout duplicate=1\n"))
         changed=[dict(row) for row in records]
@@ -3368,6 +3382,8 @@ class Phase3PreparedEvidence(unittest.TestCase):
                 submission += 1
                 event("submit", submission=submission)
                 if maximum > 64:
+                    event("submission_access_edge", submission=submission, raw=1, stages_before=1 << 28, stages_after=1)
+                    event("native_render_queue_barrier", submission=submission, after=1 << 28, before=1)
                     native("EXECUTE_ICB", stage="render", encoder=1, buffer=2, location=0, length=maximum)
                 for slot in range(maximum if maximum <= 64 else 0):
                     fields = dict(encoder=1, argument_buffer=2, argument_offset=16+32*slot, primitive_type=3)
@@ -3383,6 +3399,9 @@ class Phase3PreparedEvidence(unittest.TestCase):
     def test_indirect_numeric_predicate_root_and_tail_corruption(self):
         stdout, stderr = self.indirect_control()
         self.assertEqual(runner.prepared_indirect_failures(stdout, stderr), [])
+        for name in ("submission_access_edge", "native_render_queue_barrier"):
+            with self.subTest(missing=name):
+                self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(name, "missing_event", 1)))
         for old, new in (("result=0 guards=a17e0011", "result=7 guards=a17e0011"),
                          ("result=1 guards=d00d0000", "result=0 guards=d00d0000"),
                          ("predicate=0 result=0", "predicate=0 result=561"),
@@ -3413,6 +3432,18 @@ class Phase3PreparedEvidence(unittest.TestCase):
         snapshot=next(line for line in stderr.splitlines() if "pso=110" in line)
         self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot+"\n", "", 1)))
         self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot, snapshot.replace("threads_x=1", "threads_x=2"), 1)))
+
+    def test_indirect_encoder_records_do_not_launch_work(self):
+        out, err = self.indirect_control()
+        launch = next(line for line in err.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT"))
+        for record, invalid in (
+                ("COMPUTE_BEGIN context=9 encoder=1 concurrent=0", "COMPUTE_BEGIN context=9 encoder=1 concurrent=2"),
+                ("STAGE_BARRIER encoder=1 after=8 before=8 implicit=1", "STAGE_BARRIER encoder=1 after=0 before=8 implicit=1")):
+            with self.subTest(record=record):
+                prefix = "OWNED_GRAPHICS_NATIVE_"
+                self.assertEqual(runner.prepared_indirect_failures(out, err.replace(launch, prefix + record + "\n" + launch, 1)), [])
+                self.assertTrue(runner.prepared_indirect_failures(out, err.replace(launch, prefix + invalid + "\n" + launch, 1)))
+                self.assertTrue(runner.prepared_indirect_failures(out, err.replace(launch, prefix + record, 1)))
 
     def test_single_native_compute_only_and_multi_command_parallel_resolver(self):
         out,err=self.indirect_control()

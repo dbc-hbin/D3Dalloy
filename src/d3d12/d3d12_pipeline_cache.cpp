@@ -1163,13 +1163,13 @@ HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Dige
 }
 
 HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key,
-                         const GraphicsPipelineExtras *extras) {
+                         const GraphicsPipelineExtras *extras, Sha1Digest *effective_key) {
   if (desc.NumRenderTargets > 8 || (desc.InputLayout.NumElements && !desc.InputLayout.pInputElementDescs))
     return E_INVALIDARG;
-  KeyBuilder hash;
+  KeyBuilder hash, dormant;
   // 6: Metal 4 compiles UINT logic operations into every owned framebuffer-fetch
   // 7: device atomic64 phase selection changes every participating application stage.
-  hash.add(uint32_t(8), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(9), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.VS);
   hash.shader(desc.PS);
@@ -1185,8 +1185,10 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   const UINT blend_count = blend.IndependentBlendEnable ? desc.NumRenderTargets : std::min(desc.NumRenderTargets, 1u);
   for (UINT i = 0; i < blend_count; ++i) {
     const auto &rt = blend.RenderTarget[i];
-    hash.add(bool(rt.BlendEnable), bool(rt.LogicOpEnable), rt.SrcBlend, rt.DestBlend, rt.BlendOp,
-             rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha, rt.LogicOp, rt.RenderTargetWriteMask);
+    hash.add(bool(rt.BlendEnable), bool(rt.LogicOpEnable), rt.RenderTargetWriteMask);
+    (rt.BlendEnable ? hash : dormant).add(rt.SrcBlend, rt.DestBlend, rt.BlendOp,
+                                         rt.SrcBlendAlpha, rt.DestBlendAlpha, rt.BlendOpAlpha);
+    (rt.LogicOpEnable ? hash : dormant).add(rt.LogicOp);
   }
   const auto &raster = desc.RasterizerState;
   hash.add(raster.FillMode, raster.CullMode, bool(raster.FrontCounterClockwise), raster.DepthBias,
@@ -1194,10 +1196,12 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
            bool(raster.MultisampleEnable), bool(raster.AntialiasedLineEnable), raster.ForcedSampleCount,
            raster.ConservativeRaster);
   const auto &depth = desc.DepthStencilState;
-  hash.add(bool(depth.DepthEnable), depth.DepthWriteMask, depth.DepthFunc, bool(depth.StencilEnable),
-           depth.StencilReadMask, depth.StencilWriteMask);
+  hash.add(bool(depth.DepthEnable), bool(depth.StencilEnable));
+  (depth.DepthEnable ? hash : dormant).add(depth.DepthWriteMask, depth.DepthFunc);
+  auto &stencil = depth.StencilEnable ? hash : dormant;
+  stencil.add(depth.StencilReadMask, depth.StencilWriteMask);
   for (const auto *face : {&depth.FrontFace, &depth.BackFace})
-    hash.add(face->StencilFailOp, face->StencilDepthFailOp, face->StencilPassOp, face->StencilFunc);
+    stencil.add(face->StencilFailOp, face->StencilDepthFailOp, face->StencilPassOp, face->StencilFunc);
   // Stream-only state (fractional depth bias, back-face stencil masks); absent for classic descs.
   if (extras && !extras->empty()) {
     if (extras->depth_bounds) hash.add(uint32_t(0x44424e44));
@@ -1241,7 +1245,13 @@ HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Dig
   }
   for (UINT i = 0; i < so.NumStrides; ++i)
     hash.add(so.pBufferStrides[i]);
-  return hash.finish(key);
+  Sha1Digest active;
+  HRESULT hr = hash.finish(active);
+  if (FAILED(hr)) return hr;
+  if (effective_key) *effective_key = active;
+  // Explicit cached blobs and named pipeline libraries include all inactive fields.
+  dormant.add(active);
+  return dormant.finish(key);
 }
 
 bool PipelineCacheIdentity(WMTPipelineCacheIdentity &identity) {
@@ -1281,7 +1291,7 @@ void PipelineCache::Complete(HRESULT result, bool retain) noexcept {
       Com<ID3DBlob> serialized;
       // Oversized results may be shared by live flight/PSO owners, but are never
       // retained as completed cache entries or written to disk.
-      if (SUCCEEDED(GetPrivateBlob(&serialized))) {
+      if (SUCCEEDED(SerializeBlob(effective_key_, &serialized))) {
         blob_ = ShareBlob(serialized.ptr());
         if (blob_) {
           // Native functions and immutable GPU constants already consumed these bytes.
@@ -1445,8 +1455,9 @@ HRESULT AutomaticPipelineCacheControl(D3D12_SHADER_CACHE_CONTROL_FLAGS control) 
 }
 
 HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, const Sha1Digest &key,
-                                  uint32_t stages, uint64_t adapter) {
+                                  uint32_t stages, uint64_t adapter, const Sha1Digest *effective) {
   key_ = key;
+  effective_key_ = !cached.CachedBlobSizeInBytes && effective ? *effective : key;
   stages_ = stages;
   adapter_ = adapter;
   if (cached.CachedBlobSizeInBytes)
@@ -1458,7 +1469,7 @@ HRESULT PipelineCache::Initialize(const D3D12_CACHED_PIPELINE_STATE &cached, con
   const auto &identity = Identity();
   if (stages && identity.valid) {
     Sha1HashState hash;
-    hash.update(key).update(stages).update(adapter).update(identity.value).update(kVersion);
+    hash.update(effective_key_).update(stages).update(adapter).update(identity.value).update(kVersion);
     const auto automatic_key = hash.final();
     auto &cache = Automatic();
     try {
@@ -1552,7 +1563,7 @@ HRESULT PipelineCache::LoadBlob(const D3D12_CACHED_PIPELINE_STATE &cached, ID3DB
   if (status != D3DALLOY_PIPELINE_CACHE_SUCCESS)
     return E_INVALIDARG;
   const auto &description = info.description;
-  if (description.stages != stages_ || memcmp(description.key.bytes, key_.data, sizeof(key_.data)))
+  if (description.stages != stages_ || memcmp(description.key.bytes, effective_key_.data, sizeof(effective_key_.data)))
     return E_INVALIDARG;
   const auto digest = BlobDigest(cached.pCachedBlob, info.layout);
   if (memcmp(digest.data, info.digest.bytes, sizeof(digest.data)))
@@ -1603,9 +1614,9 @@ HRESULT PipelineCache::GetPrivateBlob(ID3DBlob **blob) {
   if (!blob) return E_POINTER;
   *blob = nullptr;
   std::lock_guard lock(serialized_mutex_);
-  if (blob_) { *blob = ref(blob_->bytes.ptr()); return S_OK; }
+  if (blob_ && key_ == effective_key_) { *blob = ref(blob_->bytes.ptr()); return S_OK; }
   if (!serialized_) {
-    if (HRESULT hr = SerializeBlob(&serialized_); FAILED(hr)) return hr;
+    if (HRESULT hr = SerializeBlob(key_, &serialized_); FAILED(hr)) return hr;
   }
   *blob = ref(serialized_.ptr());
   return S_OK;
@@ -1621,19 +1632,11 @@ HRESULT PipelineCache::GetBlob(ID3DBlob **blob) {
   return S_OK;
 }
 
-HRESULT PipelineCache::SerializeBlob(ID3DBlob **blob) {
+HRESULT PipelineCache::SerializeBlob(const Sha1Digest &key, ID3DBlob **blob) {
   if (!blob)
     return E_POINTER;
   *blob = nullptr;
   try {
-    if (loaded()) {
-      const auto size = blob_->bytes->GetBufferSize();
-      const HRESULT hr = CreateBlobFromMalloc(size, blob);
-      if (FAILED(hr))
-        return hr;
-      memcpy((*blob)->GetBufferPointer(), blob_->bytes->GetBufferPointer(), size);
-      return S_OK;
-    }
     const auto &identity = Identity();
     if (!identity.valid)
       return E_FAIL;
@@ -1641,7 +1644,7 @@ HRESULT PipelineCache::SerializeBlob(ID3DBlob **blob) {
     description.stages = stages_;
     description.adapter = adapter_;
     memcpy(description.identity, &identity.value, sizeof(identity.value));
-    memcpy(description.key.bytes, key_.data, sizeof(key_.data));
+    memcpy(description.key.bytes, key.data, sizeof(key.data));
     std::array<SM50_COMPILED_BITCODE, StageCount> views{};
     for (uint32_t i = 0; i < StageCount; ++i) {
       if (!(stages_ & (1u << i)))
