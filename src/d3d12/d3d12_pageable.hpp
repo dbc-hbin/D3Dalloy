@@ -34,7 +34,6 @@ namespace d3dalloy {
 class MTLD3D12PageableResidency {
   bool supported_ = false;
   uint32_t reference_count_ = 0;
-  D3D12_RESIDENCY_PRIORITY priority_ = D3D12_RESIDENCY_PRIORITY_NORMAL;
   uint64_t allocation_bytes_ = 0;
   std::vector<WMT::Allocation> allocations_;
 
@@ -69,16 +68,6 @@ public:
   void
   RemoveResidencyReference(uint32_t count = 1) {
     reference_count_ -= count;
-  }
-
-  D3D12_RESIDENCY_PRIORITY
-  ResidencyPriority() const {
-    return priority_;
-  }
-
-  void
-  SetResidencyPriorityHint(D3D12_RESIDENCY_PRIORITY priority) {
-    priority_ = priority;
   }
 
   const std::vector<WMT::Allocation> &

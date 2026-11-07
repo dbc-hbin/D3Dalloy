@@ -513,7 +513,9 @@ bool PlanOmmShadow(const BuildInputs &inputs, const uint8_t *descs, uint64_t byt
   return !memcmp(expected, actual, sizeof(expected)) && cursor <= kHeaderSize + plan.size;
 }
 
-bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, const ShadowPlan &plan) {
+bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, const ShadowPlan &plan,
+                        bool *matching_blas_layout) {
+  if (matching_blas_layout) *matching_blas_layout = false;
   constexpr uint32_t mutableFlags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE |
       D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
   if (!(source.flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE) ||
@@ -521,6 +523,13 @@ bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, 
       source.type != inputs.type || source.descCount != (inputs.type == 0 ? inputs.instanceCount : inputs.geometries.size()) ||
       source.geometries.size() != plan.geometries.size())
     return false;
+  // An identical BLAS shadow table also satisfies every per-geometry update constraint below.
+  if (matching_blas_layout && source.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL &&
+      source.shadowSize == plan.size && (plan.geometries.empty() ||
+      !memcmp(source.geometries.data(), plan.geometries.data(), plan.geometries.size() * sizeof(ShadowGeometry)))) {
+    *matching_blas_layout = true;
+    return true;
+  }
   for (size_t i = 0; i < plan.geometries.size(); ++i) {
     const auto &a = source.geometries[i];
     const auto &b = plan.geometries[i];

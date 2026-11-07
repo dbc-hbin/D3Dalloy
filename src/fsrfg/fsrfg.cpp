@@ -572,7 +572,6 @@ extern "C" ffxReturnCode_t ffxDestroyContext(ffxContext* handle, const ffxAlloca
   ReleaseSRWLockExclusive(&g_lock);
   AcquireSRWLockExclusive(&c->configureLock);
   auto code = detach(*c);
-  if (!code && c->backend) { DispatchLock lock(*c); code = result(c->backend->Configure(FALSE)); }
   ReleaseSRWLockExclusive(&c->configureLock);
   AcquireSRWLockExclusive(&g_lock);
   if (code) { c->closing = false; ReleaseSRWLockExclusive(&g_lock); return code; }

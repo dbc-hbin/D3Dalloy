@@ -55,11 +55,13 @@ def main() -> int:
         raise SystemExit(f"OWNED_METALLIB_RT_FAIL airconv target in {targets_path} "
                          "carries no compiler or linker parameters")
 
+    archive = build / "src/airconv/darwin/libairconv.a"
+    arches = subprocess.check_output(["/usr/bin/lipo", "-archs", archive], text=True).split()
     subprocess.run([
-        "xcrun", "clang++", "-arch", "x86_64", "-std=c++20", "-fobjc-arc", "-O1",
+        "xcrun", "clang++", *(arg for arch in arches for arg in ("-arch", arch)), "-std=c++20", "-fobjc-arc", "-O1",
         *[p for p in compiler["parameters"] if p.startswith("-I")],
         "-I" + str(source / "src/airconv"),
-        str(fixture.with_suffix(".mm")), str(build / "src/airconv/darwin/libairconv.a"),
+        str(fixture.with_suffix(".mm")), str(archive),
         "-framework", "Metal", "-framework", "Foundation", *linker["parameters"],
         "-o", str(binary)], cwd=build, check=True)
 

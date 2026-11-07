@@ -785,7 +785,8 @@ def macho_audit_problems(path: Path, label: str, native_arch: str = "x86_64") ->
 def render_wrapper(with_nvngx: bool = False, with_nvapi: bool = False, arch: dict | None = None, *, with_fsr: bool | None = False,
                    with_fsr_framegeneration: bool | None = False, wow64_frontends: bool | None = None, with_core: bool = True,
                    with_wow64: bool = False, with_dcomp: bool = False,
-                   with_fsr_rayregeneration: bool | None = None, with_antilag: bool = True) -> str:
+                   with_fsr_rayregeneration: bool | None = None, with_antilag: bool = True,
+                   with_ngx_fg_observer: bool = False) -> str:
     arch = arch or architecture("x86_64", "x64")
     dll_paths = [arch["windows_directory"]]
     if with_wow64:
@@ -803,7 +804,7 @@ if [ -n "${{OWNED_FG_OBSERVER:-}}" ]; then
   {'set -- -e "DYLD_INSERT_LIBRARIES=$OWNED_FG_OBSERVER" "$@"' if arch["native_arch"] == "arm64" else ""}
 fi
 
-''' if with_fsr_framegeneration is True else ""
+''' if with_fsr_framegeneration is True or (with_nvngx and with_ngx_fg_observer) else ""
     return f'''#!/bin/sh
 set -eu
 
@@ -879,7 +880,7 @@ def prepare_real_wine(runtime: Path, with_nvngx: bool = False, with_nvapi: bool 
         if real.exists() or real.is_symlink():
             raise ValueError("staged runtime has ambiguous bin/wine.real")
         launcher.replace(real)
-    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr))
+    launcher.write_text(render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=wow64_frontends, with_wow64=with_wow64, with_dcomp=with_dcomp, with_fsr_rayregeneration=with_fsr, with_ngx_fg_observer=with_nvngx))
     launcher.chmod(0o755)
 
 def artifact_records(
@@ -1102,7 +1103,10 @@ def verify_runtime(runtime: Path) -> list[str]:
         problems.append("manifest owned DLL discovery paths do not match staged ABIs")
     # Retained manifests predate the pinned paired path. Verify their original
     # wrapper without changing its bytes or broadening its loader policy.
-    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy, with_antilag=with_antilag)
+    ngx_fg_observer = data.get("loader", {}).get("ngx_fg_observer", False)
+    if type(ngx_fg_observer) is not bool or (ngx_fg_observer and not with_nvngx):
+        problems.append("invalid NGX frame-generation observer policy")
+    expected_wrapper = render_wrapper(with_nvngx, with_nvapi, arch, with_fsr=fsr_policy, with_fsr_framegeneration=fg_policy, wow64_frontends=optional.get("wow64_frontends"), with_core=with_core, with_wow64=with_wow64 and dll_paths is not None, with_dcomp=with_dcomp, with_fsr_rayregeneration=rr_policy, with_antilag=with_antilag, with_ngx_fg_observer=ngx_fg_observer is True)
     if legacy_core_builtin:
         expected_wrapper = expected_wrapper.replace("d3d12core=n", "d3d12core=b")
     if wrapper.is_file() and not wrapper.is_symlink() and wrapper.read_text() != expected_wrapper:
@@ -1379,6 +1383,7 @@ def stage(
                 "winedlloverrides": owned_overrides(with_nvngx, with_nvapi, with_fsr=with_fsr, with_fsr_framegeneration=with_fsr, wow64_frontends=with_wow64, with_dcomp=wine_display_build is not None, with_fsr_rayregeneration=with_fsr),
                 "winedllpath": [arch["windows_directory"], *([str(WOW64_WINDOWS_DIR)] if with_wow64 else []), arch["unix_directory"]],
                 "explicit_wineprefix_required": True,
+                **({"ngx_fg_observer": True} if with_nvngx and not with_fsr else {}),
             },
             "optional_modules": {
                 "nvngx": with_nvngx,

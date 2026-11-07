@@ -923,6 +923,7 @@ _MTLBlitCommandEncoder_encodeCommands(void *obj) {
     default:
       assert(!next->type && "unhandled blit command type");
       break;
+    case WMTBlitCommandSnapshotPredicate:
     case WMTBlitCommandCopyFromBufferToBuffer: {
       struct wmtcmd_blit_copy_from_buffer_to_buffer *body = (struct wmtcmd_blit_copy_from_buffer_to_buffer *)next;
       [encoder copyFromBuffer:(id<MTLBuffer>)body->src
@@ -1058,6 +1059,11 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
     default:
       assert(!next->type && "unhandled compute command type");
       break;
+    case WMTComputeCommandDispatchCompact: {
+      const struct wmtcmd_compute_dispatch_compact *body = (const void *)next;
+      [encoder dispatchThreadgroups:MTLSizeMake(body->x, body->y, body->z) threadsPerThreadgroup:threadgroup_size];
+      break;
+    }
     case WMTComputeCommandDispatch: {
       struct wmtcmd_compute_dispatch *body = (struct wmtcmd_compute_dispatch *)next;
       [encoder dispatchThreadgroups:MTLSizeMake(body->size.width, body->size.height, body->size.depth)
@@ -1070,11 +1076,18 @@ _MTLComputeCommandEncoder_encodeCommands(void *obj) {
           threadsPerThreadgroup:threadgroup_size];
       break;
     }
+    case WMTComputeCommandDispatchIndirectRange:
     case WMTComputeCommandDispatchIndirect: {
       struct wmtcmd_compute_dispatch_indirect *body = (struct wmtcmd_compute_dispatch_indirect *)next;
-      [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-                                 indirectBufferOffset:body->indirect_args_offset
-                                threadsPerThreadgroup:threadgroup_size];
+      const struct wmtcmd_compute_dispatch_indirect_range *range = next->type == WMTComputeCommandDispatchIndirectRange ? (const void *)next : NULL;
+      uint64_t offset = body->indirect_args_offset;
+      const uint32_t slots = range ? range->count : 1, stride = range ? range->stride : 0;
+      for (uint32_t i = 0; i < slots; ++i, offset += stride) {
+        if (i) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+        [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                                   indirectBufferOffset:offset
+                                  threadsPerThreadgroup:threadgroup_size];
+      }
       break;
     }
     case WMTComputeCommandSetPSO: {
@@ -1161,6 +1174,10 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
   struct unixcall_generic_obj_cmd_noret *params = obj;
   const struct wmtcmd_base *next = params->cmd_head.ptr;
   id<MTLRenderCommandEncoder> encoder = (id<MTLRenderCommandEncoder>)params->encoder;
+  typedef void (*IndirectDrawIMP)(id, SEL, MTLPrimitiveType, id<MTLBuffer>, NSUInteger);
+  typedef void (*IndexedIndirectDrawIMP)(id, SEL, MTLPrimitiveType, MTLIndexType, id<MTLBuffer>, NSUInteger, id<MTLBuffer>, NSUInteger);
+  IndirectDrawIMP indirect_draw = NULL;
+  IndexedIndirectDrawIMP indexed_indirect_draw = NULL;
   while (next) {
     switch ((enum WMTRenderCommandType)next->type) {
     default:
@@ -1239,6 +1256,15 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setDepthTestMinBound:body->min_depth maxBound:body->max_depth];
       break;
     }
+    case WMTRenderCommandSetViewportScissors: {
+      const struct wmtcmd_render_set_viewport_scissors *body = (const struct wmtcmd_render_set_viewport_scissors *)next;
+      const MTLViewport *views = (const MTLViewport *)(body + 1);
+      if (body->viewport_count)
+        [encoder setViewports:views count:body->viewport_count];
+      if (body->scissor_count)
+        [encoder setScissorRects:(const MTLScissorRect *)(views + body->viewport_count) count:body->scissor_count];
+      break;
+    }
     case WMTRenderCommandSetViewports: {
       struct wmtcmd_render_setviewports *body = (struct wmtcmd_render_setviewports *)next;
       [encoder setViewports:(const MTLViewport *)body->viewports.ptr count:body->viewport_count];
@@ -1297,6 +1323,52 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
       [encoder setVisibilityResultMode:(MTLVisibilityResultMode)body->mode offset:body->offset];
       break;
     }
+    case WMTRenderCommandDrawRun: {
+      const struct wmtcmd_render_draw_run *run = (const void *)next;
+      const MTLPrimitiveType primitive = (MTLPrimitiveType)run->primitive_type;
+      WMT_REPLAY_DRAW_RUN(run, wmtdraw_parameters, draw,
+        [encoder drawPrimitives:primitive vertexStart:draw.first vertexCount:draw.count
+                  instanceCount:draw.instances baseInstance:draw.base_instance];
+      );
+      break;
+    }
+    case WMTRenderCommandDrawIndexedRun: {
+      const struct wmtcmd_render_draw_run *run = (const void *)next;
+      const struct wmtdraw_index_binding *binding = wmt_draw_run_binding(run);
+      const MTLPrimitiveType primitive = (MTLPrimitiveType)run->primitive_type;
+      const MTLIndexType index_type = (run->flags & WMTDrawRunIndex32) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+      const id<MTLBuffer> index_buffer = (id<MTLBuffer>)binding->index_buffer;
+      const uint64_t index_offset = binding->index_offset;
+      const uint64_t width = index_type == MTLIndexTypeUInt32 ? 4 : 2;
+      WMT_REPLAY_DRAW_RUN(run, wmtdraw_indexed_parameters, draw,
+        const uint64_t offset = width * draw.first;
+        [encoder drawIndexedPrimitives:primitive indexCount:draw.count
+                             indexType:index_type indexBuffer:index_buffer
+                     indexBufferOffset:index_offset + offset
+                         instanceCount:draw.instances baseVertex:draw.base_vertex baseInstance:draw.base_instance];
+      );
+      break;
+    }
+    case WMTRenderCommandDrawCompact: {
+      const struct wmtcmd_render_draw_compact *body = (const void *)next;
+      [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type vertexStart:body->vertex_start
+                  vertexCount:body->vertex_count instanceCount:1 baseInstance:0];
+      break;
+    }
+    case WMTRenderCommandDrawIndexedSmall: {
+      const struct wmtcmd_render_draw_indexed_small *body = (const void *)next;
+      [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type indexCount:body->index_count
+                           indexType:(MTLIndexType)body->index_type indexBuffer:(id<MTLBuffer>)body->index_buffer indexBufferOffset:body->index_buffer_offset
+                       instanceCount:1 baseVertex:0 baseInstance:0];
+      break;
+    }
+    case WMTRenderCommandDrawIndexedCompact: {
+      const struct wmtcmd_render_draw_indexed_compact *body = (const void *)next;
+      [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type indexCount:body->index_count
+                           indexType:(MTLIndexType)body->index_type indexBuffer:(id<MTLBuffer>)body->index_buffer indexBufferOffset:body->index_buffer_offset
+                       instanceCount:1 baseVertex:body->base_vertex baseInstance:0];
+      break;
+    }
     case WMTRenderCommandDraw: {
       struct wmtcmd_render_draw *body = (struct wmtcmd_render_draw *)next;
       [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
@@ -1318,21 +1390,55 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
                         baseInstance:body->base_instance];
       break;
     }
+    case WMTRenderCommandDrawIndirectRange:
     case WMTRenderCommandDrawIndirect: {
       struct wmtcmd_render_draw_indirect *body = (struct wmtcmd_render_draw_indirect *)next;
-      [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
-                indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-          indirectBufferOffset:body->indirect_args_offset];
+      const struct wmtcmd_render_draw_indirect_range *range = next->type == WMTRenderCommandDrawIndirectRange ? (const void *)next : NULL;
+      uint64_t offset = body->indirect_args_offset;
+      const uint32_t slots = range ? range->count : 1, stride = range ? range->stride : 0;
+      if (slots >= WMTDrawIndirectCachedIMPMinCount && encoder) {
+        const SEL sel = @selector(drawPrimitives:indirectBuffer:indirectBufferOffset:);
+        const MTLPrimitiveType primitive = (MTLPrimitiveType)body->primitive_type;
+        id<MTLBuffer> arguments = (id<MTLBuffer>)body->indirect_args_buffer;
+        if (!indirect_draw)
+          indirect_draw = (IndirectDrawIMP)class_getMethodImplementation(object_getClass(encoder), sel);
+        for (uint32_t i = 0; i < slots; ++i, offset += stride)
+          indirect_draw(encoder, sel, primitive, arguments, offset);
+        break;
+      }
+      for (uint32_t i = 0; i < slots; ++i, offset += stride) {
+        [encoder drawPrimitives:(MTLPrimitiveType)body->primitive_type
+                  indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+            indirectBufferOffset:offset];
+      }
       break;
     }
+    case WMTRenderCommandDrawIndexedIndirectRange:
     case WMTRenderCommandDrawIndexedIndirect: {
       struct wmtcmd_render_draw_indexed_indirect *body = (struct wmtcmd_render_draw_indexed_indirect *)next;
-      [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
-                           indexType:(MTLIndexType)body->index_type
-                         indexBuffer:(id<MTLBuffer>)body->index_buffer
-                   indexBufferOffset:body->index_buffer_offset
-                      indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
-                indirectBufferOffset:body->indirect_args_offset];
+      const struct wmtcmd_render_draw_indexed_indirect_range *range = next->type == WMTRenderCommandDrawIndexedIndirectRange ? (const void *)next : NULL;
+      uint64_t offset = body->indirect_args_offset;
+      const uint32_t slots = range ? range->count : 1, stride = range ? range->stride : 0;
+      if (slots >= WMTDrawIndirectCachedIMPMinCount && encoder) {
+        const SEL sel = @selector(drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:);
+        const MTLPrimitiveType primitive = (MTLPrimitiveType)body->primitive_type;
+        const MTLIndexType index_type = (MTLIndexType)body->index_type;
+        id<MTLBuffer> indices = (id<MTLBuffer>)body->index_buffer, arguments = (id<MTLBuffer>)body->indirect_args_buffer;
+        const NSUInteger index_offset = body->index_buffer_offset;
+        if (!indexed_indirect_draw)
+          indexed_indirect_draw = (IndexedIndirectDrawIMP)class_getMethodImplementation(object_getClass(encoder), sel);
+        for (uint32_t i = 0; i < slots; ++i, offset += stride)
+          indexed_indirect_draw(encoder, sel, primitive, index_type, indices, index_offset, arguments, offset);
+        break;
+      }
+      for (uint32_t i = 0; i < slots; ++i, offset += stride) {
+        [encoder drawIndexedPrimitives:(MTLPrimitiveType)body->primitive_type
+                             indexType:(MTLIndexType)body->index_type
+                           indexBuffer:(id<MTLBuffer>)body->index_buffer
+                     indexBufferOffset:body->index_buffer_offset
+                        indirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
+                  indirectBufferOffset:offset];
+      }
       break;
     }
     case WMTRenderCommandDrawMeshThreadgroups: {
@@ -1848,8 +1954,9 @@ _NSString_alloc_init(void *obj) {
 
 static bool
 developer_hud_uses_metric_service(void) {
-  NSOperatingSystemVersion version = [NSProcessInfo processInfo].operatingSystemVersion;
-  return version.majorVersion >= 27;
+  Class cls = objc_lookUpClass("MTLHUDService");
+  id instance = ((id (*)(id, SEL))objc_msgSend)((id)cls, @selector(instance));
+  return [instance respondsToSelector:@selector(graphicsAPI)];
 }
 
 static NTSTATUS
@@ -3922,7 +4029,8 @@ thunk32_SM50RTCompileRaytracingPipeline(void *args) {
     .MaxRecursionDepth = source->MaxRecursionDepth, .MaxPayloadSize = source->MaxPayloadSize,
     .MaxAttributeSize = source->MaxAttributeSize, .Flags = source->Flags, .MetalVersion = source->MetalVersion,
     .LinkExports = link_exports, .LinkExportCount = source->LinkExportCount,
-    .FunctionNames = UInt32ToPtr(source->FunctionNames), .FunctionNamesSize = source->FunctionNamesSize};
+    .FunctionNames = UInt32ToPtr(source->FunctionNames), .FunctionNamesSize = source->FunctionNamesSize,
+    .Incremental = UInt32ToPtr(source->Incremental)};
   uint32_t count = 0;
   params->ret = SM50CompileRaytracingPipeline(&desc, UInt32ToPtr(params->bitcode), UInt32ToPtr(params->metallib),
       functions, params->function_capacity, &count, UInt32ToPtr(params->error));

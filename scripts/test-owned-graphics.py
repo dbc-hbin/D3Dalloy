@@ -410,6 +410,7 @@ TILED_CASES = (
     "volume-BC6H-signed-cast-identical-64KB",
     "volume-copyregion-three-axis-boundary-null-alias",
     "volume-copyregion-RTV-clear-draw-64KB-alias-byte-oracle",
+    "volume-auxiliary-remap-cross-queue-64KB",
     "volume-xyz-box-linear-mip-SKIP-REUSE-CopyTileMappings-cross-queue",
     "volume-NULL-write-remap-preserves-physical-64KB",
     "volume-predicated-CopyResource-skip-all-mips",
@@ -593,7 +594,8 @@ RAYTRACING_SHADERS = ("raytracing.dxil", "raytracing-contract.dxil", "raytracing
                       "raytracing-rayquery-stages-as.dxil", "raytracing-rayquery-stages-ms.dxil",
                       "raytracing-rayquery-stages-ms-sink.dxil", "raytracing-rayquery-stages-lib.dxil",
                       "raytracing-linkage-consumer.dxil", "raytracing-linkage-helper.dxil",
-                      "raytracing-linkage-final.dxil", "raytracing-hitobject.dxil")
+                      "raytracing-linkage-final.dxil", "raytracing-hitobject.dxil",
+                      "raytracing-transition-cs.dxil")
 RAYTRACING_OMM_SHADERS = ("raytracing-contract.dxil", "raytracing-omm.dxil", "raytracing-omm-legacy.dxil")
 # Root-argument-changing ExecuteIndirect(DISPATCH_RAYS) of tests/owned-d3d12-raytracing-rootargs.inc.
 RAYTRACING_ROOTARGS_CASES = ("dispatch-rays-root-arguments",)
@@ -1594,11 +1596,50 @@ def raytracing_refit_chain_failures(stdout: str, stderr: str) -> list[str]:
     if execution != [(name, boundary) for name in ("chain", "replay", "cross-return") for boundary in ("begin", "end")]:
         failures.append("refit chain ordered execution intervals incomplete")
     required = (recordings[0],
-                prefix + "_RESULT cases=4 refits=14 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
+                prefix + "_RESULT cases=4 refits=15 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
                 prefix + "_PASS")
     if (any(stdout.splitlines().count(line) != 1 for line in required) or any(marker in stdout + stderr for marker in
             ("OWNED_D3D12_RAYTRACING_FAIL", "OWNED_D3D12_RAYTRACING_CASE_FAIL", "OWNED_D3D12_RAYTRACING_CASE_MISMATCH"))):
         failures.append("refit chain fixture did not complete its GPU/public shadow oracle")
+    return failures
+
+
+def refit_batch_failures(stdout: str, stderr: str) -> list[str]:
+    """Check scheduling separately from the public geometry oracle used for baseline comparisons."""
+    failures = []
+    for case, expected, wait in (
+        ("refit-batch", {"ordered_in_place": 2, "ordered_out_of_place": 2}, 0),
+        ("refit-revoked", {"aliased_or_sparse_storage": 1}, 1),
+    ):
+        marker = "OWNED_D3D12_REFIT_CONTROL case=" + case
+        sections = re.findall(re.escape(marker) + r" begin(.*?)" + re.escape(marker) + r" end", stderr, re.S)
+        if len(sections) != 1:
+            failures.append("missing refit control interval: " + case)
+            continue
+        events = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1]) for line in sections[0].splitlines()
+                  if "OWNED_GRAPHICS_TRACE " in line]
+        resolutions = [e for e in events if e["event"] == "rtas_refit_resolution"]
+        batches = [e for e in events if e["event"] == "rtas_refit_batch"]
+        reads = [e for e in events if e["event"] == "rtas_metadata_readback"]
+        if (Counter(e.get("reason") for e in resolutions) != expected or
+                any(e.get("cpu_wait_count") != wait or e.get("readback_count") != wait for e in resolutions) or
+                Counter(e.get("encoder") for e in reads) != Counter(e.get("encoder") for e in resolutions if wait)):
+            failures.append("refit resolution or metadata wait differs: " + case)
+        expected_batches = [] if wait else [2]
+        if ([e.get("count") for e in batches] != expected_batches or
+                {e.get("submission") for e in batches} !=
+                {e.get("submission") for e in resolutions if e.get("reason") == "ordered_in_place"}):
+            failures.append("independent refit batch or alias boundary differs: " + case)
+        if case == "refit-batch":
+            before_flush = sections[0].split('"event":"rtas_refit_batch"', 1)[0]
+            native = before_flush.rsplit("OWNED_GRAPHICS_NATIVE_COMPUTE_BEGIN ", 1)[-1]
+            begin = re.match(r"context=\d+ encoder=(\d+) concurrent=1\b", native)
+            shadows = re.findall(r"OWNED_GRAPHICS_NATIVE_DISPATCH encoder=(\d+)\b", native)
+            if not begin or shadows != [begin[1], begin[1]]:
+                failures.append("two independent BLAS shadow dispatches did not share their native refit encoder")
+    if any(stdout.splitlines().count("OWNED_D3D12_REFIT_" + case + " lanes=4 failures=0") != 1
+           for case in ("BATCH", "ALIAS_REVOKED")):
+        failures.append("refit control ray outputs missing")
     return failures
 
 
@@ -1934,6 +1975,7 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
         "STAGE_BARRIER": r"encoder=[1-9][0-9]* after=[1-9][0-9]* before=[1-9][0-9]* implicit=1",
     }
     schemas = {
+        "PREDICATE_COPY": {"encoder", "src", "dst", "src_offset", "dst_offset", "bytes"},
         "DISPATCH": {"encoder", "pso", "mode", "grid_x", "grid_y", "grid_z", "threads_x", "threads_y", "threads_z"},
         "DISPATCH_INDIRECT": {"encoder", "pso", "argument_buffer", "argument_offset", "threads_x", "threads_y", "threads_z"},
         "DRAW_INDIRECT": {"encoder", "argument_buffer", "argument_offset", "primitive_type"},
@@ -2006,9 +2048,11 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
         resolver = [value for kind, value in commands if kind == "DISPATCH" and value["pso"] in resolver_psos]
         icbs = [value for kind, value in commands if kind == "EXECUTE_ICB"]
         if fields["kind"] == "compute":
-            generic = maximum > 0 and (int(fields["mode"]) != 0 or maximum > 1)
+            generic = maximum > 0 and int(fields["mode"]) != 0
             predicated = int(fields["mode"]) in (3, 4)
-            expected = Counter({"DISPATCH": 1 + int(generic) + int(predicated), "EXECUTE_ICB": int(generic), "DISPATCH_INDIRECT": maximum if not generic else 0})
+            expected = Counter({"DISPATCH": 1 + int(generic), "EXECUTE_ICB": int(generic),
+                                "PREDICATE_COPY": int(predicated and maximum > 0),
+                                "DISPATCH_INDIRECT": maximum if not generic else 0})
             if counts != +expected or len(resolver) != int(generic):
                 failures.append("compute native producer/resolver/indirect/ICB work differs: " + marker)
             if generic and resolver:
@@ -2019,11 +2063,15 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                     failures.append("actual resolver PSO handle not joined to producer contract")
             if generic and icbs and (icbs[0]["stage"], icbs[0]["location"], icbs[0]["length"]) != ("compute", 0, maximum):
                 failures.append("actual compute ICB range differs")
-            other = [value for kind, value in commands if kind == "DISPATCH" and value["pso"] not in resolver_psos]
-            snapshots = [value for value in other if (value["mode"], value["grid_x"], value["grid_y"], value["grid_z"], value["threads_x"], value["threads_y"], value["threads_z"]) == ("threadgroups", 1, 1, 1, 1, 1, 1)]
-            if len(snapshots) != int(predicated):
+            snapshots = [value for kind, value in commands if kind == "PREDICATE_COPY"]
+            if any(not v["src"] or not v["dst"] or v["src"] == v["dst"] or v["bytes"] != 8 or
+                   (v["src_offset"] | v["dst_offset"]) & 7 for v in snapshots):
                 failures.append("actual predicate snapshot command differs")
-            producer = [value for value in other if value not in snapshots]
+            producer = [value for kind, value in commands if kind == "DISPATCH" and value["pso"] not in resolver_psos]
+            if len(producer) == len(snapshots) == len(resolver) == 1 and not (
+                    commands.index(("DISPATCH", producer[0])) < commands.index(("PREDICATE_COPY", snapshots[0]))
+                    < commands.index(("DISPATCH", resolver[0]))):
+                failures.append("predicate snapshot must follow the argument producer and precede the resolver")
             if len(producer) != 1 or (producer[0]["mode"], producer[0]["grid_x"], producer[0]["grid_y"], producer[0]["grid_z"], producer[0]["threads_x"], producer[0]["threads_y"], producer[0]["threads_z"]) != ("threadgroups", max(1, (maximum + 31) // 32), 1, 1, 32, 1, 1):
                 failures.append("actual GPU argument producer dispatch differs")
         else:
@@ -2037,11 +2085,10 @@ def prepared_indirect_failures(stdout: str, stderr: str) -> list[str]:
                     (e.get("event") == "native_render_wait" and e.get("stages", 0) & vertex) for e in phase_events)
                 if not dependency or not ordered:
                     failures.append("graphics ICB resolver lacks GPU argument producer ordering: " + marker)
-            expected = Counter({"EXECUTE_ICB": 1}) if maximum > 64 else Counter({kind: maximum}) if maximum else Counter()
+            expected = Counter({kind: maximum}) if maximum else Counter()
             if counts != expected or resolver:
                 failures.append("graphics native fixed-count bypass work differs: " + marker)
-            if maximum > 64 and icbs and (icbs[0]["stage"], icbs[0]["location"], icbs[0]["length"]) != ("render", 0, maximum):
-                failures.append("actual graphics ICB range differs")
+
             if kind == "DRAW_INDEXED_INDIRECT" and any(value.get("index_type") != int(fields["format"]) - 1 for name, value in commands if name == kind):
                 failures.append("native indexed buffer width differs")
         payloads = [value for kind, value in commands if kind.endswith("_INDIRECT")]
@@ -2897,7 +2944,7 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
     expected = ({"distinct_compute": (1, 1, 1, 0, 1, 1),
                  "concurrent_distinct_compute": (1, 0, 1, 0, 1, 1)}
                 if suite == "pipeline-cache" else {"concurrent_graphics": (2, 2, 2, 0, 1, 2),
-                "root_abi": (2, 0, 2, 0, 1, 2), "pixel_specialization": (1, 1, 1, 1, 1, 0),
+                "root_abi": (1, 1, 1, 0, 1, 1), "pixel_specialization": (1, 1, 1, 1, 1, 0),
                 "constant_concurrent": (0, 0, 0, 1, 1, 0), "constant_distinct": (0, 0, 0, 1, 1, 0),
                 "constant_hit": (0, 0, 0, 0, 0, 0), "constant_root_abi": (1, 0, 1, 1, 1, 0),
                 "constant_entry": (1, 1, 1, 1, 1, 0), "linked_geometry_cold": (2, 2, 2, 0, 1, 2),
@@ -2907,6 +2954,7 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
     prefix = SUITE_PREFIXES[suite] + "_ARTIFACT_PHASE "
     failures, completed = [], []
     active, counts = None, {}
+    root_abi_hits = []
     captured = {"captured_layout_cold": [], "captured_layout_hit": []}
     for line in stderr.splitlines():
         if line.startswith(prefix):
@@ -2939,6 +2987,9 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
             except ValueError:
                 failures.append("malformed artifact operation trace")
                 continue
+            if (active == "root_abi" and isinstance(event, dict) and event.get("event") == "pipeline_artifact_hit"
+                    and event.get("kind") in ("air_compile", "new_library", "new_function")):
+                root_abi_hits.append(event["kind"])
             if isinstance(event, dict) and active in captured and event.get("event") in ("pipeline_artifact_operation", "pipeline_artifact_hit") and event.get("kind") in ("air_compile", "new_library"):
                 key = event.get("key")
                 if (not isinstance(key, str) or re.fullmatch(r"[0-9a-f]{40}", key) is None
@@ -2954,6 +3005,9 @@ def pipeline_artifact_failures(stderr: str, suite: str) -> list[str]:
     if active is not None or completed != list(expected):
         failures.append("artifact operation phase matrix incomplete or reordered")
     if suite == "pipeline-library":
+        # Only the live PS changes ABI. The root-free VS reuses its compiled AIR and native function.
+        if sorted(root_abi_hits) != ["air_compile", "new_function", "new_library"]:
+            failures.append("root ABI change must reuse the root-free stage AIR, library and function")
         cold, warm = captured["captured_layout_cold"], captured["captured_layout_hit"]
         cache_ids = {}
         for kind in ("air_compile", "new_library"):
@@ -3106,8 +3160,11 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
             "graph-access-3": (2, (2,), 2, 0, 1, 0, 0, 0, 0, 0),
             "graph-frontier-256": (2, (), 0, 0, 256, 0, 0, 0, 0, 0),
             "graph-frontier-512": (2, (), 0, 0, 512, 0, 0, 0, 0, 0),
-            "graph-frontier-boundary-0": (2, (2, 2), 4, 0, 61, 0, 0, 1, 0, 0),
+            "graph-frontier-boundary-0": (2, (4,), 4, 0, 61, 0, 0, 1, 0, 0),
             "graph-frontier-boundary-1": (2, (2,), 2, 0, 63, 0, 1, 1, 0, 0),
+            "graph-render-carry-0": (2, (130,), 130, 0, 0, 0, 0, 0, 0, 0),
+            "graph-render-carry-1": (2, (127, 1, 2), 129, 1, 0, 0, 0, 0, 0, 0),
+            "graph-render-carry-2": (2, (64, 66), 130, 0, 1, 0, 0, 0, 0, 0),
             "graph-mips": (1, (2,), 2, 0, 0, 1, 0, 0, 0, 0),
             "graph-union-0": (2, (3,), 3, 0, 0, 0, 0, 0, 0, 0),
             "graph-union-1": (2, (3,), 3, 0, 0, 0, 0, 0, 0, 0),
@@ -3183,7 +3240,8 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                     expected_maps = [identity, [1, 0, 2, 3, 4, 5, 6, 7], identity]
                 elif name in ("graph-union-1", "graph-union-lifetime"):
                     expected_maps = [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity]
-                expected_map_members = [0, 1, 0, 1] if name == "graph-frontier-boundary-0" else list(range(mapped))
+                expected_map_members = ([i for length in begin_members if length > 1 for i in range(length)]
+                                        if name.startswith("graph-render-carry-") else list(range(mapped)))
                 if maps != expected_maps or map_members != expected_map_members:
                     failures.append(f"graph {phase}: per-member mapping or final identity wrong")
                 expected_aspects = (Counter({4: loads - 2, 1: 1, 2: 1}) if name.startswith("graph-clears-")
@@ -3206,7 +3264,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
                         frontier_work[phase] = work[0]["history_checks"]
                     merged = [(e.get("before_list"), e.get("after_list"), e.get("members")) for e in planning if e["event"] == "submission_render_merged"]
                     clear_loads = [(e.get("clear_node"), e.get("render_node"), e.get("aspect")) for e in planning if e["event"] == "submission_clear_load"]
-                    expected_merged = [(62, 63, 2), (64, 65, 2)] if name == "graph-frontier-boundary-0" else [(64, 65, 2)] if name == "graph-frontier-boundary-1" else []
+                    expected_merged = [(62, 63, 2), (63, 64, 3), (64, 65, 4)] if name == "graph-frontier-boundary-0" else [(64, 65, 2)] if name == "graph-frontier-boundary-1" else []
                     expected_clear_loads = [(0, 62, 4)] if name == "graph-frontier-boundary-0" else []
                     if merged != expected_merged or clear_loads != expected_clear_loads or any(type(value) is not int for row in merged + clear_loads for value in row):
                         failures.append(f"graph {phase}: merge or clear promotion crossed planning partition")
@@ -3304,8 +3362,11 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
         numeric += [base + f"_GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
                     for count in (256, 512) for replay in range(2)]
         numeric += [base + f"_GRAPH_FRONTIER_BOUNDARY delayed_clear={delayed} replay={replay} "
-                    f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders={1 if delayed else 2} "
+                    f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders=1 "
                     f"clear_encoders={delayed} exact=1 sealed=1" for delayed in range(2) for replay in range(2)]
+        numeric += [base + f"_RENDER_CARRY control={control} replay={replay} final=ff000082 "
+                    f"observed={'ff000040' if control == 2 else '00000000'}"
+                    for control in range(3) for replay in range(2)]
         numeric += [base + "_GRAPH_MIPS rgba=ff000050 mip0=16 mip1=64 mip1_untouched=16 render_encoders=1 members=2 exact=1"]
         numeric += [base + f"_GRAPH_UNION unused={u} replay={r} first={('ff000030' if u else 'ff004030')} "
                     f"second={('ff005000' if u else 'ff003040')} render_encoders=1 members=3 identity_reset=1 exact=1"
@@ -3325,7 +3386,7 @@ def execution_graph_failures(stdout: str, stderr: str, suite: str) -> list[str]:
         numeric = [base + "_GRAPH_CLEAR_RESET_RELEASE_PASS old=ff200000 new=ff004000 recordings=2 "
                    "clear_encoders=2 superseded=2 released_before_retirement=1"]
     readbacks = [line for line in stdout.splitlines()
-                 if line.startswith((base + "_GRAPH_", base + "_CROSS_LIST"))]
+                 if line.startswith((base + "_GRAPH_", base + "_CROSS_LIST", base + "_RENDER_CARRY"))]
     if readbacks != numeric:
         failures.append("graph GPU readback matrix missing, duplicated, reordered or incorrect")
     return failures
@@ -3539,6 +3600,9 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
     if "_FAIL" in stdout + stderr or "_EXPECT" in stdout + stderr:
         failures.append("game fixture reported a failure")
     if suite in ("ngx-fg", "ngx-features"):
+        if [line for line in lines if line.startswith("OWNED_FG_CONTRACT_PASS")] != [
+                "OWNED_FG_CONTRACT_PASS evaluations=144 native_inputs=1 same_encode_scatter=1"]:
+            failures.append("NGX native inputs and same-encode output comparison incomplete")
         rows = re.findall(r"^OWNED_D3D12_NGX_NATIVE frame=(\d+) reset=([01]) replay=([01]) output_written=1 different_current=([01]) resources_released=1 consumer=gpu_readback frame_id=(\d+) not_rendering=([01])$", stdout, re.MULTILINE)
         expected = [(frame, replay) for frame in range(9) for replay in range(2 if frame in (0, 7, 8) else 1)]
         if ([(int(f), int(r)) for f, _, r, *_ in rows] != expected
@@ -3567,7 +3631,7 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
         cameras = re.findall(r"^OWNED_D3D12_NGX_CAMERA_MOTION ortho=([01]) frame=(\d+) max_delta=(\d+) different_zero=([01]) row_major=1 translated_last_row=1 matrix_snapshotted=1$", stdout, re.MULTILINE)
         if ([(int(o), int(f)) for o, f, _, _ in cameras] != [(o, f) for o in (0, 1) for f in range(6)]
                 or sum(line.startswith("OWNED_D3D12_NGX_CAMERA_MOTION") for line in lines) != 12
-                or any(int(delta) > 1 for _, _, delta, _ in cameras)
+                or any(int(delta) > 255 for _, _, delta, _ in cameras)
                 or any(not any(int(effect) for o, _, _, effect in cameras if int(o) == ortho) for ortho in (0, 1))):
             failures.append("NGX perspective/orthographic camera reconstruction oracle incomplete")
         if [line for line in lines if line.startswith("OWNED_D3D12_NGX_SCENE")] != [
@@ -3616,7 +3680,7 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
         return failures
     elif suite == "ngx-fg":
         expected = [
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 isp=1 other=0",
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode",
             *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho={o} frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1" for o in (0, 1)],
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1",
@@ -3632,10 +3696,11 @@ def game_suite_failures(suite: str, stdout: str, stderr: str = "") -> list[str]:
         if len(responsivity) != 1:
             failures.append("NGX RR history-responsivity numeric effect missing")
         expected = [
-            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 isp=1 other=0",
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode",
             *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho={o} frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1" for o in (0, 1)],
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_ui premultiplied=1 alpha_only=1 independent_ui_origin=1 invalid_inputs=1 release_before_execute=1 replay=1",
+            "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_isp feature=9 direct=1 atlas=1 invalid_rect=1 release_before_execute=1 replay=1",
             *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8" for v in range(8)],
             *[f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb={value} origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1" for value in responsivity],
             "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1",
@@ -4097,7 +4162,8 @@ def suite_inputs(suite: str, fixture: Path, dxil_dir: Path) -> list[Path]:
         "ngx-features": ("owned-d3d12-ngx-features.cpp", "owned-d3d12-ngx.cpp",
                          "owned-d3d12-temporal.cpp", "owned-rr-pattern.h",
                          "owned-rr-native-control.mm", "owned-d3d12-ngx-msvc.cpp",
-                         "owned-d3d12-ngx-present.inc", "owned-fg-present.h"),
+                         "owned-d3d12-ngx-present.inc", "owned-fg-present.h",
+                         "owned-fg-contract.h", "owned-fg-contract-guest.inc"),
         "dxgi-factory": ("owned-dxgi-factory-events.cpp",),
         "dxgi-fullscreen": ("owned-dxgi-fullscreen.cpp",),
         "corewindow-composition": ("owned-d3d12-corewindow-composition.cpp", "owned-d3d12-composition.inc"),
@@ -4389,10 +4455,11 @@ def placed_render_output_matches(stdout: str) -> bool:
 
 def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> bool:
     success = (success
-               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 47
+               and stdout.count("OWNED_D3D12_RENDER_PASSES_CASE_PASS ") == 50
                and all(stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_CASE_PASS case=" + case) == 1
                        for case in ("graph-frontier-256", "graph-frontier-512",
                                     "graph-frontier-overlap-group-boundary", "graph-frontier-delayed-clear-boundary",
+                                    "render-carry-positive", "render-carry-global", "render-carry-observer",
                                     "graph-cross-execute-producer", "depth-clear-srv-compute-read",
                                     "final-discard-query-split", "final-discard-suspend-resume",
                                     "placed-render-same-list-union", "placed-render-committed-leader",
@@ -4421,7 +4488,7 @@ def render_passes_output_matches(stdout: str, stderr: str, success: bool) -> boo
                and "OWNED_D3D12_RENDER_PASSES_SUSPEND_RESUME pixel=ff204010" in stdout
                and "OWNED_D3D12_RENDER_PASSES_VALIDATION_PASS rejected=10 conformant_barrier=1" in stdout
                and "OWNED_D3D12_RENDER_PASSES_UINT_BORDER b0000=0000 b0001=0001 b1111=1111" in stdout
-               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=47") == 1
+               and stdout.splitlines().count("OWNED_D3D12_RENDER_PASSES_PASS cases=50") == 1
                and "_FAIL" not in stdout)
     return success
 
@@ -4903,12 +4970,39 @@ def submission_foundation_output_matches(stdout: str, stderr: str, native_compil
                 ("descriptor_cache_builds", int(not hit)), ("descriptor_resolutions", int(not hit))))
         except (ValueError, TypeError, AttributeError):
             cache_ok = False
+    for name, tail in (("dispatch_window_raw_65", 1), ("dispatch_window_war_128", 64)):
+        blocks = re.findall(r"^" + phase_prefix + "begin=" + name + r"\r?\n(.*?)^" +
+                            phase_prefix + "end=" + name + r"\r?$", stderr, re.MULTILINE | re.DOTALL)
+        if len(blocks) != 1:
+            return False
+        try:
+            scoped = [json.loads(line.split("OWNED_GRAPHICS_TRACE ", 1)[1])
+                      for line in blocks[0].splitlines() if "OWNED_GRAPHICS_TRACE " in line]
+            windows = [event for event in scoped if event.get("event") == "native_compute_begin"]
+            if [(e.get("dispatches"), e.get("concurrent")) for e in windows] != [(64 + tail, 0)]:
+                return False
+            context = windows[0].get("native_context")
+            match = re.search(rf"OWNED_GRAPHICS_NATIVE_COMPUTE_BEGIN context={context} encoder=(\d+) concurrent=0\b", blocks[0])
+            if not match:
+                return False
+            dispatch_stage = 1 << 27
+            operations = re.findall(rf"OWNED_GRAPHICS_NATIVE_(DISPATCH|STAGE_BARRIER) encoder={match[1]}\b([^\n]*)", blocks[0])
+            dispatches, barriers = 0, []
+            for kind, fields in operations:
+                if kind == "DISPATCH":
+                    dispatches += 1
+                elif f"after={dispatch_stage} before={dispatch_stage} implicit=1" in fields:
+                    barriers.append(dispatches)
+            if dispatches != 64 + tail or barriers != [64]:
+                return False
+        except (ValueError, TypeError, AttributeError):
+            return False
     return bool(success and native_compiler_proof and not failures and
         cases == ["volatile_replay","descriptor_cache_reuse","retired_icb_reuse","placed_alias_clears",
                   "placed_disjoint_ranges","placed_sparse_range_replay","query_fanout","sparse_mapping_positive","cpu_strip_transfer",
                   "dispatch_independence"] and
         stdout.count("OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10") == 1 and cache_ok and
-        stdout.count("case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial "
+        stdout.count("case=dispatch_independence phases=13 table_replays=4 potential_raw_war_waw=serial "
                      "budget=65 roots=8 external_alias=serial all_words_and_guards=exact") == 1 and
         any(e.get("reason") == "dispatch_external_backing" and e.get("dispatches") == 3 and
             e.get("concurrent") == 0 for e in events("native_compute_begin")) and
@@ -5475,11 +5569,11 @@ def present_history_output_matches(stdout: str, stderr: str, success: bool) -> b
                 ("stationary-scroll", "f61989e8"), ("large-inner-scroll", "26eba67d"),
                 ("large-edge-dirty", "97e990ef"), ("adjacent-full", "85cec9c5"),
                 ("bands-cover-scroll", "d8bb0bdc"), ("large-dirty-gap", "23e1bf9f"),
-                ("corner-gap", "ebe409c7")]
+                ("corner-gap", "ebe409c7"), ("staggered-cover-scroll", "024dff86")]
     phases = re.findall(r"^OWNED_D3D12_PRESENT_HISTORY_PHASE (begin|end)=([\w-]+)\r?$", stderr, re.MULTILINE)
     return bool(success and history == expected and phases == [
         (edge, name) for name, _ in expected for edge in ("begin", "end")] and
-        stdout.count("OWNED_D3D12_PRESENT_HISTORY_PASS cases=15 pixels=720 full_dirty=4 partial=10 crop=4 queues=2 exact=1") == 1 and
+        stdout.count("OWNED_D3D12_PRESENT_HISTORY_PASS cases=16 pixels=768 full_dirty=4 partial=11 crop=4 queues=2 exact=1") == 1 and
         "OWNED_D3D12_PRESENT_HISTORY_FAIL" not in stdout + stderr and
         "OWNED_D3D12_PRESENT_QUEUES_FAIL" not in stdout + stderr)
 
@@ -6599,6 +6693,11 @@ def fsr_fg_output_matches(stdout: str, stderr: str, success: bool) -> bool:
                                   r"sync_refresh=(\d+) sync_qpc=(\d+) qpc_end=(\d+) frequency=(\d+) "
                                   r"source=public_dxgi_actual_presentation", stdout)
     observations_ok = len(statistics) == 16 and [row[0] for row in final_statistics] == ["callback", "builtin_ui"]
+    ready = re.findall(r"OWNED_D3D12_FSR_FG_READY stream=(callback|builtin_ui) attempts=(\d+) actual=(\d+) sync_qpc=(\d+)", stdout)
+    if ready:
+        observations_ok &= ([row[0] for row in ready] == ["callback", "builtin_ui"] and
+                            all(1 <= int(actual) <= int(attempts) <= 64 and int(qpc) > 0 for _, attempts, actual, qpc in ready))
+    bootstrap = {stream: int(attempts) for stream, attempts, _, _ in ready}
     if observations_ok:
         for rows, final, requested in zip((statistics[:12], statistics[12:]), final_statistics,
                                           (len(expected_callbacks), len(ui_frames))):
@@ -6618,7 +6717,7 @@ def fsr_fg_output_matches(stdout: str, stderr: str, success: bool) -> bool:
                     observations_ok &= int(result, 0) == 0x887A000B and values == (0, 0, 0, 0)
                 previous_submitted = submitted
             observations_ok &= (final[1] == "actual" and final[3] == rows[-1][3] and
-                                int(final[3]) == requested and len(frequencies) == 1)
+                                int(final[3]) == requested + bootstrap.get(final[0], 0) and len(frequencies) == 1)
     success = (success
                and stdout.count("OWNED_D3D12_FSR_FG_ORIGINAL_SDK_PASS resize1=unsupported unchanged=1 resize=implemented pacing=original") == 1
                and "OWNED_D3D12_FSR_FG_DIRECT_PASS snapshot=exact rect_guard=exact frames=4" in stdout
@@ -6812,6 +6911,11 @@ def run(args: argparse.Namespace) -> int:
     frozen = out / "fixture"
     frozen.mkdir()
     sources = [fixture, *suite_inputs(args.suite, fixture, args.dxil_dir)]
+    fg_contract = args.suite in ("ngx-fg", "ngx-features")
+    if fg_contract:
+        if args.mode != "no-present":
+            raise ValueError(f"--suite {args.suite} requires --mode no-present")
+        sources.append(REPOSITORY_ROOT / "graphics-translator/tests/owned-fg-contract-observer.mm")
     rr_oracle_dir = getattr(args, "rr_oracle_dir", None)
     rr_oracle_inputs = {}
     rr_native_validation_errors = []
@@ -6840,7 +6944,7 @@ def run(args: argparse.Namespace) -> int:
     elif rr_oracle_dir is not None:
         raise ValueError("--rr-oracle-dir is only supported with --suite ngx-features")
     fg_observer = getattr(args, "fg_observer", None)
-    if args.suite in ("ngx-alpha", "ngx-fg") and args.mode != "no-present":
+    if args.suite == "ngx-alpha" and args.mode != "no-present":
         raise ValueError(f"--suite {args.suite} requires --mode no-present")
     if args.suite == "ngx-fg-present" and args.mode != "present":
         raise ValueError("--suite ngx-fg-present requires --mode present")
@@ -6888,12 +6992,25 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError(f"--suite {args.suite} requires a runtime staged with --with-fsr ({selection}=true)")
     arch = execution_architecture(manifest,
                                   executable, getattr(args, "guest_arch", None))
+    if fg_contract:
+        contract_observer = frozen / "owned-fg-contract-observer.dylib"
+        build_observer = ["/usr/bin/xcrun", "--sdk", "macosx", "clang++", "-dynamiclib", "-std=c++20",
+                          "-fno-objc-arc", "-arch", arch["native_arch"], str(contract_observer.with_suffix(".mm")),
+                          "-framework", "Metal", "-framework", "MetalFX", "-framework", "Foundation",
+                          "-o", str(contract_observer)]
+        with (out / "fg-contract-build.log").open("w") as log:
+            subprocess.run(build_observer, stdout=log, stderr=subprocess.STDOUT, timeout=120, check=True)
+        if macho_architectures(contract_observer) != [arch["native_arch"]]:
+            raise ValueError("FG contract observer does not match the Wine host architecture")
+        sources.append(contract_observer)
     agility_inputs = prepare_agility_inputs(runtime, manifest, arch, frozen) if args.suite == "agility" else None
     env = dict(os.environ)
     for key in tuple(env):
         if (key.startswith(("D3DM", "GPTK_", "DXVK_", "D3DALLOY_", "OWNED_GRAPHICS_", "DYLD_"))
                 or key in {"WINEDLLPATH", "WINEDLLPATH_PREPEND", "WINEDLLOVERRIDES",
-                           "OWNED_FG_OBSERVER", "FG_CAPTURE_DIR", "FG_CAPTURE_CONSUMER", "FG_CAPTURE_SUITE",
+                           "OWNED_FG_OBSERVER", "OWNED_FG_CONTRACT_PROBE", "OWNED_FG_CONTRACT_DIR",
+                           "OWNED_FG_CONTRACT_CONSUMER",
+                           "FG_CAPTURE_DIR", "FG_CAPTURE_CONSUMER", "FG_CAPTURE_SUITE",
                            "CX_ACTIVE_GRAPHICS_BACKEND", "CX_APPLEGPTK_LIBD3DSHARED_PATH"}):
             env.pop(key)
     env.update({
@@ -6924,6 +7041,9 @@ def run(args: argparse.Namespace) -> int:
         env["FG_CAPTURE_DIR"] = str(capture_dir)
         env["FG_CAPTURE_CONSUMER"] = executable.name
         env["FG_CAPTURE_SUITE"] = args.suite
+    if fg_contract:
+        env.update(OWNED_FG_OBSERVER=str(contract_observer), OWNED_FG_CONTRACT_PROBE="1",
+                   OWNED_FG_CONTRACT_DIR=str(frozen), OWNED_FG_CONTRACT_CONSUMER=executable.name)
     if args.suite in ("shader-cache", "pipeline-cache", "pipeline-library"):
         env["OWNED_SHADER_CACHE_CONTROL_ISOLATED"] = "1"
     if args.suite == "pipeline-cache":
@@ -7074,6 +7194,7 @@ def run(args: argparse.Namespace) -> int:
         "fg_observer_dependencies": fg_observer_dependencies,
         "fg_observer_architectures": fg_observer_architectures,
         "fg_observer_dependencies_by_architecture": fg_observer_dependencies_by_architecture,
+        "fg_contract_observer_build": build_observer if fg_contract else None,
         "oracle_environment": ({"OWNED_FSR_NATIVE_MAX_SCALE": env.get("OWNED_FSR_NATIVE_MAX_SCALE")}
                                if args.suite == "fsr" else {}),
     }
@@ -7218,6 +7339,9 @@ def run(args: argparse.Namespace) -> int:
             validation_errors.append("Composition requires Metal API or API-and-shader validation")
     if args.suite in ("sr-alpha", "fsr-debug", "ngx-features", "ngx-alpha", "ngx-fg", "dxgi-factory", "dxgi-fullscreen"):
         validation_errors.extend(game_suite_failures(args.suite, stdout, stderr))
+        if fg_contract and ("OWNED_FG_CONTRACT_OBSERVER_READY" not in stderr.splitlines()
+                            or not any(line.endswith(" " + str(contract_observer)) for line in dyld)):
+            validation_errors.append("FG contract observer was not loaded and ready at the native MetalFX boundary")
         success = success and native_compiler_proof
         dxil_compiler_loaded = native_compiler_proof
     if args.suite in ("ngx-features", "ngx-fg-present", "ngx-alpha", "ngx-fg"):
@@ -7498,6 +7622,8 @@ def run(args: argparse.Namespace) -> int:
     if args.suite == "raytracing-refit-chain":
         dxil_compiler_loaded = native_compiler_proof
         chain_failures = raytracing_refit_chain_failures(stdout, stderr)
+        if args.require_refit_batching:
+            chain_failures += refit_batch_failures(stdout, stderr)
         raytracing_evidence = {"refit_chain": True, "failures": chain_failures}
         success = success and dxil_compiler_loaded and not chain_failures
     if args.suite == "raytracing-metadata-arena":
@@ -7563,6 +7689,25 @@ def run(args: argparse.Namespace) -> int:
         raytracing_evidence["rootargs_cases"] = list(rootargs_cases)
         success = (success and rootargs_cases == RAYTRACING_ROOTARGS_CASES
                    and "OWNED_D3D12_RAYTRACING_ROOTARGS_MISMATCH" not in stderr)
+        transition_cases = tuple((name, int(execution), int(count), int(raygen), int(compute))
+                                 for name, execution, count, raygen, compute in re.findall(
+            r"^OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=([\w-]+) execution=(\d+) count=(\d+) "
+            r"raygen=(\d+) expected_raygen=\d+ compute=(\d+) expected_compute=\d+ status=PASS$",
+            stdout, re.MULTILINE))
+        expected_transitions = (
+            ("barrier-control", 0, 1, 64, 2),
+            ("compute-raygen-same-compute", 0, 1, 64, 2),
+            ("predicated-off-raygen-then-compute", 0, 1, 0, 2),
+            ("closed-indirect-list-count-one-then-zero", 0, 1, 64, 2),
+            ("closed-indirect-list-count-one-then-zero", 1, 0, 0, 2),
+            ("zero-width-then-compute", 0, 1, 0, 2),
+            ("zero-height-then-compute", 0, 1, 0, 2),
+            ("zero-depth-then-compute", 0, 1, 0, 2),
+            ("zero-depth-large-width-height-then-compute", 0, 1, 0, 2),
+        )
+        raytracing_evidence["transition_cases"] = list(transition_cases)
+        success = (success and transition_cases == expected_transitions
+                   and stdout.count("OWNED_D3D12_RAYTRACING_TRANSITIONS_PASS") == 1)
         success = (success and dxil_compiler_loaded and not raytracing_failures_found
                    and rayquery_cases == RAYTRACING_RAYQUERY_CASES
                    and "OWNED_D3D12_RAYTRACING_RAYQUERY failures=0" in stdout
@@ -7836,7 +7981,11 @@ def main() -> int:
     parser.add_argument("--low-latency-performance", action="store_true",
                         help="low-latency suite only: disable owned tracing and info/debug logging; retain "
                              "timestamp, exact readback, public API and provenance checks; trace assertions are not exercised")
+    parser.add_argument("--require-refit-batching", action="store_true",
+                        help="require independent, ping-pong and alias-revoked GPU refit evidence")
     args = parser.parse_args()
+    if args.require_refit_batching and args.suite != "raytracing-refit-chain":
+        parser.error("--require-refit-batching requires --suite raytracing-refit-chain")
     if not 1 <= args.timeout <= 600:
         parser.error("--timeout must be between 1 and 600 seconds")
     return run(args)

@@ -387,6 +387,7 @@ struct sm50_rt_pipeline_desc32 {
   uint32_t MaxRecursionDepth, MaxPayloadSize, MaxAttributeSize, Flags, MetalVersion;
   uint32_t LinkExports, LinkExportCount, FunctionNames;
   uint64_t FunctionNamesSize;
+  uint32_t Incremental;
 };
 struct sm50_rt_library32 { uint32_t Bytecode; uint64_t Size; };
 struct sm50_rt_export32 {
@@ -397,7 +398,8 @@ struct sm50_rt_export32 {
 struct sm50_rt_function_info32 {
   uint32_t Name, ExportName, Kind, ExportIndex, TableIndex, Flags;
 };
-_Static_assert(sizeof(struct sm50_rt_pipeline_desc32) == 72, "raytracing pipeline description ABI");
+_Static_assert(sizeof(struct sm50_rt_pipeline_desc32) == 80, "raytracing pipeline description ABI");
+_Static_assert(sizeof(struct SM50_RT_INCREMENTAL) == 32, "raytracing incremental state ABI");
 _Static_assert(sizeof(struct sm50_rt_export32) == 48, "raytracing export ABI");
 #if !defined(__LP64__) && !defined(_WIN64)
 _Static_assert(sizeof(struct SM50_RT_PIPELINE_DESC) == sizeof(struct sm50_rt_pipeline_desc32), "raytracing caller description ABI");

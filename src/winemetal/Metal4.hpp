@@ -20,6 +20,18 @@ inline struct WMTMetal4Call Metal4Invoke(uint32_t operation, Args... args) {
   return call;
 }
 
+struct ASGenerationInfo {
+  uint64_t resourceID, nativeSize, instanceCount;
+};
+inline ASGenerationInfo ReadASGeneration(AccelerationStructureSidecar sidecar) {
+  const auto call = Metal4Invoke(WMTMetal4ASGenerationInfo, sidecar.handle);
+  return {call.ret[0], call.ret[1], call.ret[2]};
+}
+
+inline Allocation FindASGeneration(AccelerationStructureSidecar sidecar, uint64_t resource_id) {
+  return Allocation{Metal4Invoke(WMTMetal4FindASGeneration, sidecar.handle, resource_id).ret[0]};
+}
+
 class MTL4CommandAllocator : public Object {
 public:
   void reset() { Metal4Invoke(WMTMetal4ResetAllocator, handle); }
@@ -102,8 +114,10 @@ public:
 
 class MTL4ComputeCommandEncoder : public MTL4CommandEncoder {
 public:
-  void encodeCommands(const wmtcmd_compute_nop *commands, uint64_t independent_dispatch_mask = 0) {
-    Metal4Invoke(WMTMetal4ComputeCommands, handle, Metal4CPUPointer(commands), independent_dispatch_mask);
+  void encodeCommands(const wmtcmd_compute_nop *commands, uint64_t independent_dispatch_mask = 0,
+                      const uint64_t *next_masks = nullptr, size_t mask_count = 0) {
+    Metal4Invoke(WMTMetal4ComputeCommands, handle, Metal4CPUPointer(commands), independent_dispatch_mask,
+                 mask_count ? Metal4CPUPointer(next_masks) : 0, mask_count);
   }
   void encodeCommands(const wmtcmd_blit_nop *commands) {
     Metal4Invoke(WMTMetal4BlitCommands, handle, commands ? WMTGetGuestWindowBase() + uintptr_t(commands) : 0);
@@ -139,11 +153,20 @@ public:
              AccelerationStructureSidecar destination, Buffer scratch, uint64_t offset) {
     return Metal4Invoke(WMTMetal4ASRefit, handle, descriptor.handle, source.handle, destination.handle, scratch.handle, offset).ret[0] != 0;
   }
+  bool refitBatch(const WMTMetal4RefitEntry *entries, size_t count) {
+    return Metal4Invoke(WMTMetal4ASRefitBatch, handle, Metal4CPUPointer(entries), count).ret[0] != 0;
+  }
   bool copy(AccelerationStructureSidecar source, AccelerationStructureSidecar destination, uint32_t mode) {
     return Metal4Invoke(WMTMetal4ASCopy, handle, source.handle, destination.handle, mode).ret[0] != 0;
   }
+  bool copyNativeAS(Allocation source, AccelerationStructureSidecar destination, uint32_t mode) {
+    return Metal4Invoke(WMTMetal4ASCopy, handle, source.handle, destination.handle, mode, 1).ret[0] != 0;
+  }
   void compactedSize(AccelerationStructureSidecar source, Buffer destination, uint64_t offset) {
     Metal4Invoke(WMTMetal4ASCompactedSize, handle, source.handle, destination.handle, offset);
+  }
+  void compactedSizeOfNative(Allocation structure, Buffer destination, uint64_t offset) {
+    Metal4Invoke(WMTMetal4ASCompactedSize, handle, structure.handle, destination.handle, offset, 1);
   }
 };
 
@@ -241,8 +264,12 @@ public:
     return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, uint64_t(concurrent),
                                                   uint64_t(external_backing)).ret[0]};
   }
-  MTL4ComputeCommandEncoder blitCommandEncoder() { return computeCommandEncoder(); }
-  MTL4ComputeCommandEncoder accelerationStructureCommandEncoder() { return computeCommandEncoder(); }
+  MTL4ComputeCommandEncoder blitCommandEncoder() {
+    return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, 0, 0, 1).ret[0]};
+  }
+  MTL4ComputeCommandEncoder accelerationStructureCommandEncoder(bool independent = false) {
+    return MTL4ComputeCommandEncoder{Metal4Invoke(WMTMetal4ComputeEncoder, handle, uint64_t(independent), 0, 2).ret[0]};
+  }
 };
 
 inline Reference<MTL4Submission> MTL4CommandQueue::commit(const MTL4CommandBuffer *buffers, uint64_t count) {

@@ -261,6 +261,120 @@ void wait(Context &ctx) {
   require(WaitForSingleObject(ctx.event, kFenceTimeoutMs) == WAIT_OBJECT_0, "refit chain: fence timeout");
 }
 
+// Two disjoint placed BLAS updates may overlap. A later update of A must complete after
+// its first update, and the single TLAS consumes the final geometry of both BLAS.
+int runBatch(ID3D12Device5 *device, Context &ctx, contract::Runner &run) {
+  // Two independent refits with more than 4,096 potential range pairs.
+  // Only the first two geometries intersect the fixture rays.
+  constexpr UINT geometry_count = 65;
+  std::array<std::array<D3D12_RAYTRACING_GEOMETRY_DESC, geometry_count>, 3> geometry{};
+  const float distant[] = {128,0,0, 129,0,0, 128,1,0};
+  const auto far_vb = run.upload(distant, sizeof(distant));
+  for (UINT step = 0; step < geometry.size(); ++step) {
+    const auto v = vertices(step);
+    auto vb = run.upload(v.data(), sizeof(v));
+    for (UINT g = 0; g < 2; ++g)
+      geometry[step][g] = contract::triangles(vb->GetGPUVirtualAddress() + g * 36, 12, 3,
+          DXGI_FORMAT_R32G32B32_FLOAT, D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE);
+    std::fill(geometry[step].begin() + 2, geometry[step].end(),
+        contract::triangles(far_vb->GetGPUVirtualAddress(), 12, 3, DXGI_FORMAT_R32G32B32_FLOAT,
+            D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE));
+  }
+  auto inputs = contract::blasInputs(geometry[0].data(), geometry_count, kFlags);
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+  device->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+  auto desc = bufferDesc(info.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+      D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE);
+  const auto storage = device->GetResourceAllocationInfo(0, 1, &desc);
+  D3D12_HEAP_DESC heap_desc{};
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.SizeInBytes = storage.SizeInBytes * 2;
+  ComPtr<ID3D12Heap> heap;
+  check(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)), "batch: mixed heap");
+  std::array<ComPtr<ID3D12Resource>, 2> blas, scratch;
+  for (UINT i : {1u, 0u}) {
+    check(device->CreatePlacedResource(heap.Get(), i * storage.SizeInBytes, &desc,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr, IID_PPV_ARGS(&blas[i])), "batch: BLAS");
+    scratch[i] = run.uavBuffer(std::max(info.ScratchDataSizeInBytes, info.UpdateScratchDataSizeInBytes));
+  }
+  Recording first(device), second(device);
+  ID3D12GraphicsCommandList4 *recording = first.list.Get();
+  auto command = [&](UINT member, UINT step, ID3D12Resource *source = nullptr, ID3D12Resource *dest = nullptr) {
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+    build.Inputs = contract::blasInputs(geometry[step].data(), geometry_count, kFlags);
+    build.DestAccelerationStructureData = (dest ? dest : blas[member].Get())->GetGPUVirtualAddress();
+    if (step) {
+      build.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+      build.SourceAccelerationStructureData = (source ? source : blas[member].Get())->GetGPUVirtualAddress();
+    }
+    build.ScratchAccelerationStructureData = scratch[member]->GetGPUVirtualAddress();
+    recording->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+  };
+  command(0, 0); command(1, 0); uavBarrier(recording, nullptr);
+  command(0, 1);
+  first.close();
+  recording = second.list.Get();
+  command(1, 1);
+  second.close();
+  recording = ctx.list.Get();
+  uavBarrier(recording, nullptr);
+  auto alternate = run.asBuffer(info.ResultDataMaxSizeInBytes);
+  command(0, 1, blas[0].Get(), alternate.Get()); uavBarrier(ctx.list.Get(), nullptr);
+  command(0, 2, alternate.Get(), blas[0].Get()); uavBarrier(ctx.list.Get(), nullptr);
+  auto instances_data = instances(0, blas[0]->GetGPUVirtualAddress());
+  instances_data[1].AccelerationStructure = blas[1]->GetGPUVirtualAddress();
+  auto instance_input = run.upload(instances_data.data(), sizeof(instances_data));
+  auto tlas = run.build(contract::tlasInputs(instance_input->GetGPUVirtualAddress(), 2), "batch: TLAS");
+  std::vector<contract::LaneRay> rays;
+  for (UINT i = 0; i < 4; ++i)
+    rays.push_back(contract::ray(4.0f * (i % 2) + 0.25f, 4.0f * (i / 2) + 0.25f,
+        -1, 0, 0, 1, 0, 0xff, 0, 0));
+  auto check_rays = [&](const char *name, ID3D12Resource *top, float first_distance) {
+    std::fprintf(stderr, "OWNED_D3D12_REFIT_CONTROL case=%s begin\n", name); std::fflush(stderr);
+    if (!std::strcmp(name, "refit-batch")) {
+      ID3D12CommandList *lists[] = {first.list.Get(), second.list.Get()};
+      ctx.queue->ExecuteCommandLists(2, lists);
+    }
+    const auto words = run.trace(name, top->GetGPUVirtualAddress(), rays);
+    std::fprintf(stderr, "OWNED_D3D12_REFIT_CONTROL case=%s end\n", name); std::fflush(stderr);
+    int failures = 0;
+    for (UINT i = 0; i < 4; ++i)
+      failures += run.expect(name, words, i, contract::triangleHit(i < 2 ? first_distance : 3.f, .25f, .25f,
+          contract::kHitGroupTagBase, 0x80 + i / 2, i / 2, i % 2));
+    return failures;
+  };
+  int bad = check_rays("refit-batch", tlas.Get(), 5.f);
+  std::printf("OWNED_D3D12_REFIT_BATCH lanes=4 failures=%d\n", bad);
+  // The overlapping owner is never activated. Even after it dies the original
+  // resource must keep working, but the allocation-history proof stays revoked.
+  ComPtr<ID3D12Resource> overlapping;
+  check(device->CreatePlacedResource(heap.Get(), 0, &desc, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+      nullptr, IID_PPV_ARGS(&overlapping)), "batch: overlapping placement");
+  overlapping.Reset();
+  command(0, 1); uavBarrier(ctx.list.Get(), nullptr);
+  auto alias_tlas = run.build(contract::tlasInputs(instance_input->GetGPUVirtualAddress(), 2), "alias: TLAS");
+  const int alias_bad = check_rays("refit-revoked", alias_tlas.Get(), 3.f);
+  std::printf("OWNED_D3D12_REFIT_ALIAS_REVOKED lanes=4 failures=%d\n", alias_bad);
+  bad += alias_bad;
+  auto abandon_then_update = [&](const char *name, UINT unpublished_geometries, UINT step, float distance) {
+    Recording abandoned(run.device());
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC unused{};
+    unused.Inputs = contract::blasInputs(geometry[0].data(), unpublished_geometries, kFlags);
+    unused.DestAccelerationStructureData = blas[0]->GetGPUVirtualAddress();
+    unused.ScratchAccelerationStructureData = scratch[0]->GetGPUVirtualAddress();
+    abandoned.list->BuildRaytracingAccelerationStructure(&unused, 0, nullptr);
+    abandoned.close(); // Newest at record time only; its native BLAS has never been built.
+    command(0, step); uavBarrier(ctx.list.Get(), nullptr);
+    auto top = run.build(contract::tlasInputs(instance_input->GetGPUVirtualAddress(), 2), name);
+    return check_rays(name, top.Get(), distance);
+  };
+  const int same_shape = abandon_then_update("refit-abandoned-same", geometry_count, 2, 5.f);
+  const int other_shape = abandon_then_update("refit-abandoned-shape", 1, 1, 3.f);
+  std::printf("OWNED_D3D12_REFIT_ABANDONED same_shape_failures=%d other_shape_failures=%d rays=8\n",
+      same_shape, other_shape);
+  return bad + same_shape + other_shape;
+}
+
 int runAll(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &dxil) {
   char indexedEnv[2]{};
   const bool indexed = GetEnvironmentVariableA("OWNED_D3D12_REFIT_INDEXED", indexedEnv, sizeof(indexedEnv)) == 1 &&
@@ -352,6 +466,8 @@ int runAll(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &dxil
   // R2 is recorded before B too: it captures the same native sidecars as R.
   Capture secondary(run, structures[0].Get(), structures[1].Get(), 1, indexed);
   copyInputs(cross.list.Get(), 3, false);
+  // This private vertex input is unchanged until the immediately following BLAS refit.
+  build(cross.list.Get(), 0, inputs[0], true);
   for (UINT i = 0; i < 2; ++i) build(cross.list.Get(), i, inputs[i], true);
   secondary.ray(cross.list.Get(), 0);
   secondary.metadata(cross.list.Get());
@@ -390,7 +506,8 @@ int runAll(ID3D12Device5 *device, Context &ctx, const std::vector<uint8_t> &dxil
   std::fprintf(stderr, "OWNED_D3D12_REFIT_CHAIN_EXECUTE case=cross-return end\n"); std::fflush(stderr);
   bad += secondary.verify("cross-queue", {3}, prebuild);
   bad += primary.verify("after-cross", {1, 2}, prebuild);
-  std::printf("OWNED_D3D12_REFIT_CHAIN_RESULT cases=4 refits=14 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=%d\n", bad);
+  bad += runBatch(device, ctx, run);
+  std::printf("OWNED_D3D12_REFIT_CHAIN_RESULT cases=4 refits=15 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=%d\n", bad);
   if (!bad) std::puts("OWNED_D3D12_REFIT_CHAIN_PASS");
   return bad ? 1 : 0;
 }

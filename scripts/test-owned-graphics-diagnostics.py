@@ -111,6 +111,16 @@ OWNED_D3D12_RAYTRACING_RAYQUERY_CASE ms lanes=24 status=PASS
 OWNED_D3D12_RAYTRACING_RAYQUERY_STAGES failures=0
 OWNED_D3D12_RAYTRACING_RAYQUERY failures=0
 OWNED_D3D12_RAYTRACING_ROOTARGS_CASE dispatch-rays-root-arguments slots=4 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=barrier-control execution=0 count=1 raygen=64 expected_raygen=64 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=compute-raygen-same-compute execution=0 count=1 raygen=64 expected_raygen=64 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=predicated-off-raygen-then-compute execution=0 count=1 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=closed-indirect-list-count-one-then-zero execution=0 count=1 raygen=64 expected_raygen=64 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=closed-indirect-list-count-one-then-zero execution=1 count=0 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=zero-width-then-compute execution=0 count=1 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=zero-height-then-compute execution=0 count=1 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=zero-depth-then-compute execution=0 count=1 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITION_CASE case=zero-depth-large-width-height-then-compute execution=0 count=1 raygen=0 expected_raygen=0 compute=2 expected_compute=2 status=PASS
+OWNED_D3D12_RAYTRACING_TRANSITIONS_PASS
 OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE geometry-index lanes=24 status=PASS
 OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE hit-group-indexing lanes=8 status=PASS
 OWNED_D3D12_RAYTRACING_COVERAGE_FEATURE miss-index lanes=8 status=PASS
@@ -306,7 +316,7 @@ class RunnerFailures(unittest.TestCase):
     def test_pipeline_artifacts_require_real_operations_within_joined_phases(self):
         for suite, phases in (("pipeline-cache", [("distinct_compute", 1, 1, 0, 1, 1),
                               ("concurrent_distinct_compute", 1, 0, 0, 1, 1)]),
-                              ("pipeline-library", [("concurrent_graphics", 2, 2, 0, 1, 2), ("root_abi", 2, 0, 0, 1, 2),
+                              ("pipeline-library", [("concurrent_graphics", 2, 2, 0, 1, 2), ("root_abi", 1, 1, 0, 1, 1),
                                ("pixel_specialization", 1, 1, 1, 1, 0), ("constant_concurrent", 0, 0, 1, 1, 0),
                                ("constant_distinct", 0, 0, 1, 1, 0), ("constant_hit", 0, 0, 0, 0, 0),
                                ("constant_root_abi", 1, 0, 1, 1, 0), ("constant_entry", 1, 1, 1, 1, 0),
@@ -326,6 +336,9 @@ class RunnerFailures(unittest.TestCase):
                         if name == "captured_layout_cold" and kind in ("air_compile","new_library"):
                             event.update(cache=1 if kind == "air_compile" else 2,key=f"{index+1+(100 if kind == 'new_library' else 0):040x}")
                         rows.append("info: OWNED_GRAPHICS_TRACE " + json.dumps(event))
+                if name == "root_abi":
+                    for kind in ("air_compile", "new_library", "new_function"):
+                        rows.append("info: OWNED_GRAPHICS_TRACE " + json.dumps({"event": "pipeline_artifact_hit", "kind": kind}))
                 if name in ("captured_layout_cold","captured_layout_hit"):
                     for kind,base,cache in (("air_compile",0,1),("new_library",100,2)):
                         for index in (range(7) if name.endswith("hit") else (0,)):
@@ -333,6 +346,10 @@ class RunnerFailures(unittest.TestCase):
                 rows.append(prefix + "end=" + name)
             text = "\n".join(rows)
             self.assertEqual(runner.pipeline_artifact_failures(text, suite), [])
+            if suite == "pipeline-library":
+                for kind in ("air_compile", "new_library", "new_function"):
+                    hit = json.dumps({"event": "pipeline_artifact_hit", "kind": kind})
+                    self.assertTrue(runner.pipeline_artifact_failures(text.replace(hit, "{}", 1), suite))
             # Cache IDs are runtime object identities, not fixed kind ordinals.
             relocated = text.replace('"cache": 1', '"cache": 41').replace('"cache": 2', '"cache": 73')
             self.assertEqual(runner.pipeline_artifact_failures(relocated, suite), [])
@@ -461,8 +478,11 @@ class RunnerFailures(unittest.TestCase):
             ("graph-access-3", 2, [2], [identity, identity], 0, 1, 0, 0, [], 0, False),
             ("graph-frontier-256", 2, [], [], 0, 256, 0, 0, [], 0, False),
             ("graph-frontier-512", 2, [], [], 0, 512, 0, 0, [], 0, False),
-            ("graph-frontier-boundary-0", 2, [2, 2], [identity, identity, identity, identity], 0, 61, 0, 0, [4], 0, False),
+            ("graph-frontier-boundary-0", 2, [4], [identity] * 4, 0, 61, 0, 0, [4], 0, False),
             ("graph-frontier-boundary-1", 2, [2], [identity, identity], 0, 63, 0, 1, [4], 0, False),
+            ("graph-render-carry-0", 2, [130], [identity] * 130, 0, 0, 0, 0, [], 0, False),
+            ("graph-render-carry-1", 2, [127, 1, 2], [identity] * 129, 1, 0, 0, 0, [], 0, False),
+            ("graph-render-carry-2", 2, [64, 66], [identity] * 130, 0, 1, 0, 0, [], 0, False),
             ("graph-mips", 1, [2], [identity, identity], 0, 0, 1, 0, [], 0, False),
             ("graph-union-0", 2, [3], [identity, [1, 0, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
             ("graph-union-1", 2, [3], [[0, 2, 2, 3, 4, 5, 6, 7], [2, 1, 2, 3, 4, 5, 6, 7], identity], 0, 0, 0, 0, [], 0, False),
@@ -487,8 +507,10 @@ class RunnerFailures(unittest.TestCase):
         render_numeric += [f"GRAPH_FRONTIER count={count} replay={replay} word=13579bdf exact=1 sealed=1"
                            for count in (256, 512) for replay in range(2)]
         render_numeric += [f"GRAPH_FRONTIER_BOUNDARY delayed_clear={delayed} replay={replay} "
-                           f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders={1 if delayed else 2} "
+                           f"rgba={'ff000020' if delayed else 'ff000040'} render_encoders=1 "
                            f"clear_encoders={delayed} exact=1 sealed=1" for delayed in range(2) for replay in range(2)]
+        render_numeric += [f"RENDER_CARRY control={c} replay={r} final=ff000082 observed={'ff000040' if c == 2 else '00000000'}"
+                           for c in range(3) for r in range(2)]
         render_numeric += ["GRAPH_MIPS rgba=ff000050 mip0=16 mip1=64 mip1_untouched=16 render_encoders=1 members=2 exact=1"]
         render_numeric += [f"GRAPH_UNION unused={u} replay={r} first={('ff000030' if u else 'ff004030')} "
                            f"second={('ff005000' if u else 'ff003040')} render_encoders=1 members=3 identity_reset=1 exact=1"
@@ -515,8 +537,8 @@ class RunnerFailures(unittest.TestCase):
                     if name.startswith("graph-frontier-"):
                         events.append({"event": "submission_plan_work", "history_checks": 0,
                                        "candidate_checks": 0, "metadata_copies": 0, "scope_checks": 0, "feedback_checks": 0})
-                        pairs = [(62, 63), (64, 65)] if name == "graph-frontier-boundary-0" else [(64, 65)] if name == "graph-frontier-boundary-1" else []
-                        events += [{"event": "submission_render_merged", "before_list": before, "after_list": after, "members": 2} for before, after in pairs]
+                        pairs = [(62, 63, 2), (63, 64, 3), (64, 65, 4)] if name == "graph-frontier-boundary-0" else [(64, 65, 2)] if name == "graph-frontier-boundary-1" else []
+                        events += [{"event": "submission_render_merged", "before_list": before, "after_list": after, "members": count} for before, after, count in pairs]
                         if name == "graph-frontier-boundary-0":
                             events.append({"event": "submission_clear_load", "clear_node": 0, "render_node": 62, "aspect": 4})
                     for kind, count in (("render", len(begins)), ("clear", clears), ("blit", blits), ("compute", computes)):
@@ -533,10 +555,10 @@ class RunnerFailures(unittest.TestCase):
                                 events += [{"event": "native_clear_load", "clear_count": 1, "aspect": a,
                                             **({"node": 63} if name == "graph-frontier-boundary-1" else {})} for a in aspects]
                             if kind == "render":
-                                if identities:
+                                if identities and begins[index] == 1:
                                     events.append({"event": "native_render_color_map_identity", "map_count": 1})
                                 for member in range(begins[index]):
-                                    if mappings:
+                                    if mappings and begins[index] > 1:
                                         if inline and member == 1:
                                             events.append({"event": "native_render_inline_barrier", "member": 1,
                                                            "scope": 1, "before": 1, "after": 1, "barrier_count": 1})
@@ -629,7 +651,8 @@ class RunnerFailures(unittest.TestCase):
                                     bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
                                     mutations.append((f"frontier-work-{count}-{field}-{value}", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
                         elif kind == "submission_render_merged":
-                            for field, value in (("before_list", 63), ("after_list", 64), ("members", 4), ("members", True)):
+                            for field, value in (("before_list", event["before_list"] + 1), ("after_list", event["after_list"] - 1),
+                                                 ("members", event["members"] + 1), ("members", True)):
                                 bad = "OWNED_GRAPHICS_TRACE " + json.dumps({**event, field: value})
                                 mutations.append((f"frontier-cross-partition-{field}-{value}", stdout, stderr.replace(frontier_chunk, frontier_chunk.replace(row, bad, 1))))
                         elif kind == "submission_clear_load":
@@ -799,11 +822,14 @@ class RunnerFailures(unittest.TestCase):
                     kwargs["stderr"].write(r'Loaded L"C:\\windows\\system32\\' + module +
                                            f'" at 0001: {"builtin" if builtin else "native"}\n')
                     self.assertNotIn("OWNED_FG_OBSERVER", kwargs["env"])
+                    self.assertNotIn("OWNED_FG_CONTRACT_PROBE", kwargs["env"])
+                    self.assertNotIn("OWNED_FG_CONTRACT_DIR", kwargs["env"])
                     self.assertNotIn("FG_CAPTURE_DIR", kwargs["env"])
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
             with patch.object(runner.subprocess, "run", side_effect=fake_run), \
                  patch.dict(runner.os.environ, {"OWNED_FG_OBSERVER": "/foreign/observer.dylib",
+                                               "OWNED_FG_CONTRACT_PROBE": "1", "OWNED_FG_CONTRACT_DIR": "/foreign",
                                                "FG_CAPTURE_DIR": "/foreign/captures"}), \
                  contextlib.redirect_stdout(io.StringIO()):
                 runner.run(args)
@@ -1785,6 +1811,7 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
             "RAYQUERY_CASE anyhit", "RAYQUERY_CASE intersection",
             "RAYQUERY_CASE miss", "RAYQUERY_CASE callable", "RAYQUERY_STAGES failures=0",
             "ROOTARGS_CASE dispatch-rays-root-arguments",
+            "TRANSITION_CASE case=closed-indirect-list-count-one-then-zero", "TRANSITIONS_PASS",
             "COVERAGE_FEATURE rayquery-template-skip", "COVERAGE_CASE grid-indirect",
             "COVERAGE_PREDICATION predication-indirect-ne0-1",
             "COVERAGE_BUNDLE bundle-direct-predicated-run", "COVERAGE failures=0",
@@ -1803,6 +1830,7 @@ case=exposure_gpu_replay replay=2 value=3.14159012 half_bits=4248 max_ulp=0 cont
             ("raygen-indirect lanes=24", "raygen-indirect lanes=23"),
             ("intersection lanes=24", "intersection lanes=23"),
             ("dispatch-rays-root-arguments slots=4", "dispatch-rays-root-arguments slots=3"),
+            ("raygen=0 expected_raygen=0 compute=2", "raygen=64 expected_raygen=0 compute=1"),
             ("geometry-index lanes=24", "geometry-index lanes=23"),
             ("predication-direct-eq0-0 culled=1", "predication-direct-eq0-0 culled=0"),
             ("bundle-indirect-predicated-culled culled=1",
@@ -2628,7 +2656,7 @@ class GameSuiteEvidence(unittest.TestCase):
     def setUp(self):
         self.alpha = "".join(f"OWNED_D3D12_SR_ALPHA_CASE_PASS frame={f} replay={r} scalar_oracle_max_half_ulp=2 subrect=1 dynamic={int(f == 3)} retired={int(f == 5)}\n" for f in range(6) for r in range(2 if f == 5 else 1)) + "OWNED_D3D12_SR_ALPHA_PASS frames=6 replay_after_release=1 independent_scalar_oracle=1 history_delta=42\n"
         self.debug = "".join(f"OWNED_D3D12_FSR_DEBUG_CASE_PASS extent={e} replay={r} panel_max_byte_error=1 sentinel=1 retired={int(e == 96)}\n" for e in (128, 96) for r in (0, 1)) + "OWNED_D3D12_FSR_DEBUG_PASS public_dispatch=1 depth_gradient=1 signed_motion=1 color=1 dynamic=1 retirement_replay=1\n"
-        self.ngx = ("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 non_sr_other=0\n"
+        self.ngx = ("OWNED_D3D12_NGX_FEATURE_CASE_PASS case=exact_capabilities fg=1 rr=1 isp=1 other=0\n"
                     "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg count_max=1 unsupported_mfg=1 disable_buffer=gpu_history_hint reset=native_history release_before_execute=1 replay=native_encode\n"
                     "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho=0 frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1\n"
                     "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_fg_camera_motion ortho=1 frames=6 independent_features=3 equivalent_motion=1 nonzero_effect=1 release_before_execute=1\n"
@@ -2645,8 +2673,10 @@ class GameSuiteEvidence(unittest.TestCase):
         native += "".join(f"OWNED_D3D12_NGX_INPUT_PASS case=camera infinite_far={i} frames=6 independent_features=4 inverse_projection=1 invalid_untouched=1 native_boundaries=1 explicit_projection=1 complete_basis=1 aspect=2 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n" for i in (0, 1))
         native += "".join(f"OWNED_D3D12_NGX_INPUT_PASS case=motion invalid_sentinel={i} frames=6 independent_features=5 equivalent_motion=1 poisoned_padding=1 output_real_rects=1 jitter_or_inverse=1 generated_beyond_warmup=1 release_before_execute=1 snapshot=1\n" for i in (0, 1))
         native += "".join(f"OWNED_D3D12_NGX_INPUT_REJECT case=camera infinite_far={i} aspect_zero_negative_nan_infinity=invalid_parameter far_negative_infinity_nan=invalid_parameter outputs_untouched=1\n" for i in (0, 1))
+        native += "OWNED_FG_CONTRACT_PASS evaluations=144 native_inputs=1 same_encode_scatter=1\n"
         scene = "OWNED_D3D12_NGX_SCENE frames=14 reset=1 output_written=1 actual_count=unavailable consumer=gpu_readback\n"
         self.ngx_fg = self.ngx + rejections + native + scene + "OWNED_D3D12_NGX_FG_PASS capacity=1 native_output=1 unsupported_mfg=1\n"
+        self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_isp feature=9 direct=1 atlas=1 invalid_rect=1 release_before_execute=1 replay=1\n"
         self.ngx += "".join(f"OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr variant={v} frames=8 handle13=1 denoising_guides=1 matrices_snapshotted=1 release_before_execute=1 replay=1 oracle_artifacts=8\n" for v in range(8))
         self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_rr_responsivity changed_rgb=42 origins=1 invalid_resource_subrect=1 release_before_execute=1 replay=1\n"
         self.ngx += "OWNED_D3D12_NGX_FEATURE_CASE_PASS case=public_alpha flag128=1 nonopaque_contrast=1 rgb_preserved=1\n"
@@ -2696,6 +2726,8 @@ OWNED_DXGI_FULLSCREEN_PASS
             ("ngx-fg", self.ngx_fg, "case=count count=2 result=unsupported_parameter", "case=count count=2 result=success"),
             ("ngx-fg", self.ngx_fg, "frames=14 reset=1", "frames=14 reset=0"),
             ("ngx-fg", self.ngx_fg, "consumer=gpu_readback", "consumer=wiring_copy"),
+            ("ngx-fg", self.ngx_fg, "same_encode_scatter=1", "same_encode_scatter=0"),
+            ("ngx-features", self.ngx, "evaluations=144", "evaluations=143"),
             ("ngx-alpha", self.ngx_alpha, "right=112,96,80,192", "right=112,96,80,255"),
             ("ngx-alpha", self.ngx_alpha, "left=112,96,80,48", "left=112,112,80,48"),
             ("ngx-alpha", self.ngx_alpha, "rgb_max_error=0", "rgb_max_error=8"),
@@ -2811,8 +2843,17 @@ OWNED_DXGI_FULLSCREEN_PASS
                 dxil_dir=base, out=base / "result", suite="ngx-features", mode="no-present", validation=True,
                 api_validation=False, timeout=1, rr_oracle_dir=oracle)
             def fake_run(command, **kwargs):
+                if command[0] == "/usr/bin/xcrun":
+                    self.assertEqual(command[command.index("-arch") + 1], "x86_64")
+                    Path(command[-1]).write_bytes(struct.pack("<II", 0xfeedfacf, 0x1000007) + bytes(24))
                 if command[0] == str(runtime / "bin/wine"):
                     kwargs["stdout"].write("OWNED_D3D12_TEMPORAL_BACKEND id=owned-graphics-d3d12\n" + self.ngx)
+                    self.assertEqual(kwargs["env"]["OWNED_FG_CONTRACT_PROBE"], "1")
+                    self.assertEqual(Path(kwargs["env"]["OWNED_FG_CONTRACT_DIR"]), kwargs["cwd"])
+                    self.assertEqual(kwargs["env"]["OWNED_FG_CONTRACT_CONSUMER"], fixture.name)
+                    observer = Path(kwargs["env"]["OWNED_FG_OBSERVER"])
+                    self.assertEqual(observer, kwargs["cwd"] / "owned-fg-contract-observer.dylib")
+                    kwargs["stderr"].write(f"dyld[1]: {observer}\nOWNED_FG_CONTRACT_OBSERVER_READY\n")
                     kwargs["stderr"].write(f"dyld[1]: {runtime}/lib/wine/x86_64-unix/winemetal.so\n" +
                         'Loaded L"C:\\windows\\system32\\nvngx.dll" at 0001: builtin\n')
                     for path in public.iterdir():
@@ -2957,7 +2998,7 @@ class RefitChainEvidence(unittest.TestCase):
                 lines.append(f"{prefix}_SHADOW case={name} kind={kind} type={int(kind == 'blas')} "
                              f"descriptors=2 descriptor_mismatches=0 words={words(values)}")
             lines.append(f"{prefix}_CASE case={name} steps={len(steps)} status=PASS")
-        lines.extend((prefix + "_RESULT cases=4 refits=14 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
+        lines.extend((prefix + "_RESULT cases=4 refits=15 ray_lanes=28 shadow_snapshots=8 unpublished_builds=2 failures=0",
                       prefix + "_PASS"))
         stderr = "\n".join(f"{prefix}_EXECUTE case={name} {boundary}" for name in
                            ("chain", "replay", "cross-return") for boundary in ("begin", "end"))
@@ -3039,7 +3080,7 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         output=output.replace("case=placed_disjoint_ranges proof=exact", "case=placed_disjoint_ranges textures=2 buffer=1 pixels=185 words=64 exact=1")
         output=output.replace("case=placed_sparse_range_replay proof=exact", "case=placed_sparse_range_replay executions=4 close_count=1 mapping=unmapped,disjoint,overlap,null pixels=64 words=256 exact=1")
         output=output.replace("case=dispatch_independence proof=exact",
-            "case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial "
+            "case=dispatch_independence phases=13 table_replays=4 potential_raw_war_waw=serial "
             "budget=65 roots=8 external_alias=serial all_words_and_guards=exact")
         output+="OWNED_D3D12_SUBMISSION_FOUNDATION_PASS cases=10\n"
         records=[dict(event="recording_plan_sealed",passes=3,descriptor_values_captured=0),
@@ -3048,6 +3089,9 @@ class SubmissionFoundationEvidence(unittest.TestCase):
         records += [dict(event="sparse_publication_elided",proof="no_sparse_heap_or_opaque_access") for _ in range(4)]
         records += [dict(event="submission_access_opaque",reason="sparse_alias")]
         records += [dict(event="native_compute_begin",reason="dispatch_external_backing",dispatches=3,concurrent=0)]
+        for name,tail in (("dispatch_window_raw_65",1),("dispatch_window_war_128",64)):
+            records += [dict(event="native_compute_begin",_phase=name,encoder=401,native_context=111,
+                             dispatches=64+tail,concurrent=0)]
         records += [dict(event="query_fanout_batch",targets=2,native_encoders=1,native_dispatches=1,reset=0),
                     dict(event="query_fanout_batch",targets=1,native_encoders=1,native_dispatches=1,reset=0),
                     dict(event="submit",queue=1,submission=1),dict(event="complete",queue=1,submission=1,status=4)]
@@ -3093,10 +3137,18 @@ class SubmissionFoundationEvidence(unittest.TestCase):
                     if phase:lines.append("OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE begin="+phase+"\n")
                     active=phase
                 lines.append("OWNED_GRAPHICS_TRACE "+json.dumps(record)+"\n")
+                if phase in ("dispatch_window_raw_65", "dispatch_window_war_128") and record["event"]=="native_compute_begin":
+                    lines.append("OWNED_GRAPHICS_NATIVE_COMPUTE_BEGIN context=111 encoder=222 concurrent=0\n")
+                    for j in range(record["dispatches"]):
+                        if j == record.get("barrier_after", 64):
+                            lines.append(f"OWNED_GRAPHICS_NATIVE_STAGE_BARRIER encoder=222 after={1<<27} before={1<<27} implicit=1\n")
+                        lines.append("OWNED_GRAPHICS_NATIVE_DISPATCH encoder=222 pso=501\n")
             if active:lines.append("OWNED_D3D12_SUBMISSION_FOUNDATION_PHASE end="+active+"\n")
             log="".join(lines)
             return runner.submission_foundation_output_matches(text,log,proof,True)
         self.assertTrue(check(records));self.assertFalse(check(records,False))
+        self.assertFalse(check([dict(row,barrier_after=63) if row.get("_phase")=="dispatch_window_raw_65" and
+                                row["event"]=="native_compute_begin" else row for row in records]))
         self.assertFalse(check(records,text=output.replace("dispatch_independence", "missing_dispatch_independence")))
         for kind in ("recording_plan_sealed","residency_add_batch","indirect_buffer_reuse","sparse_publication_elided",
                      "submission_heap_clear_in_place","native_clear_begin","native_clear_end",
@@ -3346,7 +3398,7 @@ class Phase3PreparedEvidence(unittest.TestCase):
             for maximum in (0, 1, 31, 32, 33, 4097):
                 if mode in (2, 4) and maximum != 33:
                     continue
-                if maximum and (mode or maximum > 1):
+                if maximum and mode:
                     event("indirect_compute_resolver", allocator=1, pso=900, max_count=maximum, grid_x=(maximum+31)//32, threads_x=32)
                 repetitions = 7 if mode in (1, 3, 4) and maximum == 33 else 1
                 for replay in range(repetitions):
@@ -3363,9 +3415,9 @@ class Phase3PreparedEvidence(unittest.TestCase):
                     submission += 1
                     event("submit", submission=submission)
                     native("DISPATCH", encoder=1, pso=100, mode="threadgroups", grid_x=max(1, (maximum+31)//32), grid_y=1, grid_z=1, threads_x=32, threads_y=1, threads_z=1)
-                    if mode in (3, 4):
-                        native("DISPATCH", encoder=3, pso=110, mode="threadgroups", grid_x=1, grid_y=1, grid_z=1, threads_x=1, threads_y=1, threads_z=1)
-                    if maximum and (mode or maximum > 1):
+                    if mode in (3, 4) and maximum:
+                        native("PREDICATE_COPY", encoder=3, src=5, dst=6, src_offset=0, dst_offset=8, bytes=8)
+                    if maximum and mode:
                         native("DISPATCH", encoder=1, pso=900, mode="threadgroups", grid_x=(maximum+31)//32, grid_y=1, grid_z=1, threads_x=32, threads_y=1, threads_z=1)
                         native("EXECUTE_ICB", stage="compute", encoder=1, buffer=2, location=0, length=maximum)
                     else:
@@ -3384,8 +3436,7 @@ class Phase3PreparedEvidence(unittest.TestCase):
                 if maximum > 64:
                     event("submission_access_edge", submission=submission, raw=1, stages_before=1 << 28, stages_after=1)
                     event("native_render_queue_barrier", submission=submission, after=1 << 28, before=1)
-                    native("EXECUTE_ICB", stage="render", encoder=1, buffer=2, location=0, length=maximum)
-                for slot in range(maximum if maximum <= 64 else 0):
+                for slot in range(maximum):
                     fields = dict(encoder=1, argument_buffer=2, argument_offset=16+32*slot, primitive_type=3)
                     if kind:
                         fields.update(index_type=kind-1, index_buffer=3, index_offset=4)
@@ -3429,9 +3480,9 @@ class Phase3PreparedEvidence(unittest.TestCase):
         line = next(line for line in stderr.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT"))
         self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(line + "\n", "", 1)))
         self.assertTrue(runner.prepared_indirect_failures(stdout, stderr + "\ntrace limit reached"))
-        snapshot=next(line for line in stderr.splitlines() if "pso=110" in line)
+        snapshot=next(line for line in stderr.splitlines() if line.startswith("OWNED_GRAPHICS_NATIVE_PREDICATE_COPY"))
         self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot+"\n", "", 1)))
-        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot, snapshot.replace("threads_x=1", "threads_x=2"), 1)))
+        self.assertTrue(runner.prepared_indirect_failures(stdout, stderr.replace(snapshot, snapshot.replace("bytes=8", "bytes=4"), 1)))
 
     def test_indirect_encoder_records_do_not_launch_work(self):
         out, err = self.indirect_control()
@@ -3445,46 +3496,17 @@ class Phase3PreparedEvidence(unittest.TestCase):
                 self.assertTrue(runner.prepared_indirect_failures(out, err.replace(launch, prefix + invalid + "\n" + launch, 1)))
                 self.assertTrue(runner.prepared_indirect_failures(out, err.replace(launch, prefix + record, 1)))
 
-    def test_single_native_compute_only_and_multi_command_parallel_resolver(self):
-        out,err=self.indirect_control()
-        self.assertEqual(runner.prepared_indirect_failures(out,err),[])
-        begin="OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=compute mode=0 max=32 replay=0 phase=submit_begin"
-        end=begin.replace("submit_begin","submit_end")
-        part=err.split(begin,1)[1].split(end,1)[0]
-        lines=[line for line in part.splitlines() if "pso=900" not in line and not line.startswith("OWNED_GRAPHICS_NATIVE_EXECUTE_ICB")]
-        loop=[f"OWNED_GRAPHICS_NATIVE_DISPATCH_INDIRECT encoder=1 pso=101 argument_buffer=2 argument_offset={16+32*i} threads_x=1 threads_y=1 threads_z=1" for i in range(32)]
-        self.assertTrue(runner.prepared_indirect_failures(out,err.replace(part,"\n"+"\n".join(lines+loop)+"\n",1)))
-
-
-    def test_graphics_bypass_threshold_and_actual_icb_range(self):
+    def test_ranges_reject_missing_slots_and_wrong_stride(self):
         out, err = self.indirect_control()
         self.assertEqual(runner.prepared_indirect_failures(out, err), [])
-        for kind in range(3):
-            for maximum in (64, 65, 4096):
-                begin = f"OWNED_D3D12_INDIRECT_PREPARATION_PHASE kind=graphics format={kind} max={maximum} phase=submit_begin"
-                end = begin.replace("submit_begin", "submit_end")
-                part = err.split(begin, 1)[1].split(end, 1)[0]
-                records = [line for line in part.splitlines() if not line.startswith("OWNED_GRAPHICS_NATIVE_")]
-                indirect = []
-                for slot in range(maximum):
-                    line = f"OWNED_GRAPHICS_NATIVE_{'DRAW_INDEXED_INDIRECT' if kind else 'DRAW_INDIRECT'} encoder=1 argument_buffer=2 argument_offset={16+32*slot} primitive_type=3"
-                    if kind:
-                        line += f" index_type={kind-1} index_buffer=3 index_offset=4"
-                    indirect.append(line)
-                icb = f"OWNED_GRAPHICS_NATIVE_EXECUTE_ICB stage=render encoder=1 buffer=2 location=0 length={maximum}"
-                flipped = [icb] if maximum == 64 else indirect
-                with self.subTest(kind=kind, maximum=maximum, mutation="threshold-or-expanded-calls"):
-                    self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, "\n" + "\n".join(records + flipped) + "\n", 1)))
-                if maximum > 64:
-                    for replacement in ("", icb + "\n" + icb):
-                        with self.subTest(kind=kind, maximum=maximum, mutation="missing-or-duplicate-icb"):
-                            self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, replacement, 1), 1)))
-                    for old, new in (("stage=render", "stage=compute"), ("location=0", "location=1"),
-                                     (f"length={maximum}", f"length={maximum-1}")):
-                        with self.subTest(kind=kind, maximum=maximum, mutation=new):
-                            self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, icb.replace(old, new), 1), 1)))
-                    resolver = "OWNED_GRAPHICS_NATIVE_DISPATCH encoder=1 pso=900 mode=threadgroups grid_x=2 grid_y=1 grid_z=1 threads_x=32 threads_y=1 threads_z=1"
-                    self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(icb, resolver + "\n" + icb, 1), 1)))
+        for fields in ("kind=compute mode=0 max=32", "kind=graphics format=0 max=65",
+                       "kind=graphics format=1 max=64", "kind=graphics format=2 max=4096"):
+            replay = " replay=0" if fields.startswith("kind=compute") else ""
+            begin = "OWNED_D3D12_INDIRECT_PREPARATION_PHASE " + fields + replay + " phase=submit_begin"
+            part = err.split(begin, 1)[1].split(begin.replace("submit_begin", "submit_end"), 1)[0]
+            slot = next(line for line in part.splitlines() if "argument_offset=48 " in line)
+            for replacement in ("", slot + "\n" + slot, slot.replace("offset=48", "offset=52")):
+                self.assertTrue(runner.prepared_indirect_failures(out, err.replace(part, part.replace(slot, replacement, 1), 1)))
 
 
 class Phase3UploadEvidence(unittest.TestCase):

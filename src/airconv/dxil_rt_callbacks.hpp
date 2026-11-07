@@ -186,6 +186,10 @@ inline constexpr uint32_t kRtCandidateRegionSize(uint32_t attribute_size) {
   return kRtCandidateControlSize + attribute_size;
 }
 
+inline constexpr uint32_t rtHitStateSize(bool uses_object_space) {
+  return uses_object_space ? sizeof(SM50_RT_HIT_STATE) : offsetof(SM50_RT_HIT_STATE, ObjectToWorld);
+}
+
 /** Byte offsets of RtCandidateControl, for the traversal lowering's stores. */
 enum RtCandidateField : uint32_t {
   kRtCandidateDecision = offsetof(RtCandidateControl, Decision),
@@ -237,6 +241,22 @@ struct RtInvocationLayout {
 };
 
 RtInvocationLayout rtInvocationLayout(const RaytracingExportContext &context);
+
+inline llvm::Value *rtBytePointer(llvm::IRBuilder<> &builder, llvm::Value *value) {
+  return builder.CreateBitCast(value, builder.getInt8PtrTy(value->getType()->getPointerAddressSpace()));
+}
+
+// Invocation storage may live in thread, device, or ray-data memory.
+inline llvm::Value *rtFieldPointer(llvm::IRBuilder<> &builder, llvm::Value *base, uint32_t offset, llvm::Type *type) {
+  auto *field = builder.CreateGEP(builder.getInt8Ty(), rtBytePointer(builder, base), builder.getInt32(offset));
+  return builder.CreateBitCast(field, type->getPointerTo(base->getType()->getPointerAddressSpace()));
+}
+
+// Emit the body only on the guarded edge. A value-producing body merges with the fallback.
+void emitConditional(llvm::IRBuilder<> &builder, llvm::Value *condition, llvm::StringRef name,
+                     llvm::function_ref<void(llvm::IRBuilder<> &)> body);
+llvm::Value *emitGuardedValue(llvm::IRBuilder<> &builder, llvm::Value *condition, llvm::Value *fallback,
+                              llvm::StringRef name, llvm::function_ref<llvm::Value *(llvm::IRBuilder<> &)> body);
 
 /* -------------------------------------------------------------------------- */
 /* DXIL opcodes                                                               */

@@ -5,7 +5,7 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 63
+#define AIRCONV_VERSION 84
 
 #ifdef __cplusplus
 #include <string>
@@ -176,6 +176,10 @@ struct MTL_SHADER_REFLECTION {
   uint32_t HasAtomic64;
   /* Application coverage inputs; occupies the existing reflection tail padding. */
   uint32_t PSCoverageInputs;
+  /* Reachable TraceRayInline use, not a count of rays executed by the GPU. */
+  uint32_t HasRayQuery;
+  /* Ordinary VS/PS/CS variants without a source-level root consumer. */
+  uint32_t RootArgumentsUnused;
 };
 
 #if defined(__LP64__) || defined(_WIN64)
@@ -712,6 +716,7 @@ struct SM50_SHADER_D3D12_MSAA_PIXEL_DATA {
   bool depth_bounds_emulated;
 };
 
+enum { SM50_MSAA_CAPTURED_USER_CULL_DISTANCE = 4 };
 struct SM50_MSAA_CAPTURED_USER {
   uint64_t hash;
   uint32_t offset_dwords;

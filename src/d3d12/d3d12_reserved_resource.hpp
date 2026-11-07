@@ -259,8 +259,9 @@ public:
   }
   uint64_t CollectMappedTiles(uint64_t seen_generation, std::vector<uint32_t> &tiles,
                               uint32_t subresource = UINT32_MAX);
-  void MapCastTiles(WMT::MTL4CommandQueue queue, WMT::Texture texture, WMT::Heap heap,
-                    const std::unordered_set<uint32_t> &tiles);
+  void EncodeTexture(WMT::MTL4CommandQueue queue, WMT::Texture texture,
+                     const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments,
+                     uint32_t flat_pages_x = 0, uint32_t flat_pages_y = 0);
 
   /*
    * Buffers: GPU-published residency bytes, biased in BufferAllocation::residencyStatusBase.
@@ -273,10 +274,6 @@ public:
   mutable d3dalloy::mutex mutex;
 
 private:
-  void EncodeTexture(
-      WMT::MTL4CommandQueue queue, WMT::Texture texture,
-      const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
-  );
   void EncodeBuffer(
       WMT::MTL4CommandQueue queue, WMT::Buffer buffer,
       const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments

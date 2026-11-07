@@ -356,7 +356,40 @@ static void TestEncodingProofRetirementAndSlotReuse() {
   assert(**life.FindRecorded(key) == 4);
 }
 
+static void TestForeignQueueRequiresRetiredWriter() {
+  Lifetime life;
+  int owner{};
+  const Key key{&owner, 0};
+  const auto token = life.Publish(key, std::make_shared<int>(1));
+  const std::array<Lease, 1> leases{{{key, token}}};
+  auto encode = [&](uint64_t queue) {
+    const auto id = life.BeginSubmission();
+    life.HoldLease(key, token);
+    assert(life.RecordEncoding(key, token, queue, id));
+    return id;
+  };
+  auto retire = [&](uint64_t id, uint32_t observed) {
+    life.CompleteSubmission(id, leases, [&](const Key &) { return observed; });
+  };
+  const auto first = encode(101);
+  assert(life.Observe(key, token) && !life.FindEncoded(key, 202));
+  retire(first, token);
+  assert(life.FindEncoded(key, 202));
+  const auto replay = encode(101);
+  const auto latest = encode(202);
+  assert(!life.FindEncoded(key, 303));
+  retire(latest, token);
+  assert(!life.FindEncoded(key, 303)); // Reused token with an earlier pending writer.
+  retire(replay, token);
+  assert(!life.FindEncoded(key, 303)); // This completion is not the latest encoded submission.
+  retire(encode(202), 0);
+  assert(!life.FindEncoded(key, 303));
+  retire(encode(202), token);
+  assert(life.FindEncoded(key, 303));
+}
+
 int main() {
+  TestForeignQueueRequiresRetiredWriter();
   Lifetime life;
   int owners[2]{};
   const std::array<Key, 3> keys{{{&owners[0], 0}, {&owners[0], 256}, {&owners[1], 0}}};

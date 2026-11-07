@@ -12,13 +12,22 @@ struct FgProxyCallbacks {
     ffxContext* context;
     Gpu* gpu;
     bool rejectGeneration = false;
+    bool rejectedPrevious = false;
     std::mutex mutex;
     std::vector<FgCallbackCapture> captures;
     std::vector<ComPtr<ID3D12Resource>> retainedMarkers;
 };
 ffxReturnCode_t fgGenerationCallback(ffxDispatchDescFrameGeneration* desc, void* user) {
     auto& s = *static_cast<FgProxyCallbacks*>(user);
-    if (s.rejectGeneration) { desc->numGeneratedFrames = 0; return FFX_API_RETURN_ERROR; }
+    if (s.rejectGeneration) {
+        s.rejectedPrevious = true;
+        if (std::getenv("OWNED_FG_REJECT_ZERO_COUNT")) desc->numGeneratedFrames = 0;
+        return FFX_API_RETURN_ERROR;
+    }
+    if (s.rejectedPrevious) {
+        fgRequire(desc->reset, "callback-history-reset-after-rejection");
+        s.rejectedPrevious = false;
+    }
     desc->numGeneratedFrames = 1;
     desc->reset |= desc->frameID == 12;
     fgRequire(desc->outputs[0].resource, "callback-native-output-resource");
@@ -92,6 +101,37 @@ void fgDrain(const FgApi& api, ffxContext& swapContext, bool expectedError = fal
              expectedError ? FFX_API_RETURN_ERROR_RUNTIME_ERROR : FFX_API_RETURN_OK, "proxy-drain");
     QueryPerformanceCounter(&stop);
     fgRequire(double(stop.QuadPart - start.QuadPart) / frequency.QuadPart < 15, "bounded-drain-progress");
+}
+void fgDisplayTick(IDXGIOutput* display) {
+    MSG message;
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message); DispatchMessageW(&message);
+    }
+    check(display->WaitForVBlank(), "proxy-output-vblank");
+}
+void fgDisplayReady(const FgApi& api, Gpu& gpu, ffxContext& context, IDXGISwapChain4* chain, IDXGIOutput* display,
+                    const char* stream) {
+    // A new Wine/CA layer can drop its first few drawables. Establish physical
+    // display with separately identified real images before the formal stream.
+    for (UINT attempt = 1; attempt <= 64; ++attempt) {
+        ComPtr<ID3D12Resource> buffer;
+        check(chain->GetBuffer(chain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&buffer)), "visibility-buffer");
+        auto r = fgRecording(gpu);
+        transition(r.list.Get(), buffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        check(r.list->Close(), "visibility-transition"); gpu.executeAndWait(r.list.Get());
+        const std::vector<UINT> pixels(fgWidth * fgHeight, 0xffb05000u | (16u + attempt));
+        fgUpload(gpu, buffer.Get(), pixels.data(), fgWidth * 4, D3D12_RESOURCE_STATE_PRESENT);
+        check(chain->Present(1, 0), "visibility-real-present"); fgDrain(api, context);
+        fgDisplayTick(display);
+        const auto observed = fgActualPresentation(chain);
+        if (observed.result == S_OK) {
+            fgRequire(observed.submitted == attempt, "visibility-single-real-per-request");
+            std::printf("OWNED_D3D12_FSR_FG_READY stream=%s attempts=%u actual=%u sync_qpc=%lld\n",
+                        stream, attempt, observed.statistics.PresentCount, observed.statistics.SyncQPCTime.QuadPart);
+            return;
+        }
+    }
+    fail("visibility-no-actual-present");
 }
 void fgPresentedStatistics(IDXGISwapChain4* chain, UINT frame, DXGI_FRAME_STATISTICS& previous, const char* stream = nullptr, bool resizedEpoch = false) {
     if (stream) {
@@ -192,6 +232,9 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     config.presentCallback = fgPresentCallback; config.presentCallbackUserContext = &callbacks;
     config.generationRect = {0, 0, fgWidth, fgHeight};
     DXGI_FRAME_STATISTICS previousStatistics{};
+    ComPtr<IDXGIOutput> display;
+    check(chain->GetContainingOutput(&display), "callback-display");
+    fgDisplayReady(api, gpu, swapContext, chain.Get(), display.Get(), "callback");
     LARGE_INTEGER frequency{}, start{}, stop{}; QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
     for (unsigned frame = 1; frame <= 12; ++frame) {
         config.frameID = frame;
@@ -245,6 +288,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
         QueryPerformanceCounter(&after);
         check(result, "proxy-present");
         fgDrain(api, swapContext);
+        fgDisplayTick(display.Get());
         fgPresentedStatistics(chain.Get(), frame, previousStatistics);
         std::printf("OWNED_D3D12_FSR_FG_PRESENT_CALL frame=%u enabled=%u only_generated=%u generation_error=%u present_error=%u qpc_start=%lld qpc_end=%lld frequency=%lld\n",
                     frame, config.frameGenerationEnabled, config.onlyPresentGenerated, frame == 9, 0,
@@ -315,6 +359,9 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
     wrap.swapchain = chain.GetAddressOf(); wrap.gameQueue = gpu.queue.Get();
     fgResult(api.create(&swapContext, &wrap.header, nullptr), FFX_API_RETURN_OK, "proxy-wrap-real-chain");
     previousStatistics = {};
+    display.Reset();
+    check(chain->GetContainingOutput(&display), "ui-display");
+    fgDisplayReady(api, gpu, swapContext, chain.Get(), display.Get(), "builtin_ui");
     FgContext uiContext(api, gpu, fgWidth, fgHeight, desc.Format);
     ffxConfigureDescFrameGeneration builtin{};
     builtin.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -367,6 +414,7 @@ void fgProxy(const FgApi& api, Gpu& gpu) {
         }
         fgUpload(gpu, ui.Get(), mutant.data(), fgWidth * 4, fgRead);
         fgDrain(api, swapContext);
+        fgDisplayTick(display.Get());
         fgPresentedStatistics(chain.Get(), frame, previousStatistics);
         std::printf("OWNED_D3D12_FSR_FG_UI_FRAME frame=%u width=%u height=%u source=%u,60,100 ui=64,0,0,128 premul=1 doublebuffer=1 overwritten_after_present=1\n", frame, width, height, frame * 8);
     }

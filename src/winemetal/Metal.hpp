@@ -403,7 +403,7 @@ public:
   }
 
   uint64_t
-  size() {
+  size() const {
     return WMTASSidecar_size(handle);
   }
 };

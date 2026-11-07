@@ -1,4 +1,8 @@
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -15,6 +19,8 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/Scalar/JumpThreading.h"
+#include "llvm/IR/PatternMatch.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/IPO/DeadArgumentElimination.h"
@@ -26,6 +32,8 @@
 #include "llvm/Transforms/IPO/InferFunctionAttrs.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/IR/InstIterator.h"
 
 #include "airconv_context.hpp"
@@ -73,12 +81,356 @@ void initializeModule(llvm::Module &M) {
 
 static std::atomic_flag llvm_overwrite = false;
 
+Value *createTextureIsNull(IRBuilderBase &builder, Value *texture) {
+  auto &M = *builder.GetInsertBlock()->getModule();
+  auto *type = cast<StructType>(cast<PointerType>(texture->getType())->getNonOpaquePointerElementType());
+  // Native texture arguments are opaque handles, not ordinary pointers.
+  // Use the same null query as Metal's is_null_texture, including without shader validation.
+  auto is_null = M.getOrInsertFunction(
+      ("air.is_null_" + type->getName().drop_front(StringRef("struct._").size()).drop_back(2)).str(),
+      FunctionType::get(builder.getInt1Ty(), {texture->getType()}, false));
+  auto *query = cast<Function>(is_null.getCallee());
+  query->setOnlyReadsMemory();
+  query->setOnlyAccessesArgMemory();
+  query->setDoesNotThrow();
+  query->setWillReturn();
+  query->addFnAttr(Attribute::NoFree);
+  query->addFnAttr(Attribute::MustProgress);
+  query->addParamAttr(0, Attribute::NoCapture);
+  query->addParamAttr(0, Attribute::ReadOnly);
+  return builder.CreateCall(is_null, {texture});
+}
+
+// An immutable handle keeps its identity across writes to its texels. Reuse
+// only an already executed query, never inspect an unselected descriptor.
+static bool reuseTextureNullQueries(Function &function) {
+  DominatorTree tree(function);
+  DenseMap<std::pair<Function *, Value *>, CallInst *> previous;
+  bool changed = false;
+  for (auto *node : depth_first(tree.getRootNode())) {
+    for (auto &inst : make_early_inc_range(*node->getBlock())) {
+      auto *call = dyn_cast<CallInst>(&inst);
+      auto *callee = call ? call->getCalledFunction() : nullptr;
+      if (!callee || !(callee->getName().startswith("air.is_null_texture") ||
+                       callee->getName().startswith("air.is_null_depth")))
+        continue;
+      auto &prior = previous[{callee, call->getArgOperand(0)}];
+      if (prior && tree.dominates(prior, call)) {
+        call->replaceAllUsesWith(prior);
+        call->eraseFromParent();
+        changed = true;
+      } else {
+        prior = call;
+      }
+    }
+  }
+  for (auto &block : function) {
+    // InstCombine spells the descriptor guard either as present && sampler or
+    // as null || !sampler. Both forms prove the query on the successful edge.
+    auto *branch = dyn_cast<BranchInst>(block.getTerminator());
+    if (!branch || !branch->isConditional() || branch->getSuccessor(0) == branch->getSuccessor(1))
+      continue;
+    Value *lhs, *rhs;
+    using namespace PatternMatch;
+    const bool absent = match(branch->getCondition(), m_Or(m_Value(lhs), m_Value(rhs)));
+    if (!absent && !match(branch->getCondition(), m_And(m_Value(lhs), m_Value(rhs)))) continue;
+    for (auto *term : {lhs, rhs}) {
+      Value *query = term;
+      if (!absent && !match(term, m_Not(m_Value(query)))) continue;
+      auto *call = dyn_cast<CallInst>(query);
+      auto *callee = call ? call->getCalledFunction() : nullptr;
+      if (!callee || !(callee->getName().startswith("air.is_null_texture") ||
+                       callee->getName().startswith("air.is_null_depth"))) continue;
+      changed |= replaceDominatedUsesWith(query, ConstantInt::getFalse(function.getContext()), tree,
+          BasicBlockEdge(branch->getParent(), branch->getSuccessor(absent ? 1 : 0))) != 0;
+    }
+  }
+  return changed;
+}
+
+static bool uniformDescriptorWord(Value *value, const MDNode &inputs) {
+  // The D3D12 root table is an immutable, draw-uniform constant-buffer argument.
+  for (;;) {
+    if (auto *load = dyn_cast<LoadInst>(value)) {
+      if (!load->isSimple() || load->getPointerAddressSpace() != 2) return false;
+      value = load->getPointerOperand();
+    } else if (auto *gep = dyn_cast<GetElementPtrInst>(value)) {
+      if (!gep->hasAllConstantIndices()) return false;
+      value = gep->getPointerOperand();
+    } else if (auto *cast = dyn_cast<BitCastInst>(value)) {
+      value = cast->getOperand(0);
+    } else {
+      auto *arg = dyn_cast<Argument>(value);
+      if (!arg || arg->getArgNo() >= inputs.getNumOperands()) return false;
+      auto *desc = dyn_cast<MDNode>(inputs.getOperand(arg->getArgNo()));
+      auto *kind = desc && desc->getNumOperands() > 1 ? dyn_cast<MDString>(desc->getOperand(1)) : nullptr;
+      if (!kind) return false;
+      if (kind->getString() == "air.indirect_buffer") return true;
+      if (kind->getString() != "air.buffer") return false;
+      for (unsigned i = 2; i + 1 < desc->getNumOperands(); ++i) {
+        auto *key = dyn_cast<MDString>(desc->getOperand(i));
+        auto *name = dyn_cast<MDString>(desc->getOperand(i + 1));
+        if (key && key->getString() == "air.arg_name" && name && name->getString() == "static_samplers")
+          return true;
+      }
+      return false;
+    }
+  }
+}
+
+static MDNode *stageInputs(Function &f, StringRef stage) {
+  if (f.empty()) return nullptr;
+  auto *entries = f.getParent()->getNamedMetadata(stage);
+  if (!entries || entries->getNumOperands() != 1) return nullptr;
+  auto *signature = entries->getOperand(0);
+  if (signature->getNumOperands() < 3 || mdconst::dyn_extract<Function>(signature->getOperand(0)) != &f)
+    return nullptr;
+  return dyn_cast<MDNode>(signature->getOperand(2));
+}
+
+static Value *queriedTexture(Instruction &inst) {
+  auto *call = dyn_cast<CallInst>(&inst);
+  auto *callee = call ? call->getCalledFunction() : nullptr;
+  if (!callee || !(callee->getName().startswith("air.is_null_texture") ||
+                   callee->getName().startswith("air.is_null_depth"))) return nullptr;
+  return call->getArgOperand(0);
+}
+
+static LoadInst *fixedEntryDescriptor(Value *value, BasicBlock &entry, const MDNode &inputs) {
+  auto *load = dyn_cast_or_null<LoadInst>(value);
+  return load && load->getParent() == &entry && uniformDescriptorWord(load, inputs) ? load : nullptr;
+}
+
+// D3D12 owns these fixed table slots and writes a zero 64-bit ID for null.
+// Inspect only an already loaded slot. Never speculate a native texture access.
+static Value *descriptorId(IRBuilder<> &b, LoadInst *handle) {
+  auto *slot = b.CreateBitCast(handle->getPointerOperand(), b.getInt64Ty()->getPointerTo(2));
+  return b.CreateFreeze(b.CreateAlignedLoad(b.getInt64Ty(), slot, handle->getAlign()));
+}
+
+static bool lowerFixedTextureNulls(Function &f, const MDNode &inputs) {
+  DenseMap<LoadInst *, Value *> nulls;
+  for (auto &bb : f) {
+    for (auto &inst : make_early_inc_range(bb)) {
+      auto *handle = fixedEntryDescriptor(queriedTexture(inst), f.getEntryBlock(), inputs);
+      if (!handle) continue;
+      auto &absent = nulls[handle];
+      if (!absent) {
+        IRBuilder<> b(handle->getNextNode());
+        absent = b.CreateICmpEQ(descriptorId(b, handle), b.getInt64(0));
+      }
+      inst.replaceAllUsesWith(absent);
+      inst.eraseFromParent();
+    }
+  }
+  return !nulls.empty();
+}
+
+// Consecutive lane guards all succeed when the final byte is in the UAV.
+// Keep the original per-lane path for partial ranges and null descriptors.
+static void specializeStoreSpans(Function &f) {
+  const auto &dl = f.getParent()->getDataLayout();
+  SmallVector<BasicBlock *, 32> starts;
+  for (auto &bb : f) starts.push_back(&bb);
+  SmallPtrSet<BasicBlock *, 32> consumed;
+  for (auto *head : starts) {
+    if (consumed.count(head)) continue;
+    SmallVector<BasicBlock *, 16> guards, stores;
+    auto *guard = head;
+    Value *length = nullptr, *base = nullptr;
+    uint64_t last = 0;
+    int64_t lastOffset = 0;
+    while (stores.size() < 16) {
+      auto *br = dyn_cast<BranchInst>(guard->getTerminator());
+      if (!br || !br->isConditional()) break;
+      auto *cmp = dyn_cast<ICmpInst>(br->getCondition());
+      if (!cmp || cmp->getPredicate() != ICmpInst::ICMP_UGT) break;
+      auto *limit = dyn_cast<ConstantInt>(cmp->getOperand(1));
+      if (!limit || limit->getBitWidth() > 64) break;
+      auto *arm = br->getSuccessor(0), *next = br->getSuccessor(1);
+      if (arm == next || arm->getSinglePredecessor() != guard || arm->getSingleSuccessor() != next ||
+          isa<PHINode>(next->front())) break;
+      if (guard != head && (pred_size(guard) != 2 || llvm::any_of(*guard, [](Instruction &i) {
+        return !i.isTerminator() && (!isa<ICmpInst>(i) || !i.hasOneUse() || !isa<BranchInst>(*i.user_begin()));
+      }))) break;
+      auto *store = dyn_cast_or_null<StoreInst>(arm->getTerminator()->getPrevNode());
+      if (!store || !store->isSimple() || store->getPointerAddressSpace() != 1) break;
+      if (llvm::any_of(*arm, [&](Instruction &i) {
+        return &i != store && !i.isTerminator() && !isa<GetElementPtrInst>(i) && !isa<BitCastInst>(i);
+      })) break;
+      int64_t offset;
+      auto *ptr = GetPointerBaseWithConstantOffset(store->getPointerOperand(), offset, dl);
+      uint64_t end = limit->getZExtValue(), width = dl.getTypeStoreSize(store->getValueOperand()->getType());
+      if (!length) { length = cmp->getOperand(0); base = ptr; }
+      else if (cmp->getOperand(0) != length || ptr != base || end <= last || end-last != width ||
+               offset <= lastOffset || uint64_t(offset)-uint64_t(lastOffset) != width) break;
+      guards.push_back(guard); stores.push_back(arm); last = end; lastOffset = offset; guard = next;
+    }
+    if (stores.size() < 4) continue;
+    // The only values bypassed by the fast path are branch predicates and
+    // arm-local addresses. Require all store operands to be available there.
+    DominatorTree dt(f);
+    bool available = true;
+    for (auto *bb : guards) if (bb != head) for (auto &i : *bb) for (auto *user : i.users()) {
+      auto *use = dyn_cast<Instruction>(user);
+      if (!use || !llvm::is_contained(guards, use->getParent())) available = false;
+    }
+    for (auto *arm : stores) for (auto &i : *arm) for (Value *operand : i.operands()) {
+      auto *def = dyn_cast<Instruction>(operand);
+      if (def && def->getParent() != arm && !dt.dominates(def, head->getTerminator())) available = false;
+    }
+    if (!available) continue;
+    consumed.insert(guards.begin(), guards.end());
+    auto *partial = head->splitBasicBlock(head->getTerminator(), "uav.span.partial");
+    auto *full = BasicBlock::Create(f.getContext(), "uav.span.full", &f, partial);
+    IRBuilder<> fast(full);
+    ValueToValueMapTy map;
+    for (auto *arm : stores) for (auto &inst : *arm) {
+      if (inst.isTerminator()) continue;
+      auto *copy = inst.clone();
+      RemapInstruction(copy, map, RF_IgnoreMissingLocals);
+      fast.Insert(copy); map[&inst] = copy;
+    }
+    fast.CreateBr(guard);
+    IRBuilder<> b(head->getTerminator());
+    b.CreateCondBr(b.CreateICmpUGT(length, ConstantInt::get(length->getType(), last)), full, partial);
+    head->getTerminator()->eraseFromParent();
+  }
+}
+
+static bool specializeBoundNormalizedSamples(Function &f, const MDNode &inputs, bool kernel) {
+  using namespace PatternMatch;
+  constexpr uint64_t pixelMask = uint64_t(1) << 47;
+  DenseMap<Value *, SmallVector<BranchInst *, 8>> sites;
+  Value *best = nullptr;
+  for (auto &bb : f) {
+    auto *br = dyn_cast<BranchInst>(bb.getTerminator());
+    if (!br || !br->isConditional()) continue;
+    // Track the coordinate split emitted by AIRBuilder. If CFG folding has
+    // removed both named successors there is no candidate at this site.
+    if (!br->getSuccessor(0)->getName().startswith("sample.normalized") &&
+        !br->getSuccessor(1)->getName().startswith("sample.normalized")) continue;
+    auto *eq = dyn_cast<ICmpInst>(br->getCondition());
+    if (!eq || !eq->isEquality() || !match(eq->getOperand(1), m_Zero())) continue;
+    Value *word;
+    if (!match(eq->getOperand(0), m_And(m_Value(word), m_SpecificInt(pixelMask)))) continue;
+    if (!fixedEntryDescriptor(word, f.getEntryBlock(), inputs)) continue;
+    sites[word].push_back(br);
+    if (!best || sites[word].size() > sites[best].size()) best = word;
+  }
+  // Bound code growth to fragments with a dense run of samples using one
+  // uniform descriptor. Other samplers retain their own per-access mode.
+  if (!kernel && (!best || sites[best].size() < 8 || sites[best].size() * 128 < f.getInstructionCount())) return false;
+  auto &entry = f.getEntryBlock();
+  SmallVector<LoadInst *, 8> handles;
+  SmallVector<std::pair<Instruction *, bool>, 16> checks;
+  // Limit the extra normalized fallback to long runs. Smaller fragments
+  // split by coordinate mode and share each fixed-ID comparison.
+  const bool longRun = !kernel && sites[best].size() >= 24;
+  unsigned maxUses = 0;
+  {
+    for (auto &inst : instructions(f)) {
+      Value *handle = queriedTexture(inst);
+      bool boundResult = false;
+      if (auto *cmp = dyn_cast<ICmpInst>(&inst); cmp && cmp->isEquality() &&
+          isa<ConstantPointerNull>(cmp->getOperand(1))) {
+        auto *ptr = cast<PointerType>(cmp->getOperand(0)->getType());
+        auto *type = !ptr->isOpaque() && ptr->getAddressSpace() == 2
+            ? dyn_cast<StructType>(ptr->getNonOpaquePointerElementType()) : nullptr;
+        if (type && type->hasName() && type->getName() == "struct._sampler_t") handle = cmp->getOperand(0);
+        boundResult = cmp->getPredicate() == ICmpInst::ICMP_NE;
+      }
+      if (auto *load = fixedEntryDescriptor(handle, entry, inputs)) {
+        if (!llvm::is_contained(handles, load)) handles.push_back(load);
+        checks.emplace_back(&inst, boundResult);
+        maxUses = std::max(maxUses, unsigned(inst.getNumUses()));
+      }
+    }
+  }
+  // A small number of repeatedly tested, draw/dispatch-uniform descriptors
+  // justifies a fast body. Share the original full semantics as one fallback.
+  // Cloning a long ALU chain to remove a few guards increases register/code
+  // pressure. Require one repeated test per 64 PS or 160 kernel instructions.
+  const bool sharedFallback = !longRun && maxUses >= 8 && handles.size() <= 8 &&
+      (kernel || maxUses >= 4 * handles.size()) && maxUses * (kernel ? 160u : 64u) >= f.getInstructionCount();
+  if (kernel && !sharedFallback) return false;
+  if (!longRun && !sharedFallback) { handles.clear(); checks.clear(); }
+  auto *lastLoad = kernel ? handles.front() : cast<Instruction>(best);
+  for (auto *handle : handles)
+    if (lastLoad->comesBefore(handle)) lastLoad = handle;
+  Instruction *split = entry.getTerminator();
+  for (auto [check, ignored] : checks)
+    if (check->getParent() == &entry && lastLoad->comesBefore(check) && check->comesBefore(split)) split = check;
+  auto *start = entry.splitBasicBlock(split, "coordinate.normalized");
+  SmallVector<BasicBlock *, 32> original;
+  for (auto &bb : f) if (&bb != &entry) original.push_back(&bb);
+  auto cloneBody = [&](ValueToValueMapTy &map, StringRef suffix) {
+    for (auto *bb : original) map[bb] = CloneBasicBlock(bb, map, suffix, &f);
+    for (auto *bb : original)
+      for (auto &inst : *cast<BasicBlock>(map[bb])) RemapInstruction(&inst, map, RF_IgnoreMissingLocals);
+  };
+  ValueToValueMapTy checked, pixel, empty;
+  if (!kernel && sharedFallback) cloneBody(empty, ".empty");
+  if (!handles.empty()) cloneBody(checked, ".dynamic");
+  if (!sharedFallback) cloneBody(pixel, ".pixel");
+  if (!kernel) for (auto *br : sites[best]) {
+    auto *cmp = cast<ICmpInst>(br->getCondition());
+    bool takesNormalized = cmp->getPredicate() == ICmpInst::ICMP_EQ;
+    if (!handles.empty() && !sharedFallback)
+      cast<BranchInst>(checked[br])->setCondition(ConstantInt::get(cmp->getType(), takesNormalized));
+    if (!sharedFallback) cast<BranchInst>(pixel[br])->setCondition(ConstantInt::get(cmp->getType(), !takesNormalized));
+    br->setCondition(ConstantInt::get(cmp->getType(), takesNormalized));
+  }
+  for (auto [check, boundResult] : checks) {
+    if (!empty.empty() && queriedTexture(*check) && check->getParent() != &entry)
+      cast<Instruction>(empty[check])->replaceAllUsesWith(ConstantInt::getTrue(f.getContext()));
+    if (check->getParent() != &entry)
+      check->replaceAllUsesWith(ConstantInt::get(check->getType(), boundResult));
+  }
+  auto *oldTerminator = entry.getTerminator();
+  IRBuilder<> b(oldTerminator);
+  Value *normalized = kernel ? b.getTrue() :
+      b.CreateICmpEQ(b.CreateAnd(b.CreateFreeze(best), b.getInt64(pixelMask)), b.getInt64(0));
+  auto *fallback = cast<BasicBlock>(sharedFallback ? checked[start] : pixel[start]);
+  Value *fast = normalized;
+  if (!handles.empty()) {
+    // Freeze each ID independently so an unused undefined slot cannot mask a known null.
+    for (auto *handle : handles)
+      fast = b.CreateAnd(fast, b.CreateICmpNE(descriptorId(b, handle), b.getInt64(0)));
+    if (!sharedFallback) {
+      fallback = BasicBlock::Create(f.getContext(), "coordinate.fallback", &f);
+      IRBuilder<>(fallback).CreateCondBr(normalized, cast<BasicBlock>(checked[start]), cast<BasicBlock>(pixel[start]));
+    }
+  }
+  // The generic fallback retains partial bindings. If every fixed texture is
+  // absent, its native sample operations and their individual guards fold away.
+  if (!empty.empty()) {
+    Value *allAbsent = b.getTrue();
+    for (auto *handle : handles) {
+      auto *ptr = cast<PointerType>(handle->getType());
+      if (ptr->getAddressSpace() != 1) continue;
+      allAbsent = b.CreateAnd(allAbsent, b.CreateICmpEQ(descriptorId(b, handle), b.getInt64(0)));
+    }
+    auto *partial = BasicBlock::Create(f.getContext(), "sample.null.fallback", &f);
+    IRBuilder<>(partial).CreateCondBr(allAbsent, cast<BasicBlock>(empty[start]), fallback);
+    fallback = partial;
+  }
+  b.CreateCondBr(fast, start, fallback);
+  oldTerminator->eraseFromParent();
+  return true;
+}
+
 void
 runOptimizationPasses(llvm::Module &M) {
   // Only D3D12 root-bound shaders define null-descriptor reads as zero. D3D11
   // modules never enter this path. Guard native AIR accesses, not their results:
   // selecting zero after a query/read/sample still touches a null Metal texture.
   if (M.getModuleFlag("d3dalloy.d3d12.root-signature")) {
+    // Derivatives read neighboring fragment lanes, including helper lanes.
+    // Preserve their convergence when optimizing the surrounding control flow.
+    for (auto &function : M)
+      if (function.getName().startswith("air.dfdx.") || function.getName().startswith("air.dfdy."))
+        function.addFnAttr(Attribute::Convergent);
     SmallVector<CallInst *, 16> accesses;
     for (auto &function : M) for (auto &instruction : instructions(function)) {
       auto *call = dyn_cast<CallInst>(&instruction);
@@ -99,22 +451,7 @@ runOptimizationPasses(llvm::Module &M) {
     for (auto *call : accesses) {
       IRBuilder<> builder(call);
       auto *texture = call->getArgOperand(0);
-      auto *type = cast<StructType>(cast<PointerType>(texture->getType())->getNonOpaquePointerElementType());
-      // Native texture arguments are opaque handles, not ordinary pointers.
-      // Use the same null query as Metal's is_null_texture, including without shader validation.
-      auto is_null = M.getOrInsertFunction(
-          ("air.is_null_" + type->getName().drop_front(StringRef("struct._").size()).drop_back(2)).str(),
-          FunctionType::get(builder.getInt1Ty(), {texture->getType()}, false));
-      auto *query = cast<Function>(is_null.getCallee());
-      query->setOnlyReadsMemory();
-      query->setOnlyAccessesArgMemory();
-      query->setDoesNotThrow();
-      query->setWillReturn();
-      query->addFnAttr(Attribute::NoFree);
-      query->addFnAttr(Attribute::MustProgress);
-      query->addParamAttr(0, Attribute::NoCapture);
-      query->addParamAttr(0, Attribute::ReadOnly);
-      Value *present = builder.CreateNot(builder.CreateCall(is_null, {texture}));
+      Value *present = builder.CreateNot(createTextureIsNull(builder, texture));
       for (auto &argument : call->args()) {
         auto *pointer = dyn_cast<PointerType>(argument->getType());
         auto *type = pointer && !pointer->isOpaque() && pointer->getAddressSpace() == 2
@@ -259,7 +596,75 @@ runOptimizationPasses(llvm::Module &M) {
 
   // Optimize the IR!
   MPM.run(M, MAM);
+  if (M.getModuleFlag("d3dalloy.d3d12.root-signature")) {
+    SmallPtrSet<Function *, 8> candidates;
+    for (auto &query : M) {
+      if (!query.getName().startswith("air.is_null_texture") && !query.getName().startswith("air.is_null_depth"))
+        continue;
+      if (!query.hasNUsesOrMore(2)) continue;
+      for (auto *user : query.users())
+        if (auto *call = dyn_cast<CallInst>(user)) candidates.insert(call->getFunction());
+    }
+    for (auto *function : candidates) {
+      if (!reuseTextureNullQueries(*function)) continue;
+      FAM.invalidate(*function, PreservedAnalyses::none());
+      FunctionPassManager cleanup;
+      cleanup.addPass(InstCombinePass());
+      cleanup.addPass(SimplifyCFGPass());
+      cleanup.run(*function, FAM);
+      auto *inputs = stageInputs(*function, "air.fragment");
+      const bool kernel = !inputs;
+      if (kernel) inputs = stageInputs(*function, "air.kernel");
+      if (inputs && specializeBoundNormalizedSamples(*function, *inputs, kernel)) {
+        FAM.invalidate(*function, PreservedAnalyses::none());
+        FunctionPassManager modes;
+        modes.addPass(SimplifyCFGPass());
+        modes.addPass(EarlyCSEPass());
+        modes.addPass(InstCombinePass());
+        modes.addPass(SimplifyCFGPass());
+        // Adjacent samples on one descriptor share its validity predicate.
+        // Thread that known outcome across short intervening arithmetic blocks.
+        modes.addPass(JumpThreadingPass(64));
+        modes.addPass(EarlyCSEPass());
+        modes.addPass(InstCombinePass());
+        modes.addPass(SimplifyCFGPass(SimplifyCFGOptions().sinkCommonInsts(true)));
+        modes.run(*function, FAM);
+      }
+    }
+    for (auto &f : M) {
+      auto *inputs = stageInputs(f, "air.fragment");
+      if (!inputs) inputs = stageInputs(f, "air.kernel");
+      if (!inputs || !lowerFixedTextureNulls(f, *inputs)) continue;
+      FAM.invalidate(f, PreservedAnalyses::none());
+      FunctionPassManager cleanup;
+      cleanup.addPass(EarlyCSEPass());
+      cleanup.addPass(JumpThreadingPass(64));
+      cleanup.addPass(EarlyCSEPass());
+      cleanup.addPass(InstCombinePass());
+      cleanup.addPass(SimplifyCFGPass(SimplifyCFGOptions().sinkCommonInsts(true)));
+      cleanup.run(f, FAM);
+    }
+  }
   lowerBoundedLoads(M);
+  for (auto &f : M) {
+    if (f.isDeclaration()) continue;
+    if (stageInputs(f, "air.kernel")) specializeStoreSpans(f);
+    if (!stageInputs(f, "air.fragment")) continue;
+    SmallPtrSet<Value *, 16> seen;
+    for (auto &bb : f) {
+      auto *br = dyn_cast<BranchInst>(bb.getTerminator());
+      if (!br || !br->isConditional() ||
+          (!br->getSuccessor(0)->getName().startswith("sample.normalized") &&
+           !br->getSuccessor(1)->getName().startswith("sample.normalized"))) continue;
+      if (seen.insert(br->getCondition()).second) continue;
+      FAM.invalidate(f, PreservedAnalyses::none());
+      FunctionPassManager share;
+      share.addPass(JumpThreadingPass(12));
+      share.addPass(EarlyCSEPass());
+      share.run(f, FAM);
+      break;
+    }
+  }
 }
 
 void

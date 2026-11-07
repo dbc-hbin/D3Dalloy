@@ -24,10 +24,11 @@ device = (root / "src/d3d12/d3d12_device.hpp").read_text()
 with tempfile.TemporaryDirectory(prefix="static-optimization-cpu-", dir=root / "build") as temporary:
     directory = Path(temporary)
     helper = directory / "helper.inc"
-    helper.write_text(method(recording, "bool EnsurePredicationPipelines()") + "\n" +
+    helper.write_text(method(recording, "bool EnsurePredicationPipeline(") + "\n" +
                       method(recording, "WMT::Reference<WMT::ComputePipelineState> SharedCommandHelper(") + "\n")
     kinds = directory / "helper-kinds.inc"
-    kinds.write_text(method(device, "enum class CommandHelper") + ";\n" +
+    kinds.write_text(method(recording, "enum PredicationKernel") + ";\n" +
+                     method(device, "enum class CommandHelper") + ";\n" +
                      method(device, "struct CommandHelperEntry") + ";\n" +
                      "std::array<CommandHelperEntry, size_t(CommandHelper::Count)> owned_command_helpers;\n")
     slots = directory / "slots.inc"

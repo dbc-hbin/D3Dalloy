@@ -170,7 +170,7 @@ Value *resolveRate(IRBuilder<> &b, Value *control, unsigned sampleCount, Value *
 
 void capture(IRBuilder<> &b, Module &module, Function &entry, Value *scratch, unsigned stride, Value *position,
              Value *control, Value *pixel, unsigned centerZ, const Planes &planes, ArrayRef<Value *> interpolants,
-             Value *reciprocalW, Value *rate, ArrayRef<std::pair<unsigned, Value *>> constants,
+             Value *clipPosition, Value *rate, ArrayRef<std::pair<unsigned, Value *>> constants,
              function_ref<Value *(unsigned, Value *)> capturedInput) {
   auto &context = module.getContext();
   auto *floatTy = b.getFloatTy();
@@ -186,11 +186,10 @@ void capture(IRBuilder<> &b, Module &module, Function &entry, Value *scratch, un
                                                                     ConstantFP::get(floatTy, 0)})),
                       b.CreateFAdd(base, ConstantVector::get({ConstantFP::get(floatTy, 0),
                                                               ConstantFP::get(floatTy, 8)}))};
-  auto atOffset = [&](Value *interpolant, bool perspective, Type *type, Value *offset) -> Value * {
-    std::string name = std::string("air.interpolate_offset_") + (perspective ? "perspective" : "no_perspective") +
-                       (type == floatTy ? ".f32" : ".v4f32");
-    return b.CreateCall(module.getOrInsertFunction(name, FunctionType::get(type, {interpolant->getType(), float2},
-                                                                           false)), {interpolant, offset});
+  auto atOffset = [&](Value *interpolant, bool perspective, Value *offset) -> Value * {
+    auto *name = perspective ? "air.interpolate_offset_perspective.v4f32" : "air.interpolate_offset_no_perspective.v4f32";
+    auto *signature = FunctionType::get(float4, {interpolant->getType(), float2}, false);
+    return b.CreateCall(module.getOrInsertFunction(name, signature), {interpolant, offset});
   };
   auto *eighth = ConstantFP::get(floatTy, 1.0 / 8.0);
   // {value at the tile origin, slope x, slope y} from the three evaluations.
@@ -199,13 +198,16 @@ void capture(IRBuilder<> &b, Module &module, Function &entry, Value *scratch, un
     return {at[0], b.CreateFMul(b.CreateFSub(at[1], at[0]), scale), b.CreateFMul(b.CreateFSub(at[2], at[0]), scale)};
   };
   std::array<Value *, 3> q;
-  for (unsigned i = 0; i < 3; ++i) q[i] = atOffset(reciprocalW, false, floatTy, points[i]);
+  for (unsigned i = 0; i < 3; ++i) {
+    auto *clip = atOffset(clipPosition, true, points[i]);
+    q[i] = b.CreateFDiv(ConstantFP::get(floatTy, 1), b.CreateExtractElement(clip, b.getInt32(3)));
+  }
   SmallVector<std::array<Value *, 3>, 8> values;
   for (unsigned i = 0; i < planes.inputs.size(); ++i) {
     std::array<Value *, 3> at;
     for (unsigned j = 0; j < 3; ++j) {
       at[j] = interpolants[i]
-        ? atOffset(interpolants[i], planes.inputs[i].perspective, float4, points[j])
+        ? atOffset(interpolants[i], planes.inputs[i].perspective, points[j])
         : capturedInput(i, b.CreateFAdd(corner, points[j]));
       // Perspective inputs are v * q, affine in screen space; evaluation divides by the q plane again.
       if (planes.inputs[i].perspective) at[j] = b.CreateFMul(at[j], b.CreateVectorSplat(4, q[j]));

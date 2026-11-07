@@ -415,6 +415,7 @@ public:
     }
 
     hud.initialize(GetVersionDescriptionText(12, device_->GetFeatureLevel()));
+    hud.initializeStatistics();
 
     backbuffer_desc_ = D3D12_RESOURCE_DESC{
         .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
@@ -477,7 +478,6 @@ public:
     if (!presentation_observer_)
       return E_OUTOFMEMORY;
     try {
-      presentation_observer_fault_ = std::make_shared<std::atomic<bool>>(false);
       auto observer = presentation_observer_;
       presentation_observer_thread_ = std::thread([this, observer = std::move(observer)] {
         WMTPresentationEvent event{};
@@ -521,6 +521,7 @@ public:
     if (FAILED(hr))
       return hr;
     try {
+      presentation_observer_fault_ = std::make_shared<std::atomic<bool>>(false);
       removal_epoch_ = std::make_shared<owned_graphics::FenceOrderEpoch>(0);
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
@@ -1514,12 +1515,18 @@ public:
                           ",\"resource\":", backbuffer->owned_id,
                           ",\"sync_interval\":", SyncInterval);
     std::shared_ptr<owned_graphics::LowLatencyScheduler::Frame> latency_frame;
+    const auto &dirty = composition.dirty_rects;
+    const bool replaces_history = present_history_ && (composition.full || !composition.has_previous ||
+        (dirty.size() == 1 && !dirty[0].left && !dirty[0].top &&
+         dirty[0].right == LONG(composition.width) && dirty[0].bottom == LONG(composition.height)));
     hr = present_queue->Present(this->presenter.ptr(), backbuffer, present_semaphore_, vsync_duration,
                                 geometry, presentation_observer_, next_presentation_id_ + 1,
                                 presentation_observer_fault_, std::move(composition), do_not_wait, latency_,
                                 (PresentFlags & DXGI_PRESENT_RESTART) != 0, borrowed_credit, closes_frame, &latency_frame);
 
     if (SUCCEEDED(hr)) {
+      if (replaces_history)
+        present_history_->superseded_present.store(next_presentation_id_, std::memory_order_release);
       end_frame();
       if (PresentFlags & DXGI_PRESENT_RESTART) {
         history_presents_ = 0;

@@ -55,10 +55,10 @@ public:
       visibility_results = device_->GetMTLDevice().newBuffer(visibility_info);
       if (!visibility_results)
         return E_OUTOFMEMORY;
-      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_binary_normalize");
+      auto function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_accumulate_binary_visibility");
       WMT::Reference<WMT::Error> error;
-      binary_normalize_pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
-      if (!binary_normalize_pipeline)
+      binary_accumulate_pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, error);
+      if (!binary_accumulate_pipeline)
         return E_FAIL;
       auto accumulate_function = WMT4::Library(device_->GetLib().getLibrary()).newFunction("query_accumulate_visibility");
       visibility_accumulate_pipeline =

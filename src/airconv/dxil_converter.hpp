@@ -391,6 +391,8 @@ struct ShaderMetadata {
   bool has_inner_coverage_input = false;
   bool force_early_depth_stencil = false;
   bool has_atomic64 = false;
+  bool has_ray_query = false;
+  bool has_implicit_root_access = false;
   std::vector<SigElement> input_sig;
   std::vector<SigElement> output_sig;
   std::vector<SigElement> patch_constant_sig;
@@ -457,6 +459,9 @@ struct RaytracingExportContext {
   /** Metal intersection callbacks cannot trace inline. Such pipelines enumerate
    * candidates in the calling kernel and invoke their hit shaders as visible functions. */
   bool query_callbacks = false;
+  bool uses_object_space = true;
+  /** DispatchRaysIndex components read outside ray generation across the linked pipeline. */
+  uint8_t dispatch_index_mask = 0x7;
   const uint32_t *hit_group_any_hits = nullptr;
   const uint32_t *hit_group_intersections = nullptr;
   /** Binding slots of the pipeline-wide tables (dxil_raytracing.h). */
@@ -527,16 +532,6 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerRaytracingStage(
   ModuleInfo &module, const RaytracingExportContext &context,
   dxbc::SM50ShaderInternal &shader, const char *function_name,
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *args
-);
-
-/**
- * Link one lowered export into the pipeline module. The export is serialized to
- * bitcode and parsed into `target`'s context first, because every ModuleInfo owns
- * its own LLVMContext (DXIL needs typed pointers) while the metallib writer takes a
- * single module.
- */
-llvm::Error MergeRaytracingExport(
-  llvm::Module &target, llvm::Module &source, llvm::StringRef entry_name
 );
 
 /** Lower the `dx.op` raytracing operations of one export on an already staged module. */
@@ -631,6 +626,7 @@ llvm::Value *EmitAtomic64CellUpdate(
 llvm::Error LowerAtomic64Phase(llvm::Module &module);
 void InitializeAtomic64Phase(llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *arguments);
 bool HasDeviceAtomic64(const llvm::Module &module);
+bool HasRayQuery(const llvm::Function &entry);
 
 /** Cooperative returning i64 RMW for device or threadgroup storage. Graphics
  * device atomics still require a separate progress-safe resource protocol. */
@@ -706,18 +702,21 @@ llvm::Error unsupported(StringRef what);
  * live here so the DXIL raytracing entry points share them instead of duplicating
  * a layout-dependent copy.
  */
+struct ReusableRTExports;
 class SM50CompiledBitcodeInternal {
 public:
   llvm::SmallVector<char, 0> vec;
   llvm::SmallVector<uint8_t, 0> constants;
   llvm::SmallVector<SM50_CONSTANT_RELOCATION, 0> constant_relocations;
   uint64_t constant_alignment = 1;
-
+  std::shared_ptr<const ReusableRTExports> rt_exports;
 };
 
 /** Lift normal-stage immutable storage into an explicit constant buffer.
  * Raytracing libraries retain their existing callback ABI. */
 llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInternal &compiled);
+
+llvm::Error FinalizeShader(llvm::Module &module, SM50CompiledBitcodeInternal &compiled, bool is_dxil);
 
 class SM50ErrorInternal {
 public:

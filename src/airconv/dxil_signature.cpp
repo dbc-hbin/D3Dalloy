@@ -32,6 +32,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <string>
 
 namespace d3dalloy::dxil {
@@ -65,12 +66,6 @@ constexpr uint8_t NAME_DEPTH_GREATER_EQUAL = 67;
 constexpr uint8_t NAME_DEPTH_LESS_EQUAL = 68;
 constexpr uint8_t NAME_STENCIL_REF = 69;
 constexpr uint8_t NAME_INNER_COVERAGE = 70;
-
-/* DXIL::SemanticKind of the compute shader values, which have no D3D_NAME. */
-constexpr uint8_t KIND_DISPATCH_THREAD_ID = 21;
-constexpr uint8_t KIND_GROUP_ID = 22;
-constexpr uint8_t KIND_GROUP_INDEX = 23;
-constexpr uint8_t KIND_GROUP_THREAD_ID = 24;
 
 /* DXIL::InterpolationMode, as stored in the signature metadata. */
 constexpr uint8_t INTERP_CONSTANT = 1;
@@ -295,6 +290,7 @@ void declare_vertex_signature(
   auto &inputs = out_signature.inputs;
   auto &outputs = out_signature.outputs;
 
+  std::map<uint32_t, std::vector<dxbc::VertexPull>> pulls;
   for (auto &element : module.input_sig) {
     uint32_t reg = element.start_row;
     uint32_t mask = element_mask(element);
@@ -305,9 +301,7 @@ void declare_vertex_signature(
           auto element_info = ia_layout->elements[i];
           if (element_info.reg != reg)
             continue;
-          prologue << dxbc::pull_vertex_input(
-            func_signature, reg, mask, element_info, ia_layout->slot_mask, true
-          );
+          pulls[element_info.slot].push_back({element_info, mask});
           break;
         }
         inputs.push_back(make_slot(element, ~0u));
@@ -344,6 +338,9 @@ void declare_vertex_signature(
       return;
     }
   }
+
+  for (auto &[slot, attributes] : pulls)
+    prologue << dxbc::pull_vertex_slot(func_signature, std::move(attributes), ia_layout->slot_mask, true);
 
   for (auto &element : module.output_sig) {
     uint32_t reg = element.start_row;
@@ -1690,7 +1687,7 @@ llvm::Expected<std::unique_ptr<dxbc::BindingMap>> LowerStage(
     stats_claim = dxbc::define_pixel_statistics_claim(func_signature);
   auto binding_map = dxbc::setup_binding_rootsig(
     &shader.shader_info, func_signature, module_ir, shader_type, rootsig->bytecode,
-    rootsig->bytecode_length
+    rootsig->bytecode_length, dxbc::ordinary_root_slot(shader.shader_info, args)
   );
   if (!binding_map)
     return createError("DXIL shader has an invalid root signature");

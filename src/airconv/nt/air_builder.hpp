@@ -655,12 +655,18 @@ protected:
   Value *VolumeMip(const Texture &texture, Value *level);
   Value *VolumeDimension(const Texture &texture, unsigned axis, Value *level);
   struct VolumeAtlasPosition { Value *xy, *slice, *tile; };
-  VolumeAtlasPosition VolumePosition(const Texture &texture, Value *position, Value *level);
+  struct VolumeAtlasGeometry {
+    Value *sw, *sh, *sd, *bw, *bh, *pw, *ph;
+    Value *column_shift, *row_shift, *column_mask, *row_mask;
+  };
+  VolumeAtlasGeometry LoadVolumeGeometry(const Texture &texture);
+  VolumeAtlasPosition VolumePosition(const Texture &texture, Value *position, Value *level,
+                                     const VolumeAtlasGeometry *geometry = nullptr);
   Value *VolumeMapped(const Texture &texture, Value *tile);
   Value *VolumeInBounds(const Texture &texture, Value *position, Value *level);
   Value *VolumeDefaults(const Texture &texture, Value *handle);
   std::pair<Value *, Value *> CreateVolumeReadInBounds(const Texture &texture, Value *handle, Value *position,
-      Value *level, Value *defaults, bool coherent);
+      Value *level, Value *defaults, bool coherent, const VolumeAtlasGeometry *geometry = nullptr);
   std::pair<Value *, Value *> CreateVolumeRead(const Texture &texture, Value *handle, Value *position,
                                               Value *level, bool coherent);
   std::pair<Value *, Value *> CreateVolumeSample(const Texture &texture, Value *handle, Value *coord,

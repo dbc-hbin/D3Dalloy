@@ -128,12 +128,6 @@ private:
     id value_ = nil;
 };
 
-void* pointer(std::uint64_t value) noexcept { return reinterpret_cast<void*>(value); }
-struct Command {
-    WMTFGNativeCommand value{};
-    bool open(void* list) { if (!list) return false; value = *static_cast<WMTFGNativeCommand*>(list); return value.device && value.compiler; }
-};
-struct Resources { struct Resource { void* texture = nullptr; }; std::array<Resource,7> values{}; };
 MTLPixelFormat colorFormat(std::uint32_t format) noexcept { return to_metal_pixel_format(static_cast<WMTPixelFormat>(format)); }
 bool textureValid(id<MTLTexture> texture, id<MTLDevice> device,
                   NSUInteger width, NSUInteger height) {
@@ -372,7 +366,6 @@ private:
 };
 using Lent = std::shared_ptr<Pool::Lent>;
 
-// FG has no public color offset selector; color/UI conversion stays staged.
 bool exactDescriptorInput(id<MTLTexture> texture, MTLPixelFormat format,
                           NSUInteger width, NSUInteger height,
                           MTLTextureUsage usage, bool conversion) {
@@ -470,8 +463,6 @@ std::shared_ptr<const Kernels> deviceKernels(id<MTLDevice> device) {
 
 struct Configuration {
     Object device;
-    Object compiler;
-    Object descriptor;
     Object factory;
     MTLPixelFormat color = MTLPixelFormatInvalid;
     MTLPixelFormat ui = MTLPixelFormatInvalid;
@@ -486,18 +477,6 @@ struct Configuration {
     MTLPixelFormat motion = MTLPixelFormatRG16Float;
     NSUInteger width = 0, height = 0, outputWidth = 0, outputHeight = 0;
     std::shared_ptr<const Kernels> kernels;
-
-    Object makeInterpolator() const {
-        if (@available(macOS 26.0, *)) {
-            auto d = (MTLFXFrameInterpolatorDescriptor*)descriptor.get();
-            id instance = (id)[d newFrameInterpolatorWithDevice:(id<MTLDevice>)device.get()
-                                               compiler:(id<MTL4Compiler>)compiler.get()];
-            Object result(instance);
-            [instance release];
-            return result;
-        }
-        return {};
-    }
 };
 
 struct PreparedGuidePlan;
@@ -629,7 +608,7 @@ bool renderGridInputs(const WMTFGcreate_packet& creation, const WMTFGprepare_pac
 }
 
 std::shared_ptr<Configuration> configure(
-    State& state, const Command& command,
+    State& state, const WMTFGNativeCommand& command,
     const WMTFGprepare_packet& packet,
     MTLPixelFormat depthFormat, MTLPixelFormat sourceColor, MTLPixelFormat sourceUi,
     NSUInteger outputWidth, NSUInteger outputHeight, std::uint32_t transfer, bool distortionEnabled) {
@@ -637,8 +616,7 @@ std::shared_ptr<Configuration> configure(
     const NSUInteger inputWidth = renderGrid ? state.creation.max_render_width : outputWidth;
     const NSUInteger inputHeight = renderGrid ? state.creation.max_render_height : outputHeight;
     if (@available(macOS 26.0, *)) {
-        auto device = (id<MTLDevice>)command.value.device;
-        if (!supported(state, device, command.value.compiler)) return {};
+        auto device = (id<MTLDevice>)command.device;
         const MTLPixelFormat color = MTLPixelFormatRGBA16Float;
         const MTLPixelFormat ui = sourceUi == MTLPixelFormatInvalid
                                 ? MTLPixelFormatInvalid : MTLPixelFormatRGBA16Float;
@@ -660,7 +638,6 @@ std::shared_ptr<Configuration> configure(
 
         auto result = std::make_shared<Configuration>();
         result->device = Object(device);
-        result->compiler = Object((id)command.value.compiler);
         result->color = color;
         result->ui = ui;
         result->sourceColor = sourceColor;
@@ -676,24 +653,6 @@ std::shared_ptr<Configuration> configure(
         result->outputWidth = outputWidth;
         result->outputHeight = outputHeight;
 
-        MTLFXFrameInterpolatorDescriptor* descriptor =
-            [[MTLFXFrameInterpolatorDescriptor alloc] init];
-        result->descriptor = Object(descriptor);
-        [descriptor release];
-        descriptor.colorTextureFormat = result->color;
-        descriptor.outputTextureFormat = result->color;
-        descriptor.depthTextureFormat = result->depth;
-        descriptor.motionTextureFormat = result->motion;
-        descriptor.uiTextureFormat = result->ui;
-        descriptor.inputWidth = result->width;
-        descriptor.inputHeight = result->height;
-        descriptor.outputWidth = result->outputWidth;
-        descriptor.outputHeight = result->outputHeight;
-        if (@available(macOS 27.0, *)) {
-            descriptor.requiresPrevColorTexture = NO;
-            descriptor.distortionTextureEnabled = distortionEnabled;
-        } else if (distortionEnabled) return {};
-
         // Source interpretation (source formats, transfer, camera) is history
         // continuity, not native descriptor state: identical descriptors share one
         // interpolator. Resets still follow the Configuration pointer.
@@ -707,8 +666,26 @@ std::shared_ptr<Configuration> configure(
                 break;
             }
         }
-        if (!result->factory) result->factory = result->makeInterpolator();
-        if (!result->factory) return {};
+        if (!result->factory) {
+            auto descriptor = [[[MTLFXFrameInterpolatorDescriptor alloc] init] autorelease];
+            descriptor.colorTextureFormat = color;
+            descriptor.outputTextureFormat = color;
+            descriptor.depthTextureFormat = depthFormat;
+            descriptor.motionTextureFormat = motion;
+            descriptor.uiTextureFormat = ui;
+            descriptor.inputWidth = inputWidth;
+            descriptor.inputHeight = inputHeight;
+            descriptor.outputWidth = outputWidth;
+            descriptor.outputHeight = outputHeight;
+            if (@available(macOS 27.0, *)) {
+                descriptor.requiresPrevColorTexture = NO;
+                descriptor.distortionTextureEnabled = distortionEnabled;
+            } else if (distortionEnabled) return {};
+            id instance = [descriptor newFrameInterpolatorWithDevice:device compiler:(id<MTL4Compiler>)command.compiler];
+            result->factory = Object(instance);
+            [instance release];
+            if (!result->factory) return {};
+        }
         result->kernels = deviceKernels(device);
         if (!result->kernels) return {};
         constexpr std::size_t configurationCacheLimit = 8;
@@ -720,30 +697,9 @@ std::shared_ptr<Configuration> configure(
     return {};
 }
 
-bool mapOne(Resources& resources, unsigned index, const State& state,
-            const Command& command, std::uint64_t address, bool output,
-            NSUInteger width, NSUInteger height) {
-    auto texture = (id<MTLTexture>)address;
-    if (index >= resources.values.size() || !textureValid(texture, (id<MTLDevice>)command.value.device, width, height) ||
-        command.value.device != reinterpret_cast<std::uint64_t>(state.device.get())) return false;
-    resources.values[index].texture = (void*)texture;
-    return true;
-}
-
 id<MTLTexture> rootTexture(id<MTLTexture> texture) {
     while (texture.parentTexture) texture = texture.parentTexture;
     return texture;
-}
-
-bool mapPair(Resources& resources, const State& state, const Command& command,
-             std::uint64_t first, std::uint64_t second, bool output,
-             NSUInteger width, NSUInteger height) {
-    if (!first || !second || first == second ||
-        !mapOne(resources, 0, state, command, first, false, width, height) ||
-        !mapOne(resources, 1, state, command, second, output, width, height))
-        return false;
-    return rootTexture((id<MTLTexture>)resources.values[0].texture) !=
-           rootTexture((id<MTLTexture>)resources.values[1].texture);
 }
 
 struct CameraPlanes {
@@ -767,8 +723,7 @@ bool normalizeCameraPlanes(const WMTFGprepare_packet& p,
     return true;
 }
 
-bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
-    CameraPlanes planes{};
+bool validParameters(const WMTFGprepare_packet& p) {
     if (p.reconstruct_camera_motion > 1) return false;
     if (p.camera_aspect_ratio < 0 || !std::isfinite(p.camera_aspect_ratio) ||
         p.motion_vectors_invalid_value_present > 1 ||
@@ -782,10 +737,9 @@ bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
         const float determinant = simd_determinant(projection);
         if (!std::isfinite(determinant) || determinant == 0) return false;
     }
-    if (p.reconstruct_camera_motion)
+    if (p.reconstruct_camera_motion) {
         for (float value : p.clip_to_previous_clip)
             if (!std::isfinite(value)) return false;
-    if (p.reconstruct_camera_motion) {
         simd_float4x4 transform;
         std::memcpy(&transform, p.clip_to_previous_clip, sizeof(transform));
         const float determinant = simd_determinant(transform);
@@ -796,7 +750,6 @@ bool validParameters(const WMTFGprepare_packet& p, std::uint32_t createFlags) {
         !std::isfinite(p.motion_scale_x) || !std::isfinite(p.motion_scale_y) ||
         !std::isfinite(p.frame_time_delta_ms) || p.frame_time_delta_ms < 0 ||
         !std::isfinite(p.view_space_to_meters) ||
-        !normalizeCameraPlanes(p, createFlags, planes) ||
         !std::isfinite(p.camera_fov_vertical_radians) ||
         p.camera_fov_vertical_radians <= 0 ||
         p.camera_fov_vertical_radians >= 3.14159265358979323846f)
@@ -866,10 +819,12 @@ bool copyTextures(id buffer, id fence, const Copy* copies,
     if (@available(macOS 26.0, *)) {
     id encoder = send<id>(buffer, sel_registerName("computeCommandEncoder"));
     if (!encoder) return false;
+    m4_hud_count(WMTMetal4HUDCompute);
     retained.emplace_back(encoder);
     if (fence) {
             [(id<MTL4ComputeCommandEncoder>)encoder waitForFence:(id<MTLFence>)fence
                                              beforeEncoderStages:MTLStageBlit];
+            m4_hud_count(WMTMetal4HUDFenceWait);
     }
     for (std::size_t i = 0; i != count; ++i) {
         const auto& copy = copies[i];
@@ -916,13 +871,14 @@ struct alignas(16) FgParams {
     std::uint32_t depthSourceExtent[2];
     std::uint32_t depthDilation;
     std::uint32_t depthInverted;
+    std::uint32_t copyMotion;
 };
 static_assert(sizeof(FgParams) == 208 && offsetof(FgParams, depthSourceExtent) == 184 &&
               sizeof(FgParams) <= Pool::kParameterSlot);
 
 struct GuideLayout {
     NSUInteger width, height;
-    bool dilateDepth, convertMotion;
+    bool dilateDepth, convertMotion, padded;
 };
 GuideLayout guideLayout(const WMTFGcreate_packet& creation, const Snapshot& snapshot,
                         const Configuration& config, const WMTFGdispatch_packet& dispatch) {
@@ -935,12 +891,14 @@ GuideLayout guideLayout(const WMTFGcreate_packet& creation, const Snapshot& snap
         (snapshot.depthWidth < samplingWidth || snapshot.depthHeight < samplingHeight);
     return {width,height,dilate,dilate || p.reconstruct_camera_motion || p.motion_scale_x != 1 ||
         p.motion_scale_y != 1 || p.motion_vectors_invalid_value_present || p.motion_width != width ||
-        p.motion_height != height || (creation.flags & WMTFG_MOTION_VECTORS_JITTERED)};
+        p.motion_height != height || (creation.flags & WMTFG_MOTION_VECTORS_JITTERED),
+        width != config.width || height != config.height};
 }
 FgParams guideMotionParams(const WMTFGcreate_packet& creation, const Snapshot& snapshot,
                            const GuideLayout& layout, bool reset) {
     const auto& p = snapshot.parameters;
     FgParams result{};
+    result.copyMotion = !layout.convertMotion && snapshot.motionFormat == MTLPixelFormatRG16Float;
     result.extent[0] = result.outputExtent[0] = layout.width;
     result.extent[1] = result.outputExtent[1] = layout.height;
     result.sourceExtent[0] = snapshot.motionWidth; result.sourceExtent[1] = snapshot.motionHeight;
@@ -986,13 +944,17 @@ bool dispatchPass(id encoderObject, id table, id<MTLComputePipelineState> pipeli
         [arguments setAddress:parameterBuffer.gpuAddress + offset atIndex:0];
         [arguments setTexture:source.gpuResourceID atIndex:0];
         [arguments setTexture:destination.gpuResourceID atIndex:1];
-        // Metal validates every declared texture, including inactive uiMode
-        // branches. Rebind unused slots so no stale binding outlives its pass.
-        [arguments setTexture:(depth ? depth : source).gpuResourceID atIndex:2];
-        [arguments setTexture:(motion ? motion : source).gpuResourceID atIndex:3];
-        [arguments setTexture:(ui ? ui : source).gpuResourceID atIndex:4];
-        [arguments setTexture:(scene ? scene : source).gpuResourceID atIndex:5];
-        [arguments setTexture:(present ? present : source).gpuResourceID atIndex:6];
+        // Bind every texture declared by this kernel, including scatter's
+        // inactive debug/UI inputs. Decode, crop and resample use only 0/1.
+        if (slot == MotionSlot || slot == ColorSlot) {
+            [arguments setTexture:(depth ?: source).gpuResourceID atIndex:2];
+            [arguments setTexture:(ui ?: source).gpuResourceID atIndex:4];
+        }
+        if (slot == ColorSlot) {
+            [arguments setTexture:(motion ?: source).gpuResourceID atIndex:3];
+            [arguments setTexture:(scene ?: source).gpuResourceID atIndex:5];
+            [arguments setTexture:(present ?: source).gpuResourceID atIndex:6];
+        }
         const auto useSourceAxis = [](uint32_t target, uint32_t source) {
             return 2ull * target >= 3ull * source && target <= 2ull * source;
         };
@@ -1006,9 +968,11 @@ bool dispatchPass(id encoderObject, id table, id<MTLComputePipelineState> pipeli
                                                                       fusedGuides->depthMotionSourcePipeline).get();
         }
         const auto* grid = sourcePipeline ? params.depthSourceExtent : params.extent;
+        const MTLSize threads = fusedGuides && !sourcePipeline
+            ? MTLSizeMake(destination.width, destination.height, 1) : MTLSizeMake(grid[0], grid[1], 1);
         [encoder setComputePipelineState:sourcePipeline ?: pipeline];
         [encoder setArgumentTable:arguments];
-        [encoder dispatchThreads:MTLSizeMake(grid[0], grid[1], 1)
+        [encoder dispatchThreads:threads
              threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         return true;
     }
@@ -1048,7 +1012,6 @@ struct PreparedFrame::Impl {
     Object ui, uiAlpha;
     Object disableInterpolation;
     WMTFGdispatch_packet dispatch{};
-    bool reset = false;
     std::uint64_t generationEpoch = 0;
 };
 
@@ -1115,16 +1078,8 @@ bool PreparedFrame::encode(
                 auto execution = std::make_shared<ExecutionLease::Impl>();
                 execution->prepared = impl_;
                 execution->pool = impl_->state->pool;
-                execution->objects.reserve(impl_->kind == Impl::Kind::Snapshot ? 8 : 32);
+                execution->objects.reserve(impl_->kind == Impl::Kind::Snapshot ? 3 : 7);
                 execution->objects.emplace_back((id)fence);
-                execution->objects.push_back(impl_->first);
-                execution->objects.push_back(impl_->second);
-                execution->objects.push_back(impl_->third);
-                execution->objects.push_back(impl_->realOutput);
-                execution->objects.push_back(impl_->distortion);
-                execution->objects.push_back(impl_->ui);
-                execution->objects.push_back(impl_->uiAlpha);
-                execution->objects.push_back(impl_->disableInterpolation);
 
                 auto retainedLease = std::shared_ptr<const ExecutionLease>(
                     new ExecutionLease(execution));
@@ -1141,17 +1096,16 @@ bool PreparedFrame::encode(
                     auto nativeInputs = (id<MTLFXFrameInterpolatorBase>)selected.factory.get();
                     auto device = (id<MTLDevice>)selected.device.get();
                     if (!snapshot.depthScratch) snapshot.depthScratch = execution->pool->texture(device,selected.depth,
-                        plan ? plan->layout.width : snapshot.depthWidth, plan ? plan->layout.height : snapshot.depthHeight,
+                        plan ? selected.width : snapshot.depthWidth, plan ? selected.height : snapshot.depthHeight,
                         nativeInputs.depthTextureUsage | MTLTextureUsageShaderRead |
                         (plan && plan->depthConversion ? MTLTextureUsageShaderWrite : MTLTextureUsageUnknown));
                     if (!snapshot.motionScratch) snapshot.motionScratch = execution->pool->texture(device,
                         plan && plan->motionConversion ? selected.motion : snapshot.motionFormat,
-                        plan ? plan->layout.width : snapshot.motionWidth, plan ? plan->layout.height : snapshot.motionHeight,
+                        plan ? selected.width : snapshot.motionWidth, plan ? selected.height : snapshot.motionHeight,
                         nativeInputs.motionTextureUsage | MTLTextureUsageShaderRead |
                         (plan && plan->motionConversion ? MTLTextureUsageShaderWrite : MTLTextureUsageUnknown));
                     if (!snapshot.depthScratch || !snapshot.motionScratch) return fail("snapshot_allocations");
                     snapshot.depth = snapshot.depthScratch->object; snapshot.motion = snapshot.motionScratch->object;
-                    execution->objects.push_back(snapshot.depth); execution->objects.push_back(snapshot.motion);
                     Lent parameterLease, tableLease;
                     if (plan) {
                         parameterLease = execution->pool->parameters(device); tableLease = execution->pool->table(device);
@@ -1174,12 +1128,14 @@ bool PreparedFrame::encode(
                     if (plan) {
                         auto encoder = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
                         if (!encoder) return fail("snapshot_encoder");
+                        m4_hud_count(WMTMetal4HUDCompute);
                         execution->objects.emplace_back(encoder);
                         struct EndSnapshotEncoding {
                             id<MTL4ComputeCommandEncoder> encoder;
                             ~EndSnapshotEncoding() { if (encoder) [encoder endEncoding]; }
                         } scope{encoder};
                         [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
+                        m4_hud_count(WMTMetal4HUDFenceWait);
                         auto params = plan->motionParams;
                         params.sourceOrigin[0] = snapshot.parameters.motion_subrect_x;
                         params.sourceOrigin[1] = snapshot.parameters.motion_subrect_y;
@@ -1209,12 +1165,9 @@ bool PreparedFrame::encode(
                     return true;
                 }
                 if (!impl_->snapshot->produced.load(std::memory_order_acquire)) return fail("generate_before_prepare_execution");
-                execution->objects.push_back(impl_->snapshot->depth); execution->objects.push_back(impl_->snapshot->motion);
                 const bool preparedGuides = bool(impl_->snapshot->guidePlan);
 
-                Object interpolator = configuration.factory;
-                if (!interpolator) return fail("encode_interpolator");
-                auto effect = (id<MTLFXFrameInterpolatorBase>)interpolator.get();
+                auto effect = (id<MTL4FXFrameInterpolator>)configuration.factory.get();
                 auto device = (id<MTLDevice>)configuration.device.get();
                 const auto& p = impl_->snapshot->parameters;
                 const auto& d = impl_->dispatch;
@@ -1224,12 +1177,14 @@ bool PreparedFrame::encode(
                 // only a render grid smaller than its sampling grid. A public (FSR)
                 // generation rect keeps the full display's sampling density.
                 const bool depthDilation = layout.dilateDepth;
+                // MetalFX consumes the active guide rect from descriptor-sized textures.
                 const bool directDepth = preparedGuides || exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->depth.get(), configuration.depth,
-                    guideWidth, guideHeight, effect.depthTextureUsage, depthDilation);
+                    configuration.width, configuration.height, effect.depthTextureUsage,
+                    layout.padded || depthDilation || impl_->snapshot->depthWidth != guideWidth || impl_->snapshot->depthHeight != guideHeight);
                 const bool directMotion = preparedGuides || exactDescriptorInput(
                     (id<MTLTexture>)impl_->snapshot->motion.get(), configuration.motion,
-                    guideWidth, guideHeight, effect.motionTextureUsage, layout.convertMotion);
+                    configuration.width, configuration.height, effect.motionTextureUsage, layout.padded || layout.convertMotion);
                 // Both native inputs are read-only. When HUD-less and present
                 // identify the same source view/rect and conversion format, the
                 // same decoded pixels can serve both without a second dispatch.
@@ -1240,7 +1195,17 @@ bool PreparedFrame::encode(
                         d.hudless_x == d.present_x && d.hudless_y == d.present_y));
                 const MTLTextureUsage currentUsage = effect.colorTextureUsage | MTLTextureUsageShaderRead |
                     MTLTextureUsageShaderWrite | (sharedSceneUi ? effect.uiTextureUsage : MTLTextureUsageUnknown);
-                Object current = execution->scratchTexture(configuration.color,
+                id<MTLTexture> present = (id<MTLTexture>)impl_->first.get();
+                id<MTLTexture> scene = impl_->third ? (id<MTLTexture>)impl_->third.get() : present;
+                id<MTLTexture> target = (id<MTLTexture>)impl_->second.get();
+                const bool linearIdentity = d.backbuffer_transfer_function == 2 &&
+                    d.min_luminance == 0 && d.max_luminance == 80;
+                const bool directColor = linearIdentity && exactDescriptorInput(scene, configuration.color,
+                    configuration.outputWidth, configuration.outputHeight, effect.colorTextureUsage |
+                    (sharedSceneUi ? effect.uiTextureUsage : MTLTextureUsageUnknown), false) &&
+                    metalfx::texturesDisjoint(scene, (id<MTLTexture>)impl_->realOutput.get()) &&
+                    metalfx::texturesDisjoint(scene, target);
+                Object current = directColor ? Object(scene) : execution->scratchTexture(configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
                     currentUsage);
                 Object ui = configuration.ui == MTLPixelFormatInvalid ? Object{} :
@@ -1248,12 +1213,20 @@ bool PreparedFrame::encode(
                                    configuration.outputHeight, effect.uiTextureUsage |
                                    MTLTextureUsageShaderWrite);
                 Object normalizedDepth = directDepth ? impl_->snapshot->depth : execution->scratchTexture(configuration.depth,
-                    guideWidth, guideHeight,
+                    configuration.width, configuration.height,
                     effect.depthTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
                 Object normalizedMotion = directMotion ? impl_->snapshot->motion : execution->scratchTexture(configuration.motion,
-                    guideWidth, guideHeight,
+                    configuration.width, configuration.height,
                     effect.motionTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
-                Object output = execution->scratchTexture(configuration.color,
+                const bool directOutput = linearIdentity && !impl_->ui && !impl_->uiAlpha &&
+                    !((d.flags | p.flags) & 7u) && target.storageMode == MTLStorageModePrivate &&
+                    exactDescriptorInput(target, configuration.color, configuration.outputWidth,
+                                         configuration.outputHeight, effect.outputTextureUsage, false) &&
+                    metalfx::texturesDisjoint(target, scene) && metalfx::texturesDisjoint(target, present) &&
+                    metalfx::texturesDisjoint(target, (id<MTLTexture>)normalizedDepth.get()) &&
+                    metalfx::texturesDisjoint(target, (id<MTLTexture>)normalizedMotion.get()) &&
+                    metalfx::texturesDisjoint(target, (id<MTLTexture>)impl_->distortion.get());
+                Object output = directOutput ? Object(target) : execution->scratchTexture(configuration.color,
                     configuration.outputWidth, configuration.outputHeight,
                     effect.outputTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
                 auto distortionSource = (id<MTLTexture>)impl_->distortion.get();
@@ -1274,21 +1247,11 @@ bool PreparedFrame::encode(
                 const std::uint64_t frame = impl_->dispatch.frame_id;
                 const bool currentGeneration =
                     impl_->generationEpoch == state.generationEpoch && state.generationEnabled;
-                bool reset = impl_->reset || impl_->snapshot->parameters.reset ||
+                const bool reset = d.reset || impl_->snapshot->parameters.reset ||
                     impl_->configuration != state.historyConfiguration ||
                     !sameHistoryValues(impl_->dispatch, state.historyDispatch) ||
                     state.historyFrame + 1 != frame;
-                execution->objects.push_back(interpolator);
-                execution->objects.push_back(current);
-                execution->objects.push_back(ui);
-                execution->objects.push_back(normalizedDepth);
-                execution->objects.push_back(normalizedMotion);
-                execution->objects.push_back(output);
-                execution->objects.push_back(distortion);
 
-                id<MTLTexture> present = (id<MTLTexture>)impl_->first.get();
-                id<MTLTexture> scene = impl_->third
-                    ? (id<MTLTexture>)impl_->third.get() : present;
                 auto rawView = [&](id<MTLTexture> texture) -> Object {
                     MTLPixelFormat raw = texture.pixelFormat;
                     if (raw == MTLPixelFormatRGBA8Unorm_sRGB) raw = MTLPixelFormatRGBA8Unorm;
@@ -1364,14 +1327,23 @@ bool PreparedFrame::encode(
 
                 FgParams motionParams = guideMotionParams(state.creation,*impl_->snapshot,layout,reset);
 
-                auto parameterLease = impl_->state->pool->parameters(device);
-                auto tableLease = impl_->state->pool->table(device);
-                if (!parameterLease || !tableLease) return fail("encode_parameter_buffers");
-                execution->scratch.push_back(parameterLease);
-                execution->scratch.push_back(tableLease);
-                auto parameters = (id<MTLBuffer>)parameterLease->object.get();
-                id table = tableLease->object.get();
-                execution->objects.push_back(parameterLease->object);
+                const bool prepassDispatch = !directColor || (ui && !sharedSceneUi) || decodeDistortion ||
+                    !directDepth || !directMotion;
+                const bool usesKernel = prepassDispatch || !directOutput;
+                id<MTLBuffer> parameters = nil;
+                id table = nil;
+                if (usesKernel || impl_->disableInterpolation) {
+                    auto lease = impl_->state->pool->parameters(device);
+                    if (!lease) return fail("encode_parameter_buffers");
+                    parameters = (id<MTLBuffer>)lease->object.get();
+                    execution->scratch.push_back(std::move(lease));
+                }
+                if (usesKernel) {
+                    auto lease = impl_->state->pool->table(device);
+                    if (!lease) return fail("encode_argument_table");
+                    table = lease->object.get();
+                    execution->scratch.push_back(std::move(lease));
+                }
                 // Metal4 GPU addresses must be admitted before the residency set commits.
                 if (!execution->makeResident(buffer))
                     return fail("encode_residency");
@@ -1433,80 +1405,84 @@ bool PreparedFrame::encode(
                 // The snapshot and normalized depth share configuration.depth, so the
                 // value the fused pass reconstructs camera motion from round-trips the
                 // store exactly, as the separate motion pass would read it back.
-                const bool fuseDepthMotion = !directDepth && !directMotion;
-                id<MTL4ComputeCommandEncoder> prepass = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
-                if (!prepass) return fail("encode_prepass_encoder");
-                execution->objects.emplace_back(prepass);
                 struct EndEncoding {
                     id<MTL4ComputeCommandEncoder> encoder;
                     ~EndEncoding() { if (encoder) [encoder endEncoding]; }
-                } prepassScope{prepass};
-                [prepass waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageBlit | MTLStageDispatch];
-                for (unsigned i = 0; i != copyCount; ++i) {
-                    const auto& copy = copies[i];
-                    [prepass copyFromTexture:copy.source sourceSlice:0 sourceLevel:0
-                                sourceOrigin:MTLOriginMake(copy.sourceX, copy.sourceY, 0)
-                                  sourceSize:MTLSizeMake(copy.width, copy.height, 1)
-                                   toTexture:copy.destination destinationSlice:0 destinationLevel:0
-                           destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
+                };
+                const MTLStages prepassStages = (prepassDispatch ? MTLStageDispatch : 0) | (copyCount ? MTLStageBlit : 0);
+                if (prepassStages) {
+                    const bool fuseDepthMotion = !directDepth && !directMotion;
+                    id<MTL4ComputeCommandEncoder> prepass = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
+                    if (!prepass) return fail("encode_prepass_encoder");
+                    m4_hud_count(WMTMetal4HUDCompute);
+                    execution->objects.emplace_back(prepass);
+                    EndEncoding prepassScope{prepass};
+                    [prepass waitForFence:(id<MTLFence>)fence beforeEncoderStages:prepassStages];
+                    m4_hud_count(WMTMetal4HUDFenceWait);
+                    for (unsigned i = 0; i != copyCount; ++i) {
+                        const auto& copy = copies[i];
+                        [prepass copyFromTexture:copy.source sourceSlice:0 sourceLevel:0
+                                    sourceOrigin:MTLOriginMake(copy.sourceX, copy.sourceY, 0)
+                                      sourceSize:MTLSizeMake(copy.width, copy.height, 1)
+                                       toTexture:copy.destination destinationSlice:0 destinationLevel:0
+                               destinationOrigin:MTLOriginMake(copy.destinationX, copy.destinationY, 0)];
+                    }
+                    // The copies publish caller outputs (or a distortion crop);
+                    // decode/normalization write only execution-owned scratch.
+                    // Keep the barrier whenever a copy destination can overlap a
+                    // compute input, including different views of placed storage.
+                    const std::array<id<MTLTexture>, 5> prepassInputs{{
+                        !directColor ? (id<MTLTexture>)sceneView.get() : nil,
+                        ui && !sharedSceneUi ? (id<MTLTexture>)presentView.get() : nil,
+                        decodeDistortion ? distortionSource : nil,
+                        !directDepth || !directMotion ? (id<MTLTexture>)impl_->snapshot->depth.get() : nil,
+                        !directMotion ? (id<MTLTexture>)impl_->snapshot->motion.get() : nil,
+                    }};
+                    bool copyDependency = false;
+                    for (unsigned i = 0; i != copyCount && !copyDependency; ++i)
+                        for (auto input : prepassInputs)
+                            if (!metalfx::texturesDisjoint(copies[i].destination, input)) {
+                                copyDependency = true;
+                                break;
+                            }
+                    if (copyDependency)
+                        [prepass barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch
+                                         visibilityOptions:MTL4VisibilityOptionDevice];
+                    if (!directColor && !dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
+                                      (id<MTLTexture>)sceneView.get(), (id<MTLTexture>)current.get(),
+                                      parameters, SceneSlot, sceneParams))
+                        return fail("encode_scene_decode");
+                    if (ui && !sharedSceneUi && !dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
+                                            (id<MTLTexture>)presentView.get(), (id<MTLTexture>)ui.get(),
+                                            parameters, UiSlot, uiParams))
+                        return fail("encode_ui_decode");
+                    if (decodeDistortion && !dispatchPass(prepass, table,
+                                            (id<MTLComputePipelineState>)configuration.kernels->distortionPipeline.get(),
+                                            distortionSource, (id<MTLTexture>)distortion.get(),
+                                            parameters, DistortionSlot, distortionParams))
+                        return fail("encode_distortion_decode");
+                    if (fuseDepthMotion) {
+                        if (!dispatchPass(prepass, table,
+                                          (id<MTLComputePipelineState>)configuration.kernels->depthMotionPipeline.get(),
+                                          (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
+                                          parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
+                                          (id<MTLTexture>)impl_->snapshot->depth.get(), nil, nil, configuration.kernels.get()))
+                            return fail("encode_depth_motion_normalize");
+                    } else if (!directDepth) {
+                        if (!dispatchPass(prepass, table,
+                                          (id<MTLComputePipelineState>)configuration.kernels->depthPipeline.get(),
+                                          (id<MTLTexture>)impl_->snapshot->depth.get(), (id<MTLTexture>)normalizedDepth.get(),
+                                          parameters, DepthSlot, depthParams))
+                            return fail("encode_depth_normalize");
+                    } else if (!directMotion) {
+                        if (!dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->motionPipeline.get(),
+                                          (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
+                                          parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
+                                          (id<MTLTexture>)impl_->snapshot->depth.get()))
+                            return fail("encode_motion_normalize");
+                    }
+                    [prepass updateFence:(id<MTLFence>)fence afterEncoderStages:prepassStages];
                 }
-                // The copies publish caller outputs (or a distortion crop);
-                // decode/normalization write only execution-owned scratch.
-                // Keep the barrier whenever a copy destination can overlap a
-                // compute input, including different views of placed storage.
-                const std::array<id<MTLTexture>, 5> prepassInputs{{
-                    (id<MTLTexture>)sceneView.get(),
-                    ui && !sharedSceneUi ? (id<MTLTexture>)presentView.get() : nil,
-                    decodeDistortion ? distortionSource : nil,
-                    !directDepth || !directMotion ? (id<MTLTexture>)impl_->snapshot->depth.get() : nil,
-                    !directMotion ? (id<MTLTexture>)impl_->snapshot->motion.get() : nil,
-                }};
-                bool copyDependency = false;
-                for (unsigned i = 0; i != copyCount && !copyDependency; ++i)
-                    for (auto input : prepassInputs)
-                        if (!metalfx::texturesDisjoint(copies[i].destination, input)) {
-                            copyDependency = true;
-                            break;
-                        }
-                if (copyDependency)
-                    [prepass barrierAfterEncoderStages:MTLStageBlit beforeEncoderStages:MTLStageDispatch
-                                     visibilityOptions:MTL4VisibilityOptionDevice];
-                if (!dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
-                                  (id<MTLTexture>)sceneView.get(), (id<MTLTexture>)current.get(),
-                                  parameters, SceneSlot, sceneParams))
-                    return fail("encode_scene_decode");
-                if (ui && !sharedSceneUi && !dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->decodePipeline.get(),
-                                        (id<MTLTexture>)presentView.get(), (id<MTLTexture>)ui.get(),
-                                        parameters, UiSlot, uiParams))
-                    return fail("encode_ui_decode");
-                if (decodeDistortion && !dispatchPass(prepass, table,
-                                        (id<MTLComputePipelineState>)configuration.kernels->distortionPipeline.get(),
-                                        distortionSource, (id<MTLTexture>)distortion.get(),
-                                        parameters, DistortionSlot, distortionParams))
-                    return fail("encode_distortion_decode");
-                if (fuseDepthMotion) {
-                    if (!dispatchPass(prepass, table,
-                                      (id<MTLComputePipelineState>)configuration.kernels->depthMotionPipeline.get(),
-                                      (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
-                                      parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
-                                      (id<MTLTexture>)impl_->snapshot->depth.get(), nil, nil, configuration.kernels.get()))
-                        return fail("encode_depth_motion_normalize");
-                } else if (!directDepth) {
-                    if (!dispatchPass(prepass, table,
-                                      (id<MTLComputePipelineState>)configuration.kernels->depthPipeline.get(),
-                                      (id<MTLTexture>)impl_->snapshot->depth.get(), (id<MTLTexture>)normalizedDepth.get(),
-                                      parameters, DepthSlot, depthParams))
-                        return fail("encode_depth_normalize");
-                } else if (!directMotion) {
-                    if (!dispatchPass(prepass, table, (id<MTLComputePipelineState>)configuration.kernels->motionPipeline.get(),
-                                      (id<MTLTexture>)impl_->snapshot->motion.get(), (id<MTLTexture>)normalizedMotion.get(),
-                                      parameters, MotionSlot, motionParams, (id<MTLTexture>)normalizedDepth.get(), nil,
-                                      (id<MTLTexture>)impl_->snapshot->depth.get()))
-                        return fail("encode_motion_normalize");
-                }
-                [prepass updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageBlit | MTLStageDispatch];
-                [prepass endEncoding];
-                prepassScope.encoder = nil;
 
                 const InterpolatorBindings bindings(effect);
                 effect.colorTexture = (id<MTLTexture>)current.get();
@@ -1601,9 +1577,10 @@ bool PreparedFrame::encode(
                 }
 
                 // Record the encode before MetalFX can report it to the HUD.
-                if (!currentGeneration || !state.hudCounted) {
+                const bool hudActive = currentGeneration && !state.retired;
+                if (!hudActive || !state.hudCounted) {
                     std::lock_guard lock(hudRow.mutex);
-                    if (currentGeneration) {
+                    if (hudActive) {
                         state.hudCounted = true;
                         ++hudRow.interpolating;
                     } else {
@@ -1611,36 +1588,39 @@ bool PreparedFrame::encode(
                         scheduleHudRowRemoval();
                     }
                 }
-                [(id<MTL4FXFrameInterpolator>)interpolator.get()
-                    encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
+                [effect encodeToCommandBuffer:(id<MTL4CommandBuffer>)buffer];
 
-                id<MTL4ComputeCommandEncoder> scatter = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
-                if (!scatter) return fail("encode_output_scatter");
-                execution->objects.emplace_back(scatter);
-                struct EndScatter {
-                    id<MTL4ComputeCommandEncoder> encoder;
-                    ~EndScatter() { if (encoder) [encoder endEncoding]; }
-                } scatterScope{scatter};
-                [scatter waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch | MTLStageBlit];
-                if (!dispatchPass(scatter, table, (id<MTLComputePipelineState>)configuration.kernels->encodePipeline.get(),
-                                  (id<MTLTexture>)output.get(), (id<MTLTexture>)outputView.get(),
-                                  parameters, ColorSlot, colorParams, (id<MTLTexture>)normalizedDepth.get(),
-                                  (id<MTLTexture>)normalizedMotion.get(), (id<MTLTexture>)explicitUiView.get(),
-                                  explicitUiView ? (id<MTLTexture>)sceneView.get() : nil,
-                                  explicitUiView ? (id<MTLTexture>)presentView.get() : nil))
-                    return fail("encode_output_scatter");
-                if (impl_->disableInterpolation) {
-                    // NGX defines a presentation hint, not a native quality/count query.
-                    // A reset or detached recording has no continuous pair to present.
-                    // The CPU-written parameter word is independent of the scatter dispatch.
-                    [scatter copyFromBuffer:parameters
-                               sourceOffset:ColorSlot * Pool::kParameterSlot + offsetof(FgParams, disableHint)
-                                   toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
-                          destinationOffset:d.disable_interpolation_offset size:sizeof(std::uint32_t)];
+                // MetalFX itself waits on and signals the queue fence for direct output.
+                const MTLStages scatterStages = (directOutput ? 0 : MTLStageDispatch) |
+                    (impl_->disableInterpolation ? MTLStageBlit : 0);
+                if (scatterStages) {
+                    id<MTL4ComputeCommandEncoder> scatter = [(id<MTL4CommandBuffer>)buffer computeCommandEncoder];
+                    if (!scatter) return fail("encode_output_scatter");
+                    m4_hud_count(WMTMetal4HUDCompute);
+                    execution->objects.emplace_back(scatter);
+                    EndEncoding scatterScope{scatter};
+                    [scatter waitForFence:(id<MTLFence>)fence beforeEncoderStages:scatterStages];
+                    m4_hud_count(WMTMetal4HUDFenceWait);
+                    if (!directOutput && !dispatchPass(scatter, table, (id<MTLComputePipelineState>)configuration.kernels->encodePipeline.get(),
+                                      (id<MTLTexture>)output.get(), (id<MTLTexture>)outputView.get(),
+                                      parameters, ColorSlot, colorParams, (id<MTLTexture>)normalizedDepth.get(),
+                                      (id<MTLTexture>)normalizedMotion.get(), (id<MTLTexture>)explicitUiView.get(),
+                                      explicitUiView ? (id<MTLTexture>)sceneView.get() : nil,
+                                      explicitUiView ? (id<MTLTexture>)presentView.get() : nil))
+                        return fail("encode_output_scatter");
+                    if (impl_->disableInterpolation) {
+                        // NGX defines a presentation hint, not a native quality/count query.
+                        // A reset or detached recording has no continuous pair to present.
+                        if (directOutput)
+                            std::memcpy(static_cast<char*>(parameters.contents) + ColorSlot * Pool::kParameterSlot +
+                                offsetof(FgParams, disableHint), &colorParams.disableHint, sizeof(colorParams.disableHint));
+                        [scatter copyFromBuffer:parameters
+                                   sourceOffset:ColorSlot * Pool::kParameterSlot + offsetof(FgParams, disableHint)
+                                       toBuffer:(id<MTLBuffer>)impl_->disableInterpolation.get()
+                              destinationOffset:d.disable_interpolation_offset size:sizeof(std::uint32_t)];
+                    }
+                    [scatter updateFence:(id<MTLFence>)fence afterEncoderStages:scatterStages];
                 }
-                [scatter updateFence:(id<MTLFence>)fence afterEncoderStages:MTLStageDispatch | MTLStageBlit];
-                [scatter endEncoding];
-                scatterScope.encoder = nil;
                 // A queued command may encode after OFF (or after a subsequent ON).
                 // Its output remains owned by the command, but must not seed new history.
                 if (currentGeneration) {
@@ -1648,7 +1628,7 @@ bool PreparedFrame::encode(
                     state.historyDispatch = impl_->dispatch;
                     state.historyFrame = frame;
                 } else if (state.historyConfiguration &&
-                           state.historyConfiguration->factory.get() == interpolator.get()) {
+                           state.historyConfiguration->factory.get() == effect) {
                     // A stale encode advanced the shared native history without
                     // recording it; the next current frame must reset.
                     state.historyConfiguration.reset();
@@ -1704,11 +1684,10 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     contexts.erase(found);
                 }
                 std::lock_guard lock(state->mutex);
-                state->retired = true;
                 state->frames.clear();
-                // Commands recorded before DESTROY may still encode; mark them stale.
+                // Recorded frames own their state and still advance this history in queue order.
                 std::lock_guard executionLock(state->executionMutex);
-                ++state->generationEpoch;
+                state->retired = true;
                 releaseHudRow(state->hudCounted);
                 state->rawViews = {};
                 state->pool->markDormant();
@@ -1799,27 +1778,32 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 : static_cast<WMTFGprepare_packet*>(arguments);
             auto* d = generate
                 ? static_cast<WMTFGdispatch_packet*>(arguments) : nullptr;
-            void* list = pointer(generate ? d->command_list : p->command_list);
-            Command command;
-            if (!command.open(list)) return finish(Unsupported);
-            if (!supported(*state, (id<MTLDevice>)command.value.device,
-                           command.value.compiler))
+            auto list = reinterpret_cast<const WMTFGNativeCommand *>(generate ? d->command_list : p->command_list);
+            if (!list) return finish(Unsupported);
+            const auto command = *list;
+            if (!supported(*state, (id<MTLDevice>)command.device,
+                           command.compiler))
                 return finish(Unsupported);
-            if (state->providerValidated && state->device.get() != (id)command.value.device)
+            if (state->providerValidated && state->device.get() != (id)command.device)
                 return finish(Parameter);
 
-            Resources resources;
-            auto implementation = std::make_shared<PreparedFrame::Impl>();
+            std::array<id<MTLTexture>, 7> textures{};
+            const auto mapTexture = [&](unsigned index, std::uint64_t address, NSUInteger width, NSUInteger height) {
+                auto texture = (id<MTLTexture>)address;
+                if (!textureValid(texture, (id<MTLDevice>)command.device, width, height) ||
+                    state->device.get() != (id)command.device) return false;
+                textures[index] = texture;
+                return true;
+            };
+            std::shared_ptr<PreparedFrame::Impl> implementation;
             std::shared_ptr<const PreparedGuidePlan> candidateGuidePlan;
-            implementation->state = state;
-            std::array<std::uint64_t, 7> addresses{};
             std::uint64_t frame = generate ? d->frame_id : p->frame_id;
 
             if (!generate) {
                 CameraPlanes planes{};
                 if (!normalizeCameraPlanes(*p, state->creation.flags, planes))
                     return finish(Parameter, "prepare_camera_planes", state->creation.flags);
-                if (!validParameters(*p, state->creation.flags) ||
+                if (!validParameters(*p) ||
                     p->render_width > state->creation.max_render_width ||
                     p->render_height > state->creation.max_render_height)
                     return finish(Parameter, "prepare_parameters", state->creation.flags);
@@ -1831,21 +1815,19 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 // but disabled presentation cannot consume frame-ID metadata.
                 if (state->generationEnabled && state->frames.size() >= FrameRegistry::kCapacity)
                     return finish(Runtime, "prepare_backpressure");
-                addresses = {p->depth, p->motion_vectors, 0};
                 const NSUInteger motionWidth = p->motion_width;
                 const NSUInteger motionHeight = p->motion_height;
-                if (!addresses[0] || !addresses[1] || addresses[0] == addresses[1] ||
-                    !mapOne(resources, 0, *state, command, addresses[0], false,
+                if (p->depth == p->motion_vectors || !mapTexture(0, p->depth,
                             NSUInteger(p->depth_subrect_x) + p->render_width,
                             NSUInteger(p->depth_subrect_y) + p->render_height) ||
-                    !mapOne(resources, 1, *state, command, addresses[1], false,
+                    !mapTexture(1, p->motion_vectors,
                             NSUInteger(p->motion_subrect_x) + motionWidth,
                             NSUInteger(p->motion_subrect_y) + motionHeight) ||
-                    rootTexture((id<MTLTexture>)resources.values[0].texture) ==
-                    rootTexture((id<MTLTexture>)resources.values[1].texture))
+                    rootTexture(textures[0]) ==
+                    rootTexture(textures[1]))
                     return finish(Unsupported);
-                auto depth = (id<MTLTexture>)resources.values[0].texture;
-                auto motion = (id<MTLTexture>)resources.values[1].texture;
+                auto depth = textures[0];
+                auto motion = textures[1];
                 // The first Prepare selects the provider even before the pending
                 // configuration is replayed. Validate its MetalFX eligibility,
                 // but do not create or record snapshots while generation is off.
@@ -1855,7 +1837,7 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 // format, else the default full-display SDR one Generate commonly selects.
                 std::shared_ptr<Configuration> configuration;
                 for (const auto& cached : state->configurations)
-                    if (cached->device.get() == (id)command.value.device && cached->depth == depth.pixelFormat) {
+                    if (cached->device.get() == (id)command.device && cached->depth == depth.pixelFormat) {
                         configuration = cached;
                         break;
                     }
@@ -1870,7 +1852,6 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     return finish(Ok);
                 }
                 auto snapshot = std::make_shared<Snapshot>();
-                implementation->configuration = configuration;
                 snapshot->parameters = *p;
                 snapshot->depthFormat = depth.pixelFormat; snapshot->motionFormat = motion.pixelFormat;
                 snapshot->depthWidth = p->render_width;
@@ -1892,19 +1873,22 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     snapshot->depth = Object(depth);
                     snapshot->motion = Object(motion);
                     snapshot->produced.store(true, std::memory_order_relaxed);
+                } else {
+                    implementation = std::make_shared<PreparedFrame::Impl>();
+                    implementation->configuration = configuration;
                 }
                 state->hasPreparedJitter = true;
                 state->preparedFrame = frame;
                 state->preparedJitterX = p->jitter_x;
                 state->preparedJitterY = p->jitter_y;
-                implementation->snapshot = std::move(snapshot);
                 if (direct) {
                     // No Prepare command: register the frame and record nothing.
-                    if (!state->frames.insert(frame, implementation->snapshot)) return finish(Runtime);
+                    if (!state->frames.insert(frame, snapshot)) return finish(Runtime);
                     p->flags |= WMTFG_PREPARE_DIRECT_INPUTS;
                     state->providerValidated = true;
                     return finish(Ok);
                 }
+                implementation->snapshot = std::move(snapshot);
             } else {
                 if ((d->flags & ~7u) || d->output_subrect_only > 1 || d->independent_subrects > 1 ||
                     d->distortion_low_precision > 1 || (d->distortion_low_precision &&
@@ -1915,26 +1899,26 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 if (!validTransfer(*d)) return finish(Parameter);
                 auto found = state->frames.find(frame);
                 if (!found) return finish(Parameter);
+                implementation = std::make_shared<PreparedFrame::Impl>();
                 implementation->kind = PreparedFrame::Impl::Kind::Generate;
                 implementation->generationEpoch = state->generationEpoch;
-                implementation->reset = d->reset != 0;
                 implementation->dispatch = *d;
                 if (d->disable_interpolation) {
                     auto status = (id<MTLBuffer>)d->disable_interpolation;
                     if (![status conformsToProtocol:@protocol(MTLBuffer)] ||
-                        status.device != (id<MTLDevice>)command.value.device ||
+                        status.device != (id<MTLDevice>)command.device ||
                         d->disable_interpolation_offset > status.length ||
                         sizeof(std::uint32_t) > status.length - d->disable_interpolation_offset)
                         return finish(Parameter);
                     implementation->disableInterpolation = Object(status);
                 }
-                addresses = {d->present_color, d->output, d->hudless_color, d->real_output, d->distortion};
-                if (!mapPair(resources, *state, command, addresses[0], addresses[1],
-                             true, state->creation.display_width,
-                             state->creation.display_height))
+                if (d->present_color == d->output ||
+                    !mapTexture(0, d->present_color, state->creation.display_width, state->creation.display_height) ||
+                    !mapTexture(1, d->output, state->creation.display_width, state->creation.display_height) ||
+                    rootTexture(textures[0]) == rootTexture(textures[1]))
                     return finish(Unsupported);
-                auto present = (id<MTLTexture>)resources.values[0].texture;
-                auto output = (id<MTLTexture>)resources.values[1].texture;
+                auto present = textures[0];
+                auto output = textures[1];
                 if ((!d->output_subrect_only && (output.width != present.width || output.height != present.height)) ||
                     present.pixelFormat != output.pixelFormat)
                     return finish(Unsupported);
@@ -1954,19 +1938,19 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 id<MTLTexture> scene = present;
                 MTLPixelFormat uiFormat = MTLPixelFormatInvalid;
                 if (d->hudless_color) {
-                    if (!mapOne(resources, 2, *state, command, d->hudless_color, false,
+                    if (!mapTexture(2, d->hudless_color,
                                 NSUInteger(dispatch.hudless_x) + rectWidth, NSUInteger(dispatch.hudless_y) + rectHeight))
                         return finish(Unsupported);
-                    scene = (id<MTLTexture>)resources.values[2].texture;
+                    scene = textures[2];
                     if (rootTexture(scene) == rootTexture(output)) return finish(Parameter);
                     if (!d->ui && !d->ui_alpha) uiFormat = present.pixelFormat;
                 }
                 if (d->real_output) {
-                    if (!mapOne(resources, 3, *state, command, d->real_output, true,
+                    if (!mapTexture(3, d->real_output,
                                 d->output_subrect_only ? NSUInteger(dispatch.real_x) + rectWidth : present.width,
                                 d->output_subrect_only ? NSUInteger(dispatch.real_y) + rectHeight : present.height))
                         return finish(Parameter);
-                    auto real = (id<MTLTexture>)resources.values[3].texture;
+                    auto real = textures[3];
                     if ((!d->output_subrect_only && (real.width != present.width || real.height != present.height)) ||
                         NSUInteger(dispatch.real_x) + rectWidth > real.width ||
                         NSUInteger(dispatch.real_y) + rectHeight > real.height ||
@@ -1976,13 +1960,13 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                 }
                 if (d->distortion) {
                     if (!d->distortion_width || !d->distortion_height ||
-                        !mapOne(resources, 4, *state, command, d->distortion, false,
+                        !mapTexture(4, d->distortion,
                             NSUInteger(d->distortion_x) + d->distortion_width,
                             NSUInteger(d->distortion_y) + d->distortion_height))
                         return finish(Parameter);
-                    auto distortion = (id<MTLTexture>)resources.values[4].texture;
+                    auto distortion = textures[4];
                     if (rootTexture(distortion) == rootTexture(output) ||
-                        (d->real_output && rootTexture(distortion) == rootTexture((id<MTLTexture>)resources.values[3].texture)))
+                        (d->real_output && rootTexture(distortion) == rootTexture(textures[3])))
                         return finish(Parameter);
                     if (distortion.pixelFormat != MTLPixelFormatRGBA16Float && distortion.pixelFormat != MTLPixelFormatRGBA32Float &&
                         !(d->distortion_low_precision && (distortion.pixelFormat == MTLPixelFormatRGBA8Unorm ||
@@ -1996,11 +1980,11 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     if (!address) continue;
                     const auto x = i == 5 ? d->ui_x : d->ui_alpha_x;
                     const auto y = i == 5 ? d->ui_y : d->ui_alpha_y;
-                    if (!mapOne(resources,i,*state,command,address,false,NSUInteger(x) + rectWidth,NSUInteger(y) + rectHeight))
+                    if (!mapTexture(i, address, NSUInteger(x) + rectWidth,NSUInteger(y) + rectHeight))
                         return finish(Parameter);
-                    auto texture = (id<MTLTexture>)resources.values[i].texture;
+                    auto texture = textures[i];
                     if (rootTexture(texture) == rootTexture(output) ||
-                        (d->real_output && rootTexture(texture) == rootTexture((id<MTLTexture>)resources.values[3].texture)))
+                        (d->real_output && rootTexture(texture) == rootTexture(textures[3])))
                         return finish(Parameter);
                     const auto format = texture.pixelFormat;
                     if (i == 5 ? (format != MTLPixelFormatRGBA8Unorm && format != MTLPixelFormatBGRA8Unorm &&
@@ -2024,8 +2008,8 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     !(state->creation.flags & WMTFG_MOTION_VECTORS_JITTERED)) {
                     const auto& config = *implementation->configuration;
                     const auto layout = guideLayout(state->creation,snapshot,config,implementation->dispatch);
-                    const bool depthConversion = layout.dilateDepth || snapshot.depthWidth != layout.width || snapshot.depthHeight != layout.height;
-                    const bool motionConversion = layout.convertMotion || snapshot.motionFormat != config.motion ||
+                    const bool depthConversion = layout.padded || layout.dilateDepth || snapshot.depthWidth != layout.width || snapshot.depthHeight != layout.height;
+                    const bool motionConversion = layout.padded || layout.convertMotion || snapshot.motionFormat != config.motion ||
                         snapshot.motionWidth != layout.width || snapshot.motionHeight != layout.height;
                     if (depthConversion || motionConversion) {
                         auto plan = std::make_shared<PreparedGuidePlan>();
@@ -2036,13 +2020,14 @@ std::uint32_t api(std::uint32_t operation, void* arguments, std::shared_ptr<cons
                     }
                 }
             }
-            implementation->first = Object((id)resources.values[0].texture);
-            implementation->second = Object((id)resources.values[1].texture);
-            implementation->third = Object((id)resources.values[2].texture);
-            implementation->realOutput = Object((id)resources.values[3].texture);
-            implementation->distortion = Object((id)resources.values[4].texture);
-            implementation->ui = Object((id)resources.values[5].texture);
-            implementation->uiAlpha = Object((id)resources.values[6].texture);
+            implementation->state = state;
+            implementation->first = Object(textures[0]);
+            implementation->second = Object(textures[1]);
+            implementation->third = Object(textures[2]);
+            implementation->realOutput = Object(textures[3]);
+            implementation->distortion = Object(textures[4]);
+            implementation->ui = Object(textures[5]);
+            implementation->uiAlpha = Object(textures[6]);
             auto prepared = std::shared_ptr<const PreparedFrame>(
                 new PreparedFrame(implementation));
 

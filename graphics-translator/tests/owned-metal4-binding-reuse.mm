@@ -49,7 +49,7 @@ static void computeBuffer(uint64_t encoder, id<MTLBuffer> buffer, uint64_t offse
   command(encoder,WMTMetal4ComputeCommands,c);
 }
 static void dispatch(uint64_t encoder) {
-  wmtcmd_compute_dispatch c{}; c.type=WMTComputeCommandDispatchThreads; c.size={1,1,1};
+  wmtcmd_compute_dispatch_compact c{}; c.type=WMTComputeCommandDispatchCompact; c.x=c.y=c.z=1;
   command(encoder,WMTMetal4ComputeCommands,c);
 }
 static uint64_t compute(uint64_t buffer,id<MTLComputePipelineState> pso) {
@@ -57,7 +57,7 @@ static uint64_t compute(uint64_t buffer,id<MTLComputePipelineState> pso) {
   wmtcmd_compute_setpso c{}; c.type=WMTComputeCommandSetPSO; c.pso=handle(pso); c.threadgroup_size={1,1,1};
   command(encoder,WMTMetal4ComputeCommands,c); return encoder;
 }
-static void render(uint64_t buffer,id<MTLRenderPipelineState> pso,id<MTLTexture> target,id<MTLBuffer> source,uint64_t offset) {
+static void render(uint64_t buffer,id<MTLRenderPipelineState> pso,id<MTLTexture> target,id<MTLBuffer> source,uint64_t offset,bool indexed,bool small=false) {
   WMTRenderPassInfo pass{}; pass.colors[0].texture=handle(target);
   pass.colors[0].load_action=WMTLoadActionClear; pass.colors[0].store_action=WMTStoreActionStore;
   pass.default_raster_sample_count=1; pass.render_target_array_length=1;
@@ -68,8 +68,20 @@ static void render(uint64_t buffer,id<MTLRenderPipelineState> pso,id<MTLTexture>
   wmtcmd_render_setviewport v{}; v.type=WMTRenderCommandSetViewport; v.viewport={0,0,1,1,0,1}; command(encoder,WMTMetal4RenderCommands,v);
   wmtcmd_render_setbuffer b{}; b.type=WMTRenderCommandSetFragmentBuffer; b.buffer=handle(source); b.offset=offset; b.index=0;
   command(encoder,WMTMetal4RenderCommands,b); command(encoder,WMTMetal4RenderCommands,b);
-  wmtcmd_render_draw d{}; d.type=WMTRenderCommandDraw; d.primitive_type=WMTPrimitiveTypeTriangle; d.vertex_count=3; d.instance_count=1;
-  command(encoder,WMTMetal4RenderCommands,d);
+  if (small) {
+    wmtcmd_render_draw_indexed_small d{}; d.type=WMTRenderCommandDrawIndexedSmall;
+    d.primitive_type=WMTPrimitiveTypeTriangle; d.index_count=3; d.index_type=WMTIndexTypeUInt32;
+    d.index_buffer=handle(source); d.index_buffer_offset=20;
+    command(encoder,WMTMetal4RenderCommands,d);
+  } else if (indexed) {
+    wmtcmd_render_draw_indexed_compact d{}; d.type=WMTRenderCommandDrawIndexedCompact;
+    d.primitive_type=WMTPrimitiveTypeTriangle; d.index_count=3; d.index_type=WMTIndexTypeUInt32;
+    d.index_buffer=handle(source); d.index_buffer_offset=8; d.base_vertex=-1;
+    command(encoder,WMTMetal4RenderCommands,d);
+  } else {
+    wmtcmd_render_draw_compact d{}; d.type=WMTRenderCommandDrawCompact; d.primitive_type=WMTPrimitiveTypeTriangle; d.vertex_count=3;
+    command(encoder,WMTMetal4RenderCommands,d);
+  }
   call(WMTMetal4EndEncoding,{encoder});
 }
 static void finish(uint64_t buffer,id<MTL4CommandQueue> queue,unsigned expectedAllocations) {
@@ -93,8 +105,8 @@ static void word(const char *name,uint32_t actual,uint32_t expected) {
 
 int main(int argc,char **argv) {
   require(argc==2 || (argc==3 && (!std::strcmp(argv[2],"explicit") || !std::strcmp(argv[2],"encoder") ||
-                                 !std::strcmp(argv[2],"retired"))),
-          "usage: owned-metal4-binding-reuse <fresh-native-winemetal.so> [explicit|encoder|retired]");
+                                 !std::strcmp(argv[2],"retired") || !std::strcmp(argv[2],"indexed-small"))),
+          "usage: owned-metal4-binding-reuse <fresh-native-winemetal.so> [explicit|encoder|retired|indexed-small]");
   const char *negative=argc==3 ? argv[2] : "";
   auto requireUnbound = [&](uint64_t encoder, const char *phase) {
     if (std::strcmp(negative,phase)) return;
@@ -140,7 +152,7 @@ int main(int argc,char **argv) {
     id<MTL4CommandQueue> queue=[device newMTL4CommandQueue]; require(queue!=nil,"native queue");
     uint64_t allocator=call(WMTMetal4NewAllocator,{handle(device)}), buffer=call(WMTMetal4NewCommandBuffer,{handle(device)});
     require(allocator && buffer,"native-slot owners");
-    uint32_t values[2]={0x11223344,0xa5a55a5a}, optionalValue=0x87654321;
+    uint32_t values[]={0x11223344,0xa5a55a5a,1,2,3,0,1,2}, optionalValue=0x87654321;
     id<MTLBuffer> input=[device newBufferWithBytes:values length:sizeof(values) options:MTLResourceStorageModeShared];
     id<MTLBuffer> optional=[device newBufferWithBytes:&optionalValue length:4 options:MTLResourceStorageModeShared];
     const uint32_t zeroValue=0;
@@ -174,7 +186,7 @@ int main(int argc,char **argv) {
     requireUnbound(e,"explicit"); computeBuffer(e,zero,0,2); dispatch(e);
     computeBuffer(e,optional,0,2); // The next encoder must clear an actually nonnil stale slot.
     call(WMTMetal4EndEncoding,{e});
-    render(buffer,renderPSO,a,input,0); render(buffer,renderPSO,b,input,4);
+    render(buffer,renderPSO,a,input,0,false); render(buffer,renderPSO,b,input,4,true,!std::strcmp(negative,"indexed-small"));
     e=compute(buffer,computePSO); computeBuffer(e,output,16,0); computeBuffer(e,input,0,1);
     // The negative arm omits slot 2; the positive arm binds a valid zero resource.
     requireUnbound(e,"encoder"); computeBuffer(e,zero,0,2);
@@ -182,6 +194,9 @@ int main(int argc,char **argv) {
     after=counters(buffer); require(after.tableNew==2 && after.tableBind==4 && after.residencyNew==1,"one compute/fragment table and one residency set per native slot");
     require(after.tableSet==18 && after.residencyAdd==0,"exact ordinary-path operation counts");
     require(8==[(NSSet *)member(member(reinterpret_cast<id>(buffer),"recording"),"allocations") count],"separate allocation membership");
+    // Give the next input a distinct live GPU address so the exact setter-count
+    // oracle does not depend on allocator address reuse after retirement.
+    id<MTLBuffer> nextInput=[device newBufferWithBytes:&optionalValue length:4 options:MTLResourceStorageModeShared];
     [input release]; input=nil; [optional release]; optional=nil; // Recording must retain native resources through retirement.
     finish(buffer,queue,8);
     auto words=static_cast<const uint32_t *>(output.contents);
@@ -193,7 +208,7 @@ int main(int argc,char **argv) {
     [b getBytes:&pixel bytesPerRow:4 fromRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0]; word("draw_B",pixel,values[1]);
     // Rebegin after retirement: tables/set persist, while resource membership and stale slots reset.
     call(WMTMetal4ResetAllocator,{allocator}); call(WMTMetal4BeginCommandBuffer,{buffer,allocator});
-    input=[device newBufferWithBytes:&optionalValue length:4 options:MTLResourceStorageModeShared];
+    input=nextInput;
     e=compute(buffer,computePSO); computeBuffer(e,output,0,0); computeBuffer(e,input,0,1);
     requireUnbound(e,"retired"); computeBuffer(e,zero,0,2); dispatch(e); call(WMTMetal4EndEncoding,{e});
     after=counters(buffer); require(after.tableNew==0 && after.residencyNew==0 && after.tableBind==1,"retired native slot reuses table and residency");

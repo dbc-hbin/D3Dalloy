@@ -33,6 +33,7 @@ private:
   // release store publishes every write the completing thread made first.
   std::atomic<uint64_t> completed_value_ = 0;
   bool removed_ = false;
+  std::weak_ptr<Producer> committed_producer_;
   std::list<CompletionWaiter> completion_waiters_;
   uint64_t next_waiter_id_ = 1;
   const uint64_t generation_;
@@ -74,6 +75,19 @@ public:
     }
     for (auto &waiter : ready)
       waiter.callback();
+  }
+
+  // A submitted local producer can finish independently of a consumer preparing its next list.
+  // This is a progress proof only. The waiter's own completion latch still chooses the crossing.
+  void markSubmitted(const std::shared_ptr<Producer> &producer) {
+    std::lock_guard lock(mutex_);
+    committed_producer_ = producer;
+  }
+
+  bool hasSubmittedProducer(uint64_t value) const {
+    std::lock_guard lock(mutex_);
+    auto producer = committed_producer_.lock();
+    return !removed_ && producer && !producer->completed && producer->value >= value;
   }
 
   void signalCpu(uint64_t value) {

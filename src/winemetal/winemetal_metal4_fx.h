@@ -11,7 +11,14 @@ enum WMTMetal4FXOperation {
   WMTMetal4FXReservePresent = 230, /* args: MTL4 command buffer, drawable, duration bits, composition frame, sync, tearing; presents at commit */
   WMTMetal4FXPrepareTemporal = 228,
   WMTMetal4FXDormantTemporal = 229,
+  WMTMetal4FXCreateSpatial = 231,
+  WMTMetal4FXPrepareSpatial = 232,
+  WMTMetal4FXEncodeSpatial = 233,
 };
+/* Private feature selector carried in the replayable scaler transport. */
+#define WMTMetal4FXSpatialFlag 1024u
+/* Encode args[4] offers adjacent queue encoders; ret[3] reports edges actually used. */
+enum WMTMetal4FXHandoff { WMTMetal4FXProducer = 1u, WMTMetal4FXConsumer = 2u };
 struct WMTMetal4FXRect { uint32_t x, y, width, height; };
 struct WMTMetal4FXTemporalInfo {
   uint32_t input_width, input_height, output_width, output_height;

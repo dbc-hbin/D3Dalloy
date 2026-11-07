@@ -34,6 +34,7 @@
 #include "llvm/IR/DebugInfo.h"
 
 #include "airconv_context.hpp"
+#include "metallib_writer.hpp"
 #include "airconv_error.hpp"
 
 namespace d3dalloy::dxil {
@@ -363,6 +364,7 @@ llvm::Error PrepareShader(
   /* The resource maps the root-signature binding layer resolves declarations through.
    * The raytracing path calls the same helper (PopulateShaderResourceBindings). */
   PopulateShaderResourceBindings(shader.shader_info, metadata->resources);
+  shader.shader_info.has_implicit_root_access = metadata->has_implicit_root_access;
   /* Same argument tables and reflection the SM 5.x path builds. */
   dxbc::ArgumentTableMasks masks = build_argument_tables(&shader);
   if (reflection) {
@@ -371,6 +373,7 @@ llvm::Error PrepareShader(
     if (!fill_shader_reflection(&shader, masks, reflection, nullptr, nullptr, stream))
       return createError(stream.str());
     reflection->HasAtomic64 = metadata->has_atomic64 ? 1 : 0;
+    reflection->HasRayQuery = metadata->has_ray_query ? 1 : 0;
   }
   return llvm::Error::success();
 }
@@ -510,10 +513,44 @@ llvm::Error writeConstantInitializer(
 
 } // namespace
 
+llvm::Error FinalizeShader(llvm::Module &module, SM50CompiledBitcodeInternal &compiled, bool is_dxil) {
+  if (auto error = LowerAtomic64Phase(module))
+    return error;
+  runOptimizationPasses(module);
+  // Ordinary DXBC retains its inline constants. Atomic64 DXBC and DXIL use the relocated pool.
+  if (is_dxil || module.getModuleFlag(kAtomic64PhaseFlag))
+    if (auto error = LowerImmutableConstants(module, compiled))
+      return error;
+  llvm::raw_svector_ostream stream(compiled.vec);
+  return metallib::MetallibWriter().Write(module, stream);
+}
+
+// Small pointer-free fragment lookup tables can be read directly from AIR constant storage.
+static bool inlineFragmentTable(const llvm::GlobalVariable &global) {
+  using namespace llvm;
+  auto *data = dyn_cast<ConstantDataArray>(global.getInitializer());
+  if (!data || !global.hasLocalLinkage() || !global.hasGlobalUnnamedAddr() || global.getAddressSpace() != 2 ||
+      !data->getElementType()->isFloatTy() || data->getNumElements() > 32)
+    return false;
+  SmallVector<const Value *, 8> pending{&global};
+  while (!pending.empty()) {
+    for (const auto *use : pending.pop_back_val()->users()) {
+      if (isa<GEPOperator, BitCastOperator>(use)) {
+        pending.push_back(use);
+      } else {
+        auto *load = dyn_cast<LoadInst>(use);
+        if (!load || !load->isSimple()) return false;
+      }
+    }
+  }
+  return true;
+}
+
 llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInternal &compiled) {
   using namespace llvm;
   const auto &layout = module.getDataLayout();
   SmallVector<GlobalVariable *, 4> globals;
+  const bool fragment = module.getNamedMetadata("air.fragment") != nullptr;
   DenseMap<GlobalVariable *, uint64_t> offsets;
   uint64_t size = 0;
   for (auto &global : module.globals()) {
@@ -521,6 +558,7 @@ llvm::Error LowerImmutableConstants(llvm::Module &module, SM50CompiledBitcodeInt
         !global.isConstant() || !global.hasInitializer() || global.use_empty() ||
         (global.getAddressSpace() != 0 && global.getAddressSpace() != 2) || global.getName().startswith("llvm."))
       continue;
+    if (fragment && inlineFragmentTable(global)) continue;
     const uint64_t alignment = std::max(layout.getABITypeAlign(global.getValueType()).value(),
                                        global.getAlign().valueOrOne().value());
     const uint64_t length = layout.getTypeAllocSize(global.getValueType()).getFixedValue();

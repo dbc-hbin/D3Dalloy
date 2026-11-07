@@ -34,6 +34,7 @@ struct d3dalloy_compute_command_data {
   device char * argument_buffer;
   device ulong * predicate;
   uint predicate_op;
+  uint first_command;
   device ulong * static_samplers;
   device ulong * rootsig_qwords;
   device char * immutable_constants;
@@ -107,6 +108,7 @@ struct d3dalloy_render_command_data {
   device char * argument_buffer;
   device ulong * predicate;
   uint predicate_op;
+  uint first_command;
   device ulong * static_samplers;
   device ulong * rootsig_qwords;
   device char * vertex_constants;
@@ -119,7 +121,8 @@ struct d3dalloy_render_command_data {
   uint vertex_argbuf_stride;
   device d3dalloy_index_pull_control * index_pull_controls;
   uint index_pull_mode;
-  uint index_pull_padding;
+  ushort static_sampler_stages;
+  ushort root_argument_stages;
   device d3dalloy_so_capture_binding * so_draws;
   device uint * pipeline_statistics;
 };
@@ -389,7 +392,9 @@ public:
         return hr;
     }
     const bool updates_graphics_bindings = !is_compute && (UpdateRootArguments || UpdateVertexBuffers);
-    std::stringstream graphics_updates;
+    const bool may_bind_static_samplers =
+        !UpdateRootArguments || !pRootSignature || static_cast<MTLD3D12RootSignature *>(pRootSignature)->NumStaticSamplers;
+    std::stringstream graphics_updates, root_updates;
     if (updates_graphics_bindings)
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "
                 "device d3dalloy_vertex_buffer *vertex_buffer);\n";
@@ -412,9 +417,9 @@ public:
               "command_data.argument_buffer + " << (is_compute ? "ulong(i)" : "i") << " * "
            << pDesc->ByteStride << ")[0];\n";
     if (is_compute) {
-      source << "compute_command cmd(command_data.cmd_buf, i);\n";
+      source << "compute_command cmd(command_data.cmd_buf, command_data.first_command + i);\n";
     } else {
-      source << "render_command cmd(command_data.cmd_buf, i);\n";
+      source << "render_command cmd(command_data.cmd_buf, command_data.first_command + i);\n";
     }
     source << "cmd.reset();\n";
     source << "if (i >= count) return;\n";
@@ -437,11 +442,15 @@ public:
         if (!(UpdateRootArguments || UpdateVertexBuffers || UpdateIndexBuffer))
           source << "if (command_data.rootsig_qwords || command_data.so_draws || command_data.index_pull_mode != ~0u) {\n";
         source << "cmd.set_vertex_buffer(vertex_buffer," << SM50_BINDING_INDEX_VERTEX_BUFFER << ");\n";
-        source << "if (rootsig_qwords) cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
-        source << "cmd.set_vertex_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
-        source << "if (rootsig_qwords) cmd.set_fragment_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
-        source << "cmd.set_fragment_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS
-               << ");\n";
+        source << "if (command_data.root_argument_stages & " << unsigned(WMTMetal4StageVertex)
+               << ") cmd.set_vertex_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n"
+               << "if (command_data.root_argument_stages & " << unsigned(WMTMetal4StageFragment)
+               << ") cmd.set_fragment_buffer(rootsig_qwords," << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
+        if (may_bind_static_samplers)
+          source << "if (command_data.static_sampler_stages & " << unsigned(WMTMetal4StageVertex)
+                 << ") cmd.set_vertex_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n"
+                 << "if (command_data.static_sampler_stages & " << unsigned(WMTMetal4StageFragment)
+                 << ") cmd.set_fragment_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
         source << "if (command_data.vertex_constants) cmd.set_vertex_buffer(command_data.vertex_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
         source << "if (command_data.fragment_constants) cmd.set_fragment_buffer(command_data.fragment_constants,"
@@ -453,7 +462,9 @@ public:
                   "cmd.set_fragment_buffer(command_data.pipeline_statistics,25);\n}\n";
       } else {
         source << "if (rootsig_qwords) cmd.set_kernel_buffer(rootsig_qwords, " << SM50_BINDING_INDEX_ROOT_ARGUMENTS << ");\n";
-        source << "cmd.set_kernel_buffer(command_data.static_samplers," << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
+        if (may_bind_static_samplers)
+          source << "if (command_data.static_samplers) cmd.set_kernel_buffer(command_data.static_samplers,"
+                 << SM50_BINDING_INDEX_STATIC_SAMPLERS << ");\n";
         source << "if (command_data.immutable_constants) cmd.set_kernel_buffer(command_data.immutable_constants,"
                << SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS << ");\n";
         source << "if (command_data.pipeline_statistics) cmd.set_kernel_buffer(command_data.pipeline_statistics,25);\n";
@@ -566,7 +577,7 @@ public:
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
         for (unsigned j = 0; j < arg.Constant.Num32BitValuesToSet; j++) {
-          (is_compute ? source : graphics_updates)
+          root_updates
               << "reinterpret_cast<device uint *>(rootsig_qwords + " << offset << ")["
               << (j + arg.Constant.DestOffsetIn32BitValues) << "] = arg.constant_" << i << "_" << j << ";\n";
         }
@@ -582,7 +593,7 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
+        root_updates << "rootsig_qwords[" << offset << "] = arg.cb_" << i << ";\n";
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
@@ -595,11 +606,11 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
+        root_updates << "rootsig_qwords[" << offset << "] = arg.srv_" << i << ";\n";
         /* TILED: the GPU cannot map an address to its reserved buffer, so an indirect root view
            reports fully mapped (its status qword is reset instead of keeping an older base). */
         if (rootsig->StatusQwordOffsets[parameter_index] != ~0u)
-          (is_compute ? source : graphics_updates)
+          root_updates
               << "rootsig_qwords[" << rootsig->StatusQwordOffsets[parameter_index] << "] = 0;\n";
         break;
       }
@@ -613,11 +624,11 @@ public:
           return E_INVALIDARG;
         RootParameterMask |= uint64_t(1) << parameter_index;
         auto offset = rootsig->SlotQwordOffsets[parameter_index];
-        (is_compute ? source : graphics_updates) << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
+        root_updates << "rootsig_qwords[" << offset << "] = arg.uav_" << i << ";\n";
         /* TILED: the GPU cannot map an address to its reserved buffer, so an indirect root view
            reports fully mapped (its status qword is reset instead of keeping an older base). */
         if (rootsig->StatusQwordOffsets[parameter_index] != ~0u)
-          (is_compute ? source : graphics_updates)
+          root_updates
               << "rootsig_qwords[" << rootsig->StatusQwordOffsets[parameter_index] << "] = 0;\n";
         break;
       }
@@ -626,6 +637,8 @@ public:
       }
     }
 
+    if (UpdateRootArguments)
+      (is_compute ? source : graphics_updates) << "if (rootsig_qwords) {\n" << root_updates.view() << "}\n";
     source << "};\n";
     if (updates_graphics_bindings) {
       source << "void update_graphics_bindings(device d3d12_arguments &arg, device ulong *rootsig_qwords, "

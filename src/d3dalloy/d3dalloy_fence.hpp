@@ -71,6 +71,10 @@ public:
     ticket.order->complete(ticket.producer);
   }
 
+  void markQueueSignalSubmitted(const QueueTicket &ticket) {
+    if (!shared_event_) ticket.order->markSubmitted(ticket.producer);
+  }
+
   bool queueWaitReady(const QueueTicket &ticket) const {
     return ticket.latch->ready();
   }

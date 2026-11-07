@@ -81,16 +81,56 @@ RtInvocationLayout rtInvocationLayout(const RaytracingExportContext &context) {
   return layout;
 }
 
+Value *emitGuardedValue(
+  IRBuilder<> &builder, Value *condition, Value *fallback, StringRef name,
+  function_ref<Value *(IRBuilder<> &)> body
+) {
+  if (auto *constant = dyn_cast<ConstantInt>(condition)) {
+    if (constant->isOne())
+      return body(builder);
+    return fallback;
+  }
+  LLVMContext &context = builder.getContext();
+  Function *function = builder.GetInsertBlock()->getParent();
+  BasicBlock *head = builder.GetInsertBlock();
+  BasicBlock *continuation = nullptr;
+  if (builder.GetInsertPoint() != head->end())
+    continuation = head->splitBasicBlock(builder.GetInsertPoint(), name + ".cont");
+  if (head->getTerminator())
+    head->getTerminator()->eraseFromParent();
+  if (!continuation)
+    continuation = BasicBlock::Create(context, name + ".cont", function);
+  BasicBlock *guarded = BasicBlock::Create(context, name, function, continuation);
+  builder.SetInsertPoint(head);
+  builder.CreateCondBr(condition, guarded, continuation);
+  builder.SetInsertPoint(guarded);
+  Value *produced = body(builder);
+  BasicBlock *guarded_end = builder.GetInsertBlock();
+  builder.CreateBr(continuation);
+  builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
+  if (!fallback)
+    return nullptr;
+  PHINode *merged = builder.CreatePHI(fallback->getType(), 2, name + ".value");
+  merged->addIncoming(fallback, head);
+  merged->addIncoming(produced, guarded_end);
+  return merged;
+}
+
+void emitConditional(IRBuilder<> &builder, Value *condition, StringRef name,
+                     function_ref<void(IRBuilder<> &)> body) {
+  emitGuardedValue(builder, condition, nullptr, name, [&](IRBuilder<> &inner) -> Value * {
+    body(inner);
+    return nullptr;
+  });
+}
+
 namespace {
 
 /**
  * Reject a layout the callback layer cannot address.
  *
  * The candidate region has to hold the control block *and* one attribute region,
- * and the hit state has to be at least the ABI struct: a callback addresses all
- * three by fixed offsets, so a smaller region would read or write memory that
- * belongs to something else. Refusing keeps that a compile error instead of a
- * silently corrupted payload.
+ * and the hit state must contain every field that this pipeline can access.
  */
 llvm::Error checkInvocationLayout(const RaytracingExportContext &context) {
   const uint32_t required = kRtCandidateRegionSize(context.attribute_size);
@@ -101,10 +141,11 @@ llvm::Error checkInvocationLayout(const RaytracingExportContext &context) {
       "need " + Twine(required) +
       " (the stage builder must publish kRtCandidateRegionSize(attribute_size))"
     );
-  if (context.hit_state_size && context.hit_state_size < sizeof(SM50_RT_HIT_STATE))
+  const uint32_t required_hit_state = rtHitStateSize(context.uses_object_space);
+  if (context.hit_state_size && context.hit_state_size < required_hit_state)
     return createError(
       "dxil: the hit state region of this export is " + Twine(context.hit_state_size) +
-      " bytes, but SM50_RT_HIT_STATE needs " + Twine(sizeof(SM50_RT_HIT_STATE))
+      " bytes, but its callbacks need " + Twine(required_hit_state)
     );
   return llvm::Error::success();
 }
@@ -117,38 +158,12 @@ Type *visibleFunctionTableType(LLVMContext &context) {
   return type->getPointerTo(1);
 }
 
-/** The i8* form of `value` in `value`'s own address space. */
-Value *bytePointer(IRBuilder<> &builder, Value *value) {
-  LLVMContext &context = value->getContext();
-  Type *type = Type::getInt8PtrTy(
-    context, cast<PointerType>(value->getType())->getAddressSpace()
-  );
-  return value->getType() == type ? value : builder.CreateBitCast(value, type);
-}
-
-/**
- * `base + byte_offset` as a `type*`, in `base`'s own address space.
- *
- * The address space is preserved rather than assumed to be the thread space: a
- * callback runs inside the traversal and is handed the invocation block as a
- * ray-data (address space 5) pointer, so every region of the block is addressed
- * through that pointer.
- */
-Value *fieldPointer(IRBuilder<> &builder, Value *base, uint32_t byte_offset, Type *type) {
-  LLVMContext &context = base->getContext();
-  unsigned address_space = cast<PointerType>(base->getType())->getAddressSpace();
-  Value *pointer = builder.CreateGEP(
-    Type::getInt8Ty(context), bytePointer(builder, base), builder.getInt32(byte_offset)
-  );
-  return builder.CreateBitCast(pointer, type->getPointerTo(address_space));
-}
-
 Value *loadField(IRBuilder<> &builder, Value *base, uint32_t byte_offset, Type *type) {
-  return builder.CreateAlignedLoad(type, fieldPointer(builder, base, byte_offset, type), Align(1));
+  return builder.CreateAlignedLoad(type, rtFieldPointer(builder, base, byte_offset, type), Align(1));
 }
 
 void storeField(IRBuilder<> &builder, Value *base, uint32_t byte_offset, Value *value) {
-  builder.CreateAlignedStore(value, fieldPointer(builder, base, byte_offset, value->getType()), Align(1));
+  builder.CreateAlignedStore(value, rtFieldPointer(builder, base, byte_offset, value->getType()), Align(1));
 }
 
 /** Convert an integer value to i32, so a stored field has one shape. */
@@ -158,47 +173,6 @@ Value *asWord(IRBuilder<> &builder, Value *value) {
   if (value->getType()->isIntegerTy())
     return builder.CreateZExtOrTrunc(value, builder.getInt32Ty());
   return builder.CreateBitCast(value, builder.getInt32Ty());
-}
-
-/**
- * Run `body` in a block entered only when `condition` holds, continuing in a join
- * block afterwards.
- *
- * The block is split at the insertion point first, so the instructions that follow
- * it stay reachable and the branch never lands in the middle of a block: this is
- * what makes a guard usable while a call is still sitting at the insertion point
- * (the call moves into the join block, where the caller erases it).
- *
- * A condition that folds to false emits nothing at all, so guarded code that the
- * compiler can already prove unreachable is never emitted.
- */
-void emitConditional(
-  IRBuilder<> &builder, Value *condition, StringRef name,
-  function_ref<void(IRBuilder<> &)> body
-) {
-  if (auto *constant = dyn_cast<ConstantInt>(condition)) {
-    if (constant->isOne())
-      body(builder);
-    return;
-  }
-  LLVMContext &context = builder.getContext();
-  Function *function = builder.GetInsertBlock()->getParent();
-  BasicBlock *head = builder.GetInsertBlock();
-  BasicBlock *continuation = nullptr;
-  if (builder.GetInsertPoint() != head->end())
-    continuation = head->splitBasicBlock(builder.GetInsertPoint(), name + ".cont");
-  if (head->getTerminator())
-    head->getTerminator()->eraseFromParent();
-  if (!continuation)
-    continuation = BasicBlock::Create(context, name + ".cont", function);
-
-  BasicBlock *guarded = BasicBlock::Create(context, name, function, continuation);
-  builder.SetInsertPoint(head);
-  builder.CreateCondBr(condition, guarded, continuation);
-  builder.SetInsertPoint(guarded);
-  body(builder);
-  builder.CreateBr(continuation);
-  builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
 }
 
 /* -------------------------------------------------------------------------- */
@@ -394,7 +368,7 @@ llvm::Value *EmitAnyHitCandidate(
     return nullptr;
   const RtInvocationLayout layout = rtInvocationLayout(context);
   Value *control = builder.CreateGEP(
-    Type::getInt8Ty(module.getContext()), bytePointer(builder, block),
+    Type::getInt8Ty(module.getContext()), rtBytePointer(builder, block),
     builder.getInt32(layout.candidate_control)
   );
   /*
@@ -430,7 +404,7 @@ llvm::Value *EmitAnyHitCandidate(
   LLVMContext &llvm_context = module.getContext();
   auto rayDataPointer = [&](uint32_t byte_offset) -> Value * {
     Value *field = builder.CreateGEP(
-      Type::getInt8Ty(llvm_context), bytePointer(builder, block), builder.getInt32(byte_offset)
+      Type::getInt8Ty(llvm_context), rtBytePointer(builder, block), builder.getInt32(byte_offset)
     );
     if (context.query_callbacks)
       return field;
@@ -464,7 +438,7 @@ void EmitCandidateCommit(
     return;
   const RtInvocationLayout layout = rtInvocationLayout(context);
   Value *control = builder.CreateGEP(
-    Type::getInt8Ty(module.getContext()), bytePointer(builder, block),
+    Type::getInt8Ty(module.getContext()), rtBytePointer(builder, block),
     builder.getInt32(layout.candidate_control)
   );
   Value *committed = loadField(
@@ -494,11 +468,11 @@ void EmitCandidateCommit(
   emitConditional(builder, wins, "rt.commit", [&](IRBuilder<> &b) {
     if (attribute_size) {
       Value *destination = b.CreateGEP(
-        Type::getInt8Ty(module.getContext()), bytePointer(b, block),
+        Type::getInt8Ty(module.getContext()), rtBytePointer(b, block),
         b.getInt32(layout.attribute)
       );
       Value *source = b.CreateGEP(
-        Type::getInt8Ty(module.getContext()), bytePointer(b, block),
+        Type::getInt8Ty(module.getContext()), rtBytePointer(b, block),
         b.getInt32(layout.candidate_attribute)
       );
       b.CreateMemCpy(
@@ -530,12 +504,6 @@ void EmitCandidateCommit(
       b, control, kRtCandidateCommittedInstanceID, asWord(b, identity.instance_id)
     );
     storeField(b, control, kRtCandidateCommitted, b.getInt32(1));
-    // First-hit is an implicit AcceptHitAndEndSearch after an accepted report.
-    // Rejected candidates never reach this block and cannot end the search.
-    Value *flags = loadField(b, block, layout.hit_state + offsetof(SM50_RT_HIT_STATE, RayFlags), b.getInt32Ty());
-    Value *ended = loadField(b, control, kRtCandidateEndSearch, b.getInt32Ty());
-    storeField(b, control, kRtCandidateEndSearch,
-      b.CreateOr(ended, b.CreateLShr(b.CreateAnd(flags, b.getInt32(4)), b.getInt32(2))));
   });
 }
 
@@ -603,7 +571,7 @@ llvm::Value *CandidateControlPointer(
     return nullptr;
   const RtInvocationLayout layout = rtInvocationLayout(context);
   return builder.CreateGEP(
-    Type::getInt8Ty(module.getContext()), bytePointer(builder, block),
+    Type::getInt8Ty(module.getContext()), rtBytePointer(builder, block),
     builder.getInt32(layout.candidate_control)
   );
 }
@@ -617,7 +585,7 @@ llvm::Value *EmitIntersectionResult(
   if (block) {
     Value *control = CandidateControlPointer(module, context, block, builder);
     Value *ended = loadField(builder, control, kRtCandidateEndSearch, builder.getInt32Ty());
-    continue_search = builder.CreateICmpEQ(ended, builder.getInt32(0));
+    continue_search = builder.CreateNot(builder.CreateAnd(accept, builder.CreateICmpNE(ended, builder.getInt32(0))));
   }
   StructType *result = StructType::get(
     llvm_context, {Type::getInt1Ty(llvm_context), Type::getInt1Ty(llvm_context)}, true
@@ -666,7 +634,7 @@ llvm::Error LowerAnyHitControlCall(
 
   const RtInvocationLayout layout = rtInvocationLayout(context);
   IRBuilder<> builder(&call);
-  Value *control = fieldPointer(
+  Value *control = rtFieldPointer(
     builder, block, layout.candidate_control, Type::getInt8Ty(module.getContext())
   );
   Value *decision = nullptr;
@@ -780,7 +748,7 @@ llvm::Error LowerReportHitCall(
   CandidateIds ids;
   if (context.query_callbacks) {
     IRBuilder<> inputs(&call);
-    Value *state = inputs.CreateGEP(inputs.getInt8Ty(), bytePointer(inputs, block), inputs.getInt32(context.hitStateOffset()));
+    Value *state = inputs.CreateGEP(inputs.getInt8Ty(), rtBytePointer(inputs, block), inputs.getInt32(context.hitStateOffset()));
     ids.primitive_id = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, PrimitiveIndex), inputs.getInt32Ty());
     ids.geometry_id = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, GeometryIndex), inputs.getInt32Ty());
     ids.instance_index = loadField(inputs, state, offsetof(SM50_RT_HIT_STATE, InstanceIndex), inputs.getInt32Ty());
@@ -802,10 +770,10 @@ llvm::Error LowerReportHitCall(
     return createError("dxil: dx.op.reportHit's distance operand is not a float");
   Value *hit_kind = asWord(builder, call.getArgOperand(2));
 
-  Value *control = fieldPointer(
+  Value *control = rtFieldPointer(
     builder, block, layout.candidate_control, Type::getInt8Ty(llvm_context)
   );
-  Value *candidate_attributes = fieldPointer(
+  Value *candidate_attributes = rtFieldPointer(
     builder, block, layout.candidate_attribute, Type::getInt8Ty(llvm_context)
   );
   Value *t_min = loadField(builder, control, kRtCandidateTMin, Type::getFloatTy(llvm_context));
@@ -892,9 +860,14 @@ llvm::Error LowerReportHitCall(
   head->getTerminator()->eraseFromParent();
   BasicBlock *ended = BasicBlock::Create(llvm_context, "rt.report.end", head->getParent(), resume);
   builder.SetInsertPoint(head);
-  builder.CreateCondBr(
-    builder.CreateICmpNE(loadField(builder, control, kRtCandidateEndSearch, builder.getInt32Ty()),
-                         builder.getInt32(0)), ended, resume);
+  // An earlier terminal report cannot reach this call. Decide whether this
+  // report ends the intersection from its own verdict and ray flags.
+  Value *flags = loadField(builder, block, layout.hit_state + offsetof(SM50_RT_HIT_STATE, RayFlags), builder.getInt32Ty());
+  Value *end_report = builder.CreateAnd(reported, builder.CreateOr(
+    builder.CreateICmpEQ(decision, builder.getInt32(kRtCandidateAcceptAndEndSearch)),
+    builder.CreateICmpNE(builder.CreateAnd(flags, builder.getInt32(4)), builder.getInt32(0))));
+  storeField(builder, control, kRtCandidateEndSearch, builder.CreateZExt(end_report, builder.getInt32Ty()));
+  builder.CreateCondBr(end_report, ended, resume);
   IRBuilder<> finish(ended);
   EmitIntersectionReturn(module, context, block, finish);
   call.eraseFromParent();

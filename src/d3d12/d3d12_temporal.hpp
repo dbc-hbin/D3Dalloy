@@ -31,8 +31,8 @@ std::array<MTLD3D12Resource *, 12> GetOwnedTemporalFrameResources(const std::sha
 // the feature submission mutex through native commit and timeline publication.
 std::mutex &OwnedTemporalSubmissionMutex(const std::shared_ptr<OwnedTemporalFrame> &frame);
 uint64_t OwnedTemporalFrameHistoryQueue(const std::shared_ptr<OwnedTemporalFrame> &frame);
-void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
+uint32_t EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
-    const std::function<void(WMT::Event, uint64_t)> &signal_event);
+    const std::function<void(WMT::Event, uint64_t)> &signal_event, uint32_t handoff);
 } // namespace d3dalloy

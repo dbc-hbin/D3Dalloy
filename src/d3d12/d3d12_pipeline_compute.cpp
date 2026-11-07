@@ -108,7 +108,12 @@ public:
 
     if (HRESULT hr = InitializeShader(device_->GetShaderArtifactCache(), "CS", pDesc->CS, &shader_cs, &ref_cs, &resource_bindings); FAILED(hr))
       return hr;
+    if (!ref_cs.RootArgumentsUnused) root_argument_stages = WMTMetal4StageDispatch;
     uses_atomic64 = ref_cs.HasAtomic64 != 0;
+    if (StaticSamplerVisibility(static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature),
+                                pDesc->CS, resource_bindings, 1))
+      static_sampler_stages = WMTMetal4StageDispatch;
+    uses_ray_query = ref_cs.HasRayQuery != 0;
     SM50_SHADER_COMPILATION_ARGUMENT_DATA atomic_phase{};
     atomic_phase.type = SM50_SHADER_D3D12_ATOMIC64_PHASE;
     atomic_phase.next = common.next;
@@ -118,7 +123,8 @@ public:
     if (trace) times[2] = Clock::now();
 
     if (cache_.Compile(PipelineCache::Compute, device_->GetShaderArtifactCache(), pDesc->CS, shader_cs,
-                       (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &sm50_err)) {
+                       (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&common, "cs_main", &sm50_err,
+                       pDesc->pRootSignature, ref_cs)) {
       const auto error = SM50GetErrorMessageString(sm50_err);
       const bool first = RecordShaderCompileFailure(
           "CS", pDesc->CS, rootsig, reinterpret_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&common),
@@ -131,7 +137,7 @@ public:
 
     const auto cs_bitcode_compiled = cache_.view(PipelineCache::Compute);
 
-    if (HRESULT hr = compute_constants.Initialize(device_, cs_bitcode_compiled, cache_.bitcode(PipelineCache::Compute)); FAILED(hr))
+    if (HRESULT hr = compute_constants.Initialize(device_, cs_bitcode_compiled, cache_.bitcode(PipelineCache::Compute), true); FAILED(hr))
       return hr;
     if (trace) times[4] = Clock::now();
 
@@ -222,7 +228,6 @@ public:
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
     WMT::Reference<WMT::Error> error;
     if (!statistics_function) {
-      SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
       common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
@@ -233,29 +238,8 @@ public:
       SM50_SHADER_COMPILATION_ARGUMENT_DATA statistics{};
       statistics.type = SM50_SHADER_D3D12_PIPELINE_STATS;
       statistics.next = &common;
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = statistics_root_blob.empty() ? statistics_cs_bytecode.data() : statistics_root_blob.data();
-      root.bytecode_length = statistics_root_blob.empty() ? statistics_cs_bytecode.size()
-                                                         : statistics_root_blob.size();
-      root.next = &statistics;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({statistics_cs_bytecode.data(), statistics_cs_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "cs_main", &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile statistics CS: ", SM50GetErrorMessageString(compile_error));
-        return {};
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(pipeline_statistics_compute_constants.Initialize(device_, bytecode, compiled)))
-        return {};
-      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!lib)
-        return {};
-      statistics_function = device_->GetShaderArtifactCache().Function(lib, "cs_main");
+      statistics_function = CompilePipelineVariant(device_, statistics_cs_bytecode, statistics_root_blob,
+                                                   "cs_main", &statistics, pipeline_statistics_compute_constants);
       if (!statistics_function)
         return {};
     }
@@ -264,8 +248,6 @@ public:
       auto info = indirect_info;
       info.compute_function = statistics_function.handle;
       info.support_indirect_command_buffers = indirect;
-      
-      
       variant = CreateNativePipeline(info, error);
       if (!variant)
         ERR("Failed to create statistics compute PSO: ", error.description().getUTF8String());

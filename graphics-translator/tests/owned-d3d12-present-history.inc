@@ -27,6 +27,7 @@ void runPresentHistory() {
       {"bands-cover-scroll", 2, {{1, 0, 5, 5}, {3, 0, 8, 5}}, true, {0, 0, 7, 4}, {1, 1}, true},
       {"large-dirty-gap", 2, {{0, 0, 5, 6}, {6, 0, 8, 6}}, true, {0, 1, 7, 4}, {1, 0}, false},
       {"corner-gap", 2, {{0, 0, 3, 3}, {3, 3, 8, 6}}, true, {0, 0, 8, 6}, {-2, 1}, false},
+      {"staggered-cover-scroll", 2, {{0, 0, 4, 6}, {3, 1, 8, 6}}, true, {0, 0, 7, 4}, {1, 1}, false},
   };
   ComPtr<IDXGIFactory4> factory;
   check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "history-factory");
@@ -148,6 +149,14 @@ void runPresentHistory() {
     require(buffer_index < 2, "history-current-buffer");
     submission_queue = buffer_index ? alternate_queue.Get() : queue.Get();
     auto *backbuffer = backbuffers[buffer_index].Get();
+    ComPtr<ID3D12Fence> queued_full;
+    if (frame_index == 3) {
+      // Present the old pixels, then overwrite this same public buffer while
+      // both full Presents are queued. The following partial needs the new pixels.
+      check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queued_full)), "history-full-gate");
+      check(submission_queue->Wait(queued_full.Get(), 1), "history-full-wait");
+      check(swapchain->Present(0, DXGI_PRESENT_DO_NOT_SEQUENCE), "history-queued-full");
+    }
     BYTE *upload_data = nullptr;
     const D3D12_RANGE no_read{0, 0};
     check(upload->Map(0, &no_read, reinterpret_cast<void **>(&upload_data)), "history-upload-map");
@@ -182,6 +191,7 @@ void runPresentHistory() {
     parameters.pScrollOffset = frame.scroll ? const_cast<POINT *>(&frame.scroll_offset) : nullptr;
     phase("begin", frame.name);
     check(swapchain->Present1(0, 0, &parameters), "history-present");
+    if (queued_full) check(queued_full->Signal(1), "history-release-full");
     waitIdle(device.Get(), submission_queue);
     phase("end", frame.name);
 
@@ -221,5 +231,5 @@ void runPresentHistory() {
     std::memcpy(previous, expected, sizeof(previous));
     std::printf("OWNED_D3D12_PRESENT_HISTORY_CASE case=%s pixels=48 hash=%08x exact=1\n", frame.name, hash);
   }
-  std::puts("OWNED_D3D12_PRESENT_HISTORY_PASS cases=15 pixels=720 full_dirty=4 partial=10 crop=4 queues=2 exact=1");
+  std::puts("OWNED_D3D12_PRESENT_HISTORY_PASS cases=16 pixels=768 full_dirty=4 partial=11 crop=4 queues=2 exact=1");
 }

@@ -253,6 +253,7 @@ public:
   struct PresentWork {
     bool identity_copy = false;
     bool pq_code_copy = false;
+    bool pipeline_failed = false;
     uint32_t width = 0, height = 0;
   };
   WMT::MetalDrawable encodeCommandsMetal4(
@@ -263,14 +264,14 @@ public:
 private:
   void drainNativeRetirements();
   std::optional<PresentState> synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_not_wait);
-  void buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable,
-                                bool composition_residual, bool linear_composition_transport);
 
   WMT::Device device_;
   bool composition_ = false;
   WMT::Reference<WMT4::Compiler> compiler_;
   WMT::MetalLayer layer_;
   WMT::Reference<WMT::Library> lib_;
+  WMT::Reference<WMT4::Function> metal4_present_vertex_;
+  WMT::Reference<WMT::Function> classic_present_vertex_;
   WMTLayerProps layer_props_;
   uint32_t sample_count_;
   WMTColorSpace colorspace_ = WMTColorSpaceSRGB;
@@ -294,10 +295,15 @@ private:
     bool operator==(const PipelineKey &) const = default;
   };
   PipelineKey pipeline_key_;
+  struct PipelinePair {
+    PipelineKey key;
+    WMT::Reference<WMT::RenderPipelineState> blit, scale;
+  };
+  void buildRenderPipelineState(PipelinePair &target, bool build_blit, bool build_scale);
+  PipelinePair classic_pipelines_;
+  std::array<PipelinePair, 4> metal4_pipelines_;
   std::array<float, D3DALLOY_GAMMA_CP_COUNT * 4> gamma_lut_rgba_;
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
-  WMT::Reference<WMT::RenderPipelineState> present_blit_;
-  WMT::Reference<WMT::RenderPipelineState> present_scale_;
   std::atomic_flag pso_valid = 0;
   uint64_t frame_requested_ = 0;
   std::atomic<uint64_t> frames_encoded_ = 0;

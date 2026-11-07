@@ -82,14 +82,13 @@ llvm::Value *resolveRate(llvm::IRBuilder<> &b, llvm::Value *control, unsigned sa
 /* Coverage variant: the first real fragment of the primitive in the tile stores the rate, the planes and the
  * {dword, value} per-primitive inputs into record kPlaneRecord. `interpolants` parallels planes.inputs; null
  * slots use `capturedInput` at window-space XY to reconstruct spilled vertex fields. Native inputs retain
- * their interpolation functions, and
- * `reciprocalW` is the replay vertex function's user(msaa_reciprocal_w) (1 / clip w). The depth plane is the gather
+ * their interpolation functions. The reciprocal-W plane comes from interpolated clip positions. The depth plane is the gather
  * pass's center window depth of input record `pixel` (dword `centerZ`, including depth bias) with the slopes of
  * native position.z. */
 void capture(llvm::IRBuilder<> &b, llvm::Module &module, llvm::Function &entry, llvm::Value *scratch,
              unsigned stride, llvm::Value *position, llvm::Value *control, llvm::Value *pixel, unsigned centerZ,
              const Planes &planes, llvm::ArrayRef<llvm::Value *> interpolants,
-             llvm::Value *reciprocalW, llvm::Value *rate,
+             llvm::Value *clipPosition, llvm::Value *rate,
              llvm::ArrayRef<std::pair<unsigned, llvm::Value *>> constants,
              llvm::function_ref<llvm::Value *(unsigned, llvm::Value *)> capturedInput);
 

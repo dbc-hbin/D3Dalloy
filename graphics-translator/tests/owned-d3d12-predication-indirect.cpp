@@ -302,11 +302,12 @@ void RunPredicatedClearTests(TestContext &context) {
                                 D3D12_RESOURCE_STATE_PREDICATION);
   list->ResourceBarrier(1, &predicateBarrier);
 
-  const D3D12_RECT leftHalf = {0, 0, 2, 2};
+  const D3D12_RECT leftHalf[] = {{0, 0, 2, 1}, {0, 1, 2, 2}};
+  const D3D12_RECT depthRowsToClear[] = {{0, 0, 4, 1}, {0, 1, 4, 2}};
   const float green[] = {0.0f, 1.0f, 0.0f, 1.0f};
-  list->ClearRenderTargetView(rtvHeap->GetCPUDescriptorHandleForHeapStart(), green, 1, &leftHalf);
+  list->ClearRenderTargetView(rtvHeap->GetCPUDescriptorHandleForHeapStart(), green, 2, leftHalf);
   list->ClearDepthStencilView(dsvHeap->GetCPUDescriptorHandleForHeapStart(),
-                              D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0xee, 0, nullptr);
+                              D3D12_CLEAR_FLAG_DEPTH, 0.75f, 0xee, 2, depthRowsToClear);
   const UINT oneBits[] = {0x3f800000u, 0, 0, 0};
   const D3D12_RECT firstElement = {0, 0, 1, 1};
   list->ClearUnorderedAccessViewUint(uavGpu, uavCpu, uav.Get(), oneBits, 1, &firstElement);

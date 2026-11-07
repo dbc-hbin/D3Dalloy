@@ -20,11 +20,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 
 namespace d3dalloy {
 
 class Allocation {
 public:
+  // D3D12 placed allocations retain their physical alias registration through GPU retirement.
+  std::shared_ptr<const std::atomic<bool>> exclusivePlacement;
   void incRef();
   void decRef();
 

@@ -82,6 +82,16 @@ enum WMTMetal4Operation : uint32_t {
   WMTMetal4ClearTextureView = 49,
   /* Append-only: args[0..4] are dst, src, src index, dst index, count. */
   WMTMetal4CopyTextureViewsRange = 50,
+  /* Private HUD: args = service, key, text, integer, action (0 add, 1 update, 2 query),
+   * visual type, previous legacy label. Native counters are atomically drained by operation 52. */
+  WMTMetal4HUDMetric = 51,
+  WMTMetal4HUDCounters = 52,
+  WMTMetal4FindASGeneration = 53, /* sidecar, GPU resource ID -> borrowed MTLAccelerationStructure */
+  WMTMetal4ASRefitBatch = 54, /* encoder, array of in-place refits, count */
+  WMTMetal4ASGenerationInfo = 55, /* sidecar -> current resource ID, size, instance count */
+};
+struct WMTMetal4RefitEntry {
+  uint64_t descriptor, sidecar, scratch, offset;
 };
 enum WMTMetal4Stages : uint64_t {
   WMTMetal4StageVertex = 1ull << 0,
@@ -131,9 +141,16 @@ WINEMETAL_API int32_t WMTMetal4Call(struct WMTMetal4Call *params);
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+enum WMTMetal4HUDCounter {
+  WMTMetal4HUDRender, WMTMetal4HUDCompute, WMTMetal4HUDBlit, WMTMetal4HUDAcceleration,
+  WMTMetal4HUDCommandBuffer, WMTMetal4HUDBuild, WMTMetal4HUDRefit, WMTMetal4HUDFenceWait,
+  WMTMetal4HUDCounterCount
+};
 #ifdef __cplusplus
 extern "C" {
 #endif
+void m4_hud_count(enum WMTMetal4HUDCounter counter);
+void m4_hud_drain(uint64_t *values);
 int32_t winemetal_metal4_call(void *params);
 int32_t winemetal_metal4_pipeline_call(struct WMTMetal4Call *params);
 int32_t winemetal_metal4_query_call(struct WMTMetal4Call *params);
@@ -142,6 +159,8 @@ id<MTL4CommandBuffer> winemetal_metal4_command_buffer(obj_handle_t handle);
 int32_t winemetal_metal4_reserve_present(struct WMTMetal4Call *call);
 void winemetal_composition_drawables(id drawable, id<CAMetalDrawable> *primary, id<CAMetalDrawable> *residual);
 void *winemetal_metal4_split_command_buffer(void *context);
+BOOL winemetal_metal4_add_classic_segment(obj_handle_t context, id<MTLCommandQueue> queue,
+                                         BOOL (^encode)(id<MTLCommandBuffer>));
 id<MTL4ComputeCommandEncoder> winemetal_metal4_compute_encoder(obj_handle_t handle);
 id<MTL4RenderCommandEncoder> winemetal_metal4_render_encoder(obj_handle_t handle);
 void winemetal_metal4_retain_resource(obj_handle_t command_buffer, id resource);

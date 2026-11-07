@@ -123,7 +123,7 @@ PopulateWMTSamplerInfoCommon(WMTSamplerInfo &InfoOut, const DESC &Desc) {
 }
 
 void
-PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc) {
+PopulateWMTSamplerInfo(WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc) {
   PopulateWMTSamplerInfoCommon(InfoOut, Desc);
   // The *_UINT static border colors are the integer {0,0,0,1} / {1,1,1,1}. Metal's
   // predefined border colors return exactly those integers when sampling an integer
@@ -148,7 +148,7 @@ PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC
 }
 
 void
-PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLER_DESC const &Desc) {
+PopulateWMTSamplerInfo(WMTSamplerInfo &InfoOut, D3D12_SAMPLER_DESC const &Desc) {
   PopulateWMTSamplerInfoCommon(InfoOut, Desc);
 
   // border color

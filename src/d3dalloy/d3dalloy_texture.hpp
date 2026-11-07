@@ -27,6 +27,7 @@
 #include "util_svector.hpp"
 #include <array>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -107,21 +108,26 @@ struct TextureViewKey {
 class Texture;
 class TextureAllocation;
 
-struct ReservedVolumeRenderView {
-  uint32_t mip, first_w, w_size, page_w, page_h, pages_x, pages_y;
+struct AuxiliarySparsePages {
   uint64_t mapping_generation = ~uint64_t(0);
   std::vector<uint32_t> mapped_tiles;
   std::unordered_set<uint32_t> mapped_pages;
-  std::vector<WMT::Reference<WMT::Heap>> heaps;
+  struct Backing {
+    WMT::Reference<WMT::Heap> heap;
+    std::vector<std::optional<uint32_t>> slots;
+  };
+  std::vector<Backing> backings;
+  WMT::Reference<WMT::SharedEvent> ready;
+  uint64_t ready_value = 0, joined_queue = 0;
 };
 
-struct ReservedCastStorage {
+struct ReservedVolumeRenderView : AuxiliarySparsePages {
+  uint32_t mip, first_w, w_size, page_w, page_h, pages_x, pages_y;
+};
+
+struct ReservedCastStorage : AuxiliarySparsePages {
   uint32_t page_w, page_h, pages_x, pages_y;
   bool packed = false;
-  uint64_t mapping_generation = ~uint64_t(0);
-  std::vector<uint32_t> mapped_tiles;
-  std::unordered_set<uint32_t> mapped_pages;
-  WMT::Reference<WMT::Heap> heap;
 };
 
 class TextureView {

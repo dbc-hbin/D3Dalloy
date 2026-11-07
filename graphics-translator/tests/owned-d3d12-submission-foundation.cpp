@@ -93,6 +93,7 @@ void volatileReplayAndICB() {
   cacheStep("descriptor_cache_copy_payload",b.Get(),0x73100005);
   c.dev->CreateShaderResourceView(nullptr,&srv,cpu);
   cacheStep("descriptor_cache_null",nullptr,0);
+  auto unrelated=committed(c.dev.Get(),D3D12_HEAP_TYPE_UPLOAD,bufDesc(256),D3D12_RESOURCE_STATE_GENERIC_READ);
   cacheStep("descriptor_cache_null_replay",nullptr,0);
   c.dev->CreateShaderResourceView(a.Get(),&srv,cpu);
   cacheStep("descriptor_cache_restore",a.Get(),0x73100008);

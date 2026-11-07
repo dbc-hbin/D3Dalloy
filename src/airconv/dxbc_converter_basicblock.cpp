@@ -473,9 +473,9 @@ pop_mesh_output_vertex_data(
   });
 }
 
-IREffect pull_vertex_input(
-  air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask, bool dense_vertex_table
+IREffect pull_vertex_slot(
+  air::FunctionSignatureBuilder &func_signature, std::vector<VertexPull> pulls,
+  uint32_t slot_mask, bool dense_vertex_table
 ) {
   auto vbuf_table = func_signature.DefineInput(air::ArgumentBindingBuffer{
     .buffer_size = {},
@@ -490,25 +490,7 @@ IREffect pull_vertex_input(
   return make_effect_bind([=](context ctx) -> IREffect {
     auto &types = ctx.types;
     auto &builder = ctx.builder;
-    pvalue index;                   // uint
-    if (element_info.step_function) // per_instance
-    {
-      if (element_info.step_rate) {
-        index = builder.CreateAdd(
-          ctx.resource.base_instance_id,
-          builder.CreateUDiv(
-            ctx.resource.instance_id,
-            builder.getInt32(element_info.step_rate)
-          )
-        );
-      } else {
-        // 0 takes special meaning, that the instance data should never be
-        // stepped at all
-        index = ctx.resource.base_instance_id;
-      }
-    } else {
-      index = ctx.resource.vertex_id_with_base;
-    }
+    const unsigned slot = pulls.front().element.slot;
     if (!ctx.resource.vertex_buffer_table) {
       ctx.resource.vertex_buffer_table = ctx.builder.CreateBitCast(
         ctx.function->getArg(vbuf_table),
@@ -517,10 +499,10 @@ IREffect pull_vertex_input(
       );
     }
     auto vertex_buffer_table = ctx.resource.vertex_buffer_table;
-    const unsigned shift = 32u - element_info.slot;
-    const unsigned compact_index = element_info.slot
+    const unsigned shift = 32u - slot;
+    const unsigned compact_index = slot
       ? __builtin_popcount((slot_mask << shift) >> shift) : 0;
-    const unsigned entry_index = dense_vertex_table ? element_info.slot : compact_index;
+    const unsigned entry_index = dense_vertex_table ? slot : compact_index;
     auto vertex_buffer_entry = builder.CreateLoad(
       types._d3dalloy_vertex_buffer_entry,
       builder.CreateConstGEP1_32(
@@ -530,24 +512,54 @@ IREffect pull_vertex_input(
     );
     auto base_addr = builder.CreateExtractValue(vertex_buffer_entry, {0});
     auto stride = builder.CreateExtractValue(vertex_buffer_entry, {1});
-    auto byte_offset = builder.CreateAdd(
-      builder.CreateMul(stride, index),
-      builder.getInt32(element_info.aligned_byte_offset)
-    );
-    auto vec4 = co_yield air::pull_vec4_from_addr(
-      (air::MTLAttributeFormat)element_info.format, base_addr, byte_offset
-    );
-    if (vec4->getType() == types._float4) {
-      co_yield store_at_vec4_array_masked(
-        ctx.resource.input.ptr_float4, builder.getInt32(element_info.reg), vec4,
-        mask
+    auto *entry = builder.GetInsertBlock();
+    auto *bound = llvm::BasicBlock::Create(ctx.llvm, "vertex.slot.bound", ctx.function);
+    auto *merge = llvm::BasicBlock::Create(ctx.llvm, "vertex.slot.end", ctx.function);
+    builder.CreateCondBr(builder.CreateIsNotNull(base_addr), bound, merge);
+    builder.SetInsertPoint(bound);
+    llvm::SmallVector<pvalue, 8> values;
+    for (const auto &pull : pulls) {
+      const auto &element_info = pull.element;
+      pvalue index;                   // uint
+      if (element_info.step_function) // per_instance
+      {
+        if (element_info.step_rate) {
+          index = builder.CreateAdd(
+            ctx.resource.base_instance_id,
+            builder.CreateUDiv(
+              ctx.resource.instance_id,
+              builder.getInt32(element_info.step_rate)
+            )
+          );
+        } else {
+          // 0 takes special meaning, that the instance data should never be
+          // stepped at all
+          index = ctx.resource.base_instance_id;
+        }
+      } else {
+        index = ctx.resource.vertex_id_with_base;
+      }
+      auto byte_offset = builder.CreateAdd(
+        builder.CreateMul(stride, index),
+        builder.getInt32(element_info.aligned_byte_offset)
       );
-    } else {
-      assert(vec4->getType() == types._int4);
-      co_yield store_at_vec4_array_masked(
-        ctx.resource.input.ptr_int4, builder.getInt32(element_info.reg), vec4,
-        mask
+      auto value = co_yield air::pull_vec4_from_addr_checked(
+        (air::MTLAttributeFormat)element_info.format, base_addr, byte_offset
       );
+      values.push_back(value);
+    }
+    auto *source = builder.GetInsertBlock();
+    builder.CreateBr(merge);
+    builder.SetInsertPoint(merge);
+    for (auto &value : values) {
+      auto *phi = builder.CreatePHI(value->getType(), 2);
+      phi->addIncoming(llvm::ConstantAggregateZero::get(value->getType()), entry);
+      phi->addIncoming(value, source);
+      value = phi;
+    }
+    for (unsigned i = 0; i < pulls.size(); ++i) {
+      auto *dest = values[i]->getType() == types._float4 ? ctx.resource.input.ptr_float4 : ctx.resource.input.ptr_int4;
+      co_yield store_at_vec4_array_masked(dest, builder.getInt32(pulls[i].element.reg), values[i], pulls[i].mask);
     }
     co_return {};
   });

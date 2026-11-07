@@ -18,7 +18,8 @@ using Point=std::tuple<PhysicalIdentity,unsigned,unsigned,unsigned>;
 std::vector<Point> points(const SubmissionAccess& a) {
   std::vector<Point> result;
   if(a.Key().domain==PhysicalDomain::Heap || !a.aspects) {
-    for(unsigned x=unsigned(a.begin);x<a.end;++x)result.emplace_back(a.Key(),0,0,x);
+    for(unsigned x=unsigned(a.begin);x<a.end;++x)
+      if (!a.byte_stride || (x - a.begin) % a.byte_stride < a.element_bytes) result.emplace_back(a.Key(),0,0,x);
   } else for(unsigned aspect:{1u,2u,4u})if(a.aspects&aspect)
     for(unsigned mip=a.mip_begin;mip<a.mip_end;++mip)
       for(unsigned slice=a.slice_begin;slice<a.slice_end;++slice)result.emplace_back(a.Key(),aspect,mip,slice);
@@ -37,6 +38,11 @@ void frontierProof() {
       a.begin=random()%24;a.end=a.begin+1+random()%8;a.writes=random()%2;
       a.mip_begin=random()%3;a.mip_end=a.mip_begin+1+random()%2;
       a.slice_begin=random()%6;a.slice_end=a.slice_begin+1+random()%3;a.aspects=domain==0?0:uint8_t(1+random()%7);
+      if (domain == 0 && !a.writes && random()%2) {
+        a.element_bytes = uint32_t(a.end - a.begin);
+        a.byte_stride = a.element_bytes + 1 + random()%7;
+        a.end += (1 + random()%5) * a.byte_stride;
+      }
       std::set<AccessValue> actual,expected;
       frontier.Visit(a,[&](const auto& old){actual.insert(old);});
       const auto covered=points(a);
@@ -58,6 +64,53 @@ void frontierProof() {
     }
     frontier.Clear();SubmissionAccess all{};all.physical={PhysicalDomain::Heap,1};all.end=UINT64_MAX;all.writes=true;
     unsigned hits=0;frontier.Visit(all,[&](const auto&){++hits;});assert(!hits);
+  }
+  // A final element can end at UINT64_MAX. Exercise holes, endpoint touches and
+  // a second strided footprint independently of the frontier's byte expansion.
+  SubmissionAccess striped{};
+  striped.physical = {PhysicalDomain::Buffer,1};
+  striped.begin = UINT64_MAX - 54; striped.end = UINT64_MAX;
+  striped.byte_stride = 16; striped.element_bytes = 6;
+  for (unsigned first=0; first<54; ++first) for (unsigned width=1; first+width<=54; ++width) {
+    auto probe = striped;
+    probe.begin += first; probe.end = probe.begin + width; probe.writes = true;
+    probe.byte_stride = probe.element_bytes = 0;
+    bool overlaps = false, covered = true;
+    for (unsigned i=first; i<first+width; ++i) { overlaps |= i%16 < 6; covered &= i%16 < 6; }
+    assert(AccessOverlaps(striped,probe)==overlaps && AccessOverlaps(probe,striped)==overlaps);
+    assert(striped.CoversBytes(probe)==covered);
+  }
+  auto holes = striped;
+  holes.begin += 6; holes.end -= 12; holes.element_bytes = 4;
+  assert(!AccessOverlaps(striped,holes) && !striped.CoversBytes(holes));
+  assert(striped.CoversBytes(striped));
+  // The 33rd live pattern exercises the dense fallback. Overwrite both ends of
+  // separate elements, leave a hole untouched, and preserve one prior producer.
+  {
+    OwnedAccessFrontier<unsigned> f;
+    SubmissionAccess r{};
+    r.physical={PhysicalDomain::Buffer,7};
+    r.end=UINT64_MAX; r.begin=r.end-63*32-20; r.byte_stride=32; r.element_bytes=20;
+    for (unsigned v=0; v<33; ++v) f.Publish(r,v);
+    auto write=r;
+    write.byte_stride=write.element_bytes=0; write.writes=true;
+    write.begin=r.begin+13; write.end=r.end-7;
+    f.PublishPreserving(write,77,[](unsigned old) {return old==1;});
+    unsigned checked=0;
+    for (unsigned offset=0; offset<63*32+20; ++offset) {
+      const uint64_t at=r.begin+offset;
+      auto q=write;q.begin=at;q.end=at+1;
+      std::set<unsigned> actual,expected;
+      f.Visit(q,[&](unsigned value) {actual.insert(value);});
+      const bool overwritten=at>=write.begin && at<write.end;
+      if (overwritten) expected.insert(77);
+      if (offset%32<20) {
+        if (overwritten) expected.insert(1);
+        else for (unsigned v=0;v<33;++v) expected.insert(v);
+      }
+      assert(actual==expected);++checked;
+    }
+    std::printf("STRIDED_READER_FRONTIER_PASS bytes=%u readers=33 preserved=1 partial_ends=2 high_offset=1\n",checked);
   }
   OwnedAccessFrontier<unsigned> disjoint;
   for(unsigned i=0;i<4096;++i) {
@@ -421,4 +474,119 @@ void sparseHeapProof() {
   heapExtentProof();
   std::printf("SPARSE_HEAP_INDEX_PASS oracle_queries=%u aliases=refcounted remap_generations=1 native_gate_nonblocking=1 stale_proof=conservative exception_unwind=conservative half_open_ranges=exact high_offsets=1 heap_extent_fallback=1\n", queries);
 }
-int main(){frontierProof();registryProof();registrySnapshotProof();registryAliasProof();sparseHeapProof();placedAttachmentOrderProof();}
+void placedDispatchSubresources() {
+  int texture, alias;
+  SubmissionAccess mip0{&texture, 64, 256, 0, 1, 0, 1, 1, true, false, 0, {PhysicalDomain::Heap, 7}};
+  auto mip1 = mip0;
+  ++mip1.mip_begin; ++mip1.mip_end;
+  auto slice1 = mip0;
+  ++slice1.slice_begin; ++slice1.slice_end;
+  DispatchDependencyProof proof;
+  assert(proof.Append(0, {&mip0, 1}) && proof.Append(1, {&mip1, 1}) && proof.Append(2, {&slice1, 1}));
+  assert(proof.independent == 6 && !proof.needs_barrier);
+  auto stencil = mip1;
+  stencil.aspects = 2; stencil.writes = false;
+  assert(proof.Append(3, {&stencil, 1}) && proof.independent == 6 && proof.needs_barrier);
+  assert(AccessOverlaps(mip0, mip1)); // Cross-pass heap frontier remains byte based.
+
+  for (auto other : {mip1, slice1}) {
+    auto must_order = [&](SubmissionAccess first, SubmissionAccess second) {
+      DispatchDependencyProof pair;
+      assert(pair.Append(0, {&first, 1}) && pair.Append(1, {&second, 1}) && pair.needs_barrier);
+    };
+    auto different = other;
+    different.allocation = &alias;
+    must_order(mip0, different);
+    different.aspects = 0; // Placed buffer aliases the entire texture.
+    must_order(mip0, different);
+    different = other; different.allocation = nullptr;
+    must_order(mip0, different);
+    different = other; different.end = UINT64_MAX;
+    auto unknown = mip0; unknown.end = UINT64_MAX;
+    must_order(unknown, different);
+    different = other; ++different.begin;
+    must_order(mip0, different);
+  }
+}
+void dispatchProofBudget() {
+  placedDispatchSubresources();
+  // Repeated sampled textures plus a disjoint output range must remain
+  // independent across mask words. A genuine RAW at the word boundary must not.
+  std::array<SubmissionAccess, 9> repeated{};
+  for (size_t i = 0; i < 8; ++i) {
+    repeated[i].physical = {PhysicalDomain::Texture, i + 1};
+    repeated[i].aspects = 4;
+  }
+  auto &output = repeated.back();
+  output.physical = {PhysicalDomain::Buffer, 99};
+  output.writes = true;
+  DispatchDependencyProof texture_reads;
+  for (size_t i = 0; i < 128; ++i) {
+    output.begin = i * 256; output.end = output.begin + 256;
+    assert(texture_reads.Append(i, repeated));
+    assert(!texture_reads.budget_barrier && !texture_reads.needs_barrier);
+    if (i) assert(texture_reads.independent & (uint64_t(1) << (i % 64)));
+  }
+  output.writes = false;
+  assert(texture_reads.Append(128, repeated) && texture_reads.needs_barrier && texture_reads.independent == 0);
+  SubmissionAccess access{};
+  access.physical = {PhysicalDomain::Buffer, 1};
+  access.end = 1;
+  DispatchDependencyProof proof;
+  // A shared read-only allocation costs no overlap comparisons. A writer
+  // must still wait for the earlier readers, and the next reader for it.
+  for (size_t i = 0; i < 4; ++i) assert(proof.Append(i, {&access, 1}));
+  assert(proof.comparisons == 0 && proof.independent == 0xe);
+  access.writes = true;
+  assert(proof.Append(4, {&access, 1}));
+  access.writes = false;
+  assert(proof.Append(5, {&access, 1}));
+  assert(proof.needs_barrier && proof.independent == 0xe);
+  std::vector<SubmissionAccess> readers(250, access);
+  assert(proof.Append(6, readers));
+  assert(proof.Append(7, {&access, 1}));
+  assert(proof.independent == 0xce && !proof.budget_barrier);
+
+  // A tiled output stream remains one contiguous byte range. Leaving a hole
+  // must still allow a read of just that hole to run independently.
+  DispatchDependencyProof ranges;
+  std::array<SubmissionAccess, 4> writes;
+  for (size_t i = 0; i < 62; ++i) {
+    for (size_t j = 0; j < writes.size(); ++j) {
+      writes[j] = access;
+      writes[j].begin = i * writes.size() + j + (i >= 31 ? 1 : 0);
+      writes[j].end = writes[j].begin + 1;
+      writes[j].writes = true;
+    }
+    assert(ranges.Append(i, writes));
+  }
+  access.begin = 31 * writes.size();
+  access.end = access.begin + 1;
+  assert(ranges.Append(62, {&access, 1}) && !ranges.needs_barrier && ranges.comparisons < 512);
+  --access.begin;
+  assert(ranges.Append(63, {&access, 1}) && ranges.needs_barrier);
+  assert(ranges.independent == (UINT64_MAX >> 1) - 1 && !ranges.budget_barrier);
+
+  for (bool compare_budget : {false, true}) {
+    DispatchDependencyProof limited;
+    size_t i = 0;
+    do {
+      std::vector<SubmissionAccess> distinct(compare_budget ? 4 : 12, access);
+      for (size_t j = 0; j < distinct.size(); ++j) {
+        const size_t index = i * distinct.size() + j;
+        distinct[j].physical.owner = compare_budget ? 1 : index + 1;
+        distinct[j].begin = 2 * index;
+        distinct[j].end = 2 * index + 1;
+        distinct[j].writes = true;
+      }
+      assert(i < 62 && limited.Append(i, distinct));
+      ++i;
+    } while (!limited.budget_barrier);
+    assert(limited.needs_barrier && !(limited.independent & (uint64_t(1) << (i - 1))));
+    assert(limited.comparisons == (compare_budget ? 4096 : 0));
+    access.physical.owner = 999;
+    assert(limited.Append(i, {&access, 1}) && (limited.independent & (uint64_t(1) << i)));
+  }
+  std::puts("DISPATCH_PROOF_BUDGET_PASS shared_read=0 raw_war=ordered byte_union=exact access_cap=256 comparison_cap=4096 successor=recovered");
+}
+int main(){frontierProof();registryProof();registrySnapshotProof();registryAliasProof();sparseHeapProof();placedAttachmentOrderProof();dispatchProofBudget();}

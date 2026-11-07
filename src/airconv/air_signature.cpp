@@ -76,6 +76,33 @@ private:
   std::vector<llvm::Metadata *> mds;
 };
 
+llvm::StructType *BuildRayFunctionTablePair(llvm::LLVMContext &context, unsigned argument_index,
+                                           llvm::MDNode *&argument_md) {
+  StreamMDHelper fields(context);
+  auto table = [&](unsigned index, const char *name, const char *type, const char *kind,
+                   const char *access, const char *opaque_name) -> Type * {
+    StreamMDHelper binding(context);
+    binding.integer(index)->string(kind)->string("air.location_index")->integer(index)->integer(1)
+      ->string(access)->string("air.arg_type_name")->string(type)->string("air.arg_name")->string(name);
+    fields.integer(8 * index)->integer(8)->integer(0)->string(type)->string(name)
+      ->string("air.indirect_argument")->metadata(binding.BuildTuple());
+    Type *handle = getOrCreateStructType(opaque_name, context)->getPointerTo(1);
+    return StructType::get(context, {handle}, false);
+  };
+  // Metal represents each table as a one-member struct containing its opaque device pointer.
+  Type *ift = table(0, "ift", "intersection_function_table<instancing, triangle_data, world_space_data>",
+                    "air.intersection_function_table", "air.read_write", "struct._intersection_function_table_t");
+  Type *vft = table(1, "vft", "visible_function_table", "air.visible_function_table", "air.read",
+                    "struct._visible_function_table_t");
+  StreamMDHelper arg(context);
+  argument_md = arg.integer(argument_index)->string("air.indirect_buffer")->string("air.buffer_size")->integer(16)
+    ->string("air.location_index")->integer(21)->integer(1)->string("air.read")->string("air.address_space")->integer(2)
+    ->string("air.struct_type_info")->metadata(fields.BuildTuple())->string("air.arg_type_size")->integer(16)
+    ->string("air.arg_type_align_size")->integer(8)->string("air.arg_type_name")->string("D3DalloyRayFunctionTables")
+    ->string("air.arg_name")->string("function_tables")->BuildTuple();
+  return StructType::get(context, {ift, vft}, false);
+}
+
 uint32_t ArgumentBufferBuilder::DefineBuffer(
   std::string name, AddressSpace addressp_space, MemoryAccess access,
   MSLRepresentableType type, uint32_t location_index,
@@ -1054,21 +1081,11 @@ auto FunctionSignatureBuilder::CreateFunction(
             ->getPointerTo(1);
         },
         [&](const InputRaytracingDispatchArguments &dispatch) -> llvm::Type * {
-          /* SM50_RT_DISPATCH_ARGUMENTS is a plain constant buffer; the lowered
-           * shaders index it by dword, so the AIR type is an i32 array. */
           metadata_field.string("air.buffer")
-            ->string("air.buffer_size")
-            ->integer(dispatch.size)
-            ->string("air.location_index")
-            ->integer(dispatch.location_index)
-            ->integer(1)
-            ->string("air.read")
-            ->string("air.address_space")
-            ->integer((uint32_t)AddressSpace::constant)
-            ->string("air.arg_type_name")
-            ->string("uint")
-            ->string("air.arg_name")
-            ->string(dispatch.arg_name);
+            ->string("air.buffer_size")->integer(dispatch.size)
+            ->string("air.location_index")->integer(dispatch.location_index)->integer(1)
+            ->string("air.read")->string("air.address_space")->integer((uint32_t)AddressSpace::constant)
+            ->string("air.arg_type_name")->string("uint")->string("air.arg_name")->string(dispatch.arg_name);
           return ArrayType::get(
                    Type::getInt32Ty(context),
                    dispatch.size / sizeof(uint32_t)

@@ -500,17 +500,6 @@ ReservedResource::CollectMappedTiles(uint64_t seen_generation, std::vector<uint3
   return mapping_generation_;
 }
 
-void
-ReservedResource::MapCastTiles(WMT::MTL4CommandQueue queue, WMT::Texture texture, WMT::Heap heap,
-                               const std::unordered_set<uint32_t> &tiles) {
-  std::vector<std::pair<uint32_t,ReservedTileTarget>> assignments;
-  assignments.reserve(tiles.size());
-  uint32_t offset=0;
-  for (uint32_t tile : tiles)
-    assignments.push_back({tile,heap ? ReservedTileTarget{heap,offset++} : ReservedTileTarget{}});
-  EncodeTexture(queue,texture,assignments);
-}
-
 WMT::Reference<WMT::Texture>
 ReservedResource::GetVolumeCastAtlas(MTLD3D12Device *owner, WMTPixelFormat format, bool compressed) {
   if (block_width_==4 && !compressed)
@@ -540,15 +529,18 @@ ReservedResource::GetVolumeCastAtlas(MTLD3D12Device *owner, WMTPixelFormat forma
       (compressed ? 0 : WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget));
   info.options = WMTResourceOptions(WMTResourceHazardTrackingModeUntracked | WMTResourceStorageModePrivate);
   auto atlas = device.newPlacementSparseTexture(info, WMTSparsePageSize64);
-  auto completed = device.newSharedEvent();
-  if (!atlas || !completed) return {};
-  std::vector<std::pair<uint32_t, ReservedTileTarget>> assignments;
-  assignments.reserve(mapped_tiles_.size());
-  for (uint32_t tile : mapped_tiles_)
-    assignments.emplace_back(tile, targets_[tile]);
-  EncodeTexture(volume_mapping_queue, atlas, assignments);
-  volume_mapping_queue.signalEvent(completed, 1);
-  if (!completed.waitUntilSignaledValue(1, 10000)) return {};
+  if (!atlas) return {};
+  if (!mapped_tiles_.empty()) {
+    auto completed = device.newSharedEvent();
+    if (!completed) return {};
+    std::vector<std::pair<uint32_t, ReservedTileTarget>> assignments;
+    assignments.reserve(mapped_tiles_.size());
+    for (uint32_t tile : mapped_tiles_)
+      assignments.emplace_back(tile, targets_[tile]);
+    EncodeTexture(volume_mapping_queue, atlas, assignments);
+    volume_mapping_queue.signalEvent(completed, 1);
+    if (!completed.waitUntilSignaledValue(1, 10000)) return {};
+  }
   volume_cast_atlases_.emplace(format, atlas);
   return atlas;
 }
@@ -595,7 +587,8 @@ ReservedResource::EncodeBuffer(
 void
 ReservedResource::EncodeTexture(
     WMT::MTL4CommandQueue queue, WMT::Texture texture,
-    const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments
+    const std::vector<std::pair<uint32_t, ReservedTileTarget>> &assignments,
+    uint32_t flat_pages_x, uint32_t flat_pages_y
 ) {
   std::vector<WMTSparseTextureMapping> operations;
   auto flush = [&](WMT::Heap heap) {
@@ -615,7 +608,10 @@ ReservedResource::EncodeTexture(
     op.mode = unmap ? WMTSparseMappingModeUnmap : WMTSparseMappingModeMap;
     op.heap_offset = unmap ? 0 : target.heap_tile;
     op.size = {1, 1, 1};
-    if (volume_) {
+    if (flat_pages_x) {
+      op.slice = tile / flat_pages_x / flat_pages_y;
+      op.origin = {tile % flat_pages_x, (tile / flat_pages_x) % flat_pages_y, 0};
+    } else if (volume_) {
       op.level = 0;
       op.slice = tile / (volume_layout_.atlas_columns * volume_layout_.atlas_rows);
       op.origin = {tile % volume_layout_.atlas_columns,

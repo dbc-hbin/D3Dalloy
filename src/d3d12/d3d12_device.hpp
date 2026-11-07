@@ -48,6 +48,7 @@
 #include "owned_bundle_recording.hpp"
 #include "owned_rtas_lifetime.hpp"
 #include "owned_rtas_mirror.hpp"
+#include "owned_rtas_placement.hpp"
 #include "owned_async_pipeline.hpp"
 #include "owned_native_states.hpp"
 #include "owned_gpu_execution_gate.hpp"
@@ -207,6 +208,8 @@ public:
                           bool closes_frame, std::shared_ptr<owned_graphics::LowLatencyScheduler::Frame> *latency_frame) = 0;
 };
 
+// Private texture identity for native effect inputs crossing the NGX COM boundary.
+inline constexpr GUID kOwnedTextureId = {0xaa2305f9, 0x91ae, 0x4529, {0xae, 0xd7, 0x2e, 0x6f, 0xbc, 0x51, 0x24, 0xba}};
 class MTLD3D12Resource : public ID3D12Resource2 {
 public:
   // GetDesc() is the logical, normalized description, never the Metal backing description.
@@ -276,6 +279,7 @@ public:
 
 class MTLD3D12Heap : public ID3D12Heap1 {
 public:
+  std::shared_ptr<owned_graphics::RTASPlacementRanges> placement_ranges;
   HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void **session) final {
     if (!session)
       return E_POINTER;
@@ -354,6 +358,7 @@ public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
 
+  std::vector<uint32_t> vertex_table_key; // Ordinary VS projection of a validated, table-only 1.0 root.
   uint32_t UploadQwords = 0;
   /* Qwords of the parameters alone; the heap, root-view status and view-id qwords follow them. */
   uint32_t ParameterQwords = 0;
@@ -363,6 +368,8 @@ public:
   UINT const *ParameterConstantCounts = nullptr;
   bool IsLocal = false;
   bool HasTextureDescriptorTables = false;
+  bool HasPixelUAVTable = false;
+  bool CanReadSamplerHeap = false;
   /* D3D12_ROOT_SIGNATURE_FLAGS of the deserialized signature. */
   uint32_t Flags = 0;
   /**
@@ -396,7 +403,12 @@ public:
 
   size_t NumStaticSamplers;
   uint64_t const *EncodedStaticSamplers;
+  struct StaticSamplerBinding { UINT reg, space; D3D12_SHADER_VISIBILITY visibility; };
+  std::vector<StaticSamplerBinding> static_sampler_bindings;
 };
+
+uint32_t StaticSamplerVisibility(MTLD3D12RootSignature *root, D3D12_SHADER_BYTECODE embedded,
+    std::span<const MTL_SM50_SHADER_ARGUMENT> bindings, uint32_t stages);
 
 HRESULT AppendRootStaticSamplers(MTLD3D12RootSignature *root, std::vector<D3D12_STATIC_SAMPLER_DESC> &table, UINT *appended);
 
@@ -433,7 +445,7 @@ public:
 
   WMT::Reference<WMT::Buffer> timestamp_dummy;
   WMT::Reference<WMT::Buffer> visibility_results;
-  WMT::Reference<WMT::ComputePipelineState> binary_normalize_pipeline;
+  WMT::Reference<WMT::ComputePipelineState> binary_accumulate_pipeline;
   WMT::Reference<WMT::ComputePipelineState> visibility_accumulate_pipeline;
   /*
    * D3D12_QUERY_HEAP_TYPE_SO_STATISTICS storage. The first Count * 16 bytes are the
@@ -464,7 +476,8 @@ struct ShaderImmutableConstants {
 
   /** `bitcode` owns `compiled`'s parts; null only when they are directly addressable (a loaded cache blob).
    * Relocations naming SM50_CONSTANT_RELOCATION_TARGET_ATOMIC_LOCK_TABLE resolve to `device`'s lock table. */
-  HRESULT Initialize(MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode);
+  HRESULT Initialize(MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode,
+                     bool share_zero = false);
   HRESULT CopyForAtomic64(uint64_t context, uint64_t address, void *destination) const;
 };
 
@@ -473,6 +486,9 @@ class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:
   UINT IsComputePipelineState;
   bool uses_atomic64 = false;
+  bool uses_ray_query = false;
+  uint32_t root_argument_stages = 0;
+  uint32_t static_sampler_stages = 0;
   std::vector<MTL_SM50_SHADER_ARGUMENT> resource_bindings;
   // Private C++ interface: named libraries retain this immutable snapshot rather
   // than round-tripping through the application's writable GetCachedBlob copy.
@@ -730,7 +746,7 @@ public:
    * encoder viewMappings; their functions and immutable constants remain separate from the direct variant.
    * Null on failure; callers record an error instead of executing with a direct PSO.
    */
-  virtual WMT::RenderPipelineState GetIndirectCommandBufferPipelineState() = 0;
+  virtual WMT::RenderPipelineState GetIndirectCommandBufferPipelineState(bool create = true) = 0;
   virtual WMT::RenderPipelineState GetIndexPullPipelineState(bool indirect) = 0;
   virtual WMT::RenderPipelineState GetNativeMSAAPipelineState(bool index_pull) = 0;
   virtual WMT::RenderPipelineState GetPipelineStatisticsPipelineState(bool indirect) = 0;
@@ -742,11 +758,16 @@ public:
   uint32_t EffectiveRasterSampleCount() const {
     return forced_sample_count ? forced_sample_count : owned_sample_desc.Count;
   }
+  bool RequiresDistanceReplay() const {
+    // CullDistance is a primitive test even when the PS has no distance interpolant.
+    return owned_distance_interpolation ||
+           (pipeline_statistics_capture.rasterization_enabled && pipeline_statistics_capture.cull_mask);
+  }
   bool RequiresMSAAExecution() {
     // The captured-pixel path also preserves clip/cull interpolants that
     // Metal cannot carry natively, even on a single-sample target, and is
     // the only conservative rasterizer (native MSAA would shade per sample).
-    return EffectiveRasterSampleCount() > 1 || owned_distance_interpolation || ForcedSampleReplay() ||
+    return EffectiveRasterSampleCount() > 1 || RequiresDistanceReplay() || ForcedSampleReplay() ||
            owned_conservative || owned_mesh_output_replay || uses_atomic64 || emulated_depth_bounds;
   }
   /* Target-independent rasterization with RTVs: the forced raster pattern differs from the RTV sample count
@@ -875,6 +896,8 @@ private:
 class MTLD3D12Device : public ID3D12Device14 {
 public:
   RuntimeConfiguration runtime_configuration;
+  uint64_t max_buffer_length = 0;
+  bool capture_annotations = false;
   bool independent_device = false;
   DeviceDiagnostics diagnostics{this};
   ReflexState reflex{Config::getInstance().getOption<bool>("d3d12.lowLatency", false)};
@@ -927,6 +950,7 @@ public:
    * (SM50_ATOMIC_LOCK_TABLE_ENTRIES zeroed 32 bit words, resident in the global
    * residency set for the device lifetime), or 0 when it could not be allocated.
    */
+  virtual HRESULT GetSharedZeroConstants(ShaderImmutableConstants &constants) = 0;
   virtual uint64_t GetAtomicLockTableAddress() = 0;
   virtual uint64_t GetAtomic64ContextAddress() = 0;
   virtual WMT::Buffer GetAtomic64ContextBuffer() = 0;
@@ -974,8 +998,11 @@ public:
   virtual HRESULT QueryRTASSizes(const raytracing::BuildInputs &inputs, raytracing::NativeSizes &sizes) = 0;
 
   /* Sidecar lookup/publish for the acceleration structure at a D3D12 address. */
-  virtual bool FindRTAS(const raytracing::ArenaKey &key, RTASState &state) = 0;
-  virtual bool FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state) = 0;
+  virtual bool FindRTAS(const raytracing::ArenaKey &key, RTASState &state,
+      const raytracing::BuildInputs *update = nullptr, const raytracing::ShadowPlan *plan = nullptr) = 0;
+  virtual bool FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state,
+      WMT::ASGenerationInfo *current = nullptr) = 0;
+  virtual WMT::Reference<WMT::Allocation> FindNativeRTAS(const raytracing::ArenaKey &key, uint64_t resource_id) = 0;
   virtual bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) = 0;
 
   /**
@@ -1000,7 +1027,7 @@ public:
    * metadata pointer invalidates the ordinary-refit proof (copy/compact/deserialize, etc.).
    * This never observes a GPU token or completes a public fence.
    */
-  virtual void RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue,
+  virtual void RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue, uint64_t submission,
       const raytracing::ShadowMetadata *metadata) = 0;
 
   /**
@@ -1015,7 +1042,7 @@ public:
       std::span<const std::pair<raytracing::ArenaKey, uint32_t>> leases, bool observe_gpu) = 0;
 
   /* Lazily compiled prepass/write/finalize kernels out of the internal command library. */
-  virtual HRESULT GetRTASComputePipelines(RTASComputePipelines &pipelines) = 0;
+  virtual const RTASComputePipelines *GetRTASComputePipelines() = 0;
 
   virtual FormatCapability GetMTLPixelFormatCapability(WMTPixelFormat Format) = 0;
 
@@ -1030,7 +1057,7 @@ public:
   // are shared; argument tables and recording state remain command-list local.
   std::mutex owned_helper_pipeline_mutex;
   WMT::Reference<WMT::Library> owned_predication_library;
-  std::array<WMT::Reference<WMT::ComputePipelineState>, 11> owned_predication_pipelines;
+  std::array<WMT::Reference<WMT::ComputePipelineState>, 10> owned_predication_pipelines;
   std::array<WMT::Reference<WMT::ComputePipelineState>, 2> owned_feedback_pipelines;
   enum class CommandHelper {
     D24Upload, D24Readback, RGB32Expand, RGB32Compact, Packed422Expand, Packed422Compact,
@@ -1075,6 +1102,9 @@ public:
 // frame retains this generation until retirement, including after ResizeBuffers.
 struct D3DalloyPresentHistory {
   Com<MTLD3D12Device> device;
+  // Exact predecessor of an admitted full replacement. A later update can
+  // only lose an elision; never infer that intervening partials were full.
+  std::atomic<uint64_t> superseded_present{0};
   std::array<WMT::Reference<WMT::Texture>, 2> textures;
   std::array<bool, 2> resident{};
   ~D3DalloyPresentHistory() {
@@ -1257,9 +1287,9 @@ SamplerReductionMode(D3D12_FILTER filter) {
   }
 }
 
-void PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc);
+void PopulateWMTSamplerInfo(WMTSamplerInfo &InfoOut, D3D12_STATIC_SAMPLER_DESC1 const &Desc);
 
-void PopulateWMTSamplerInfo(WMT::Device Device, WMTSamplerInfo &InfoOut, D3D12_SAMPLER_DESC const &Desc);
+void PopulateWMTSamplerInfo(WMTSamplerInfo &InfoOut, D3D12_SAMPLER_DESC const &Desc);
 
 inline std::tuple<MTLD3D12RenderTargetDescriptorHeap *, UINT>
 GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle) {

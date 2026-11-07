@@ -104,6 +104,7 @@ struct ShadowJob {
   uint32_t count;
   uint32_t mode;
   uint32_t flags;
+  bool operator==(const ShadowJob &) const = default;
 };
 static_assert(sizeof(ShadowJob) == 48, "shadow job layout");
 
@@ -125,6 +126,9 @@ enum : uint32_t {
   /* The header words and the whole shadow are copied from another acceleration structure
    * (clone, compaction). */
   kShadowMetadataCopy = 1,
+  /* Update the header and mutable inputs in place. The executed BLAS already
+   * has the identical ShadowGeometry table at this address. */
+  kShadowMetadataReuseGeometry = 2,
 };
 
 /* Header words 16..63 as the shadow kernel writes them. */
@@ -150,13 +154,17 @@ struct ShadowParams {
   uint32_t jobCount;
   uint32_t metadataMode;
   ShadowMetadata metadata;
+  uint64_t resourceID = 0;
+  uint32_t versionToken = 0;
+  uint32_t mirrorSlot = 0;
 };
-static_assert(sizeof(ShadowParams) == 72, "shadow params layout");
+static_assert(sizeof(ShadowParams) == 88, "shadow params layout");
 
 /* d3dalloy_as_postbuild operations: the D3D12 postbuild info types, plus the step that turns the
  * Metal compacted size a compaction wrote into the header into the D3D12 current size. */
 inline constexpr uint32_t kPostbuildFinalizeCompactedHeader = 0x100;
 inline constexpr uint32_t kPostbuildRestoreOmmHeader = 0x200;
+inline constexpr uint32_t kPostbuildMeasuredCompactedSize = 4;
 
 struct PostbuildParams {
   uint64_t asAddress;
@@ -313,7 +321,8 @@ StructureInfo DescribeStructure(const BuildInputs &inputs, const ShadowPlan &pla
 
 /* The update rules of D3D12 (Acceleration structure update constraints): only positions,
  * transforms, AABBs and instance descriptions may change. */
-bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, const ShadowPlan &plan);
+bool IsCompatibleUpdate(const StructureInfo &source, const BuildInputs &inputs, const ShadowPlan &plan,
+                        bool *matching_blas_layout = nullptr);
 
 
 D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER DriverMatchingIdentifier(uint64_t registryID);
@@ -341,6 +350,6 @@ HRESULT ParseSerialized(const D3D12_SERIALIZED_RAYTRACING_ACCELERATION_STRUCTURE
 namespace d3dalloy {
 struct RTASComputePipelines {
   WMT::Reference<WMT::ComputePipelineState> prepass;
-  WMT::Reference<WMT::ComputePipelineState> shadow, postbuild, serialize, deserialize, visualize, visualizeDescriptors;
+  WMT::Reference<WMT::ComputePipelineState> shadow, shadowBatch, postbuild, serialize, deserialize, visualize, visualizeDescriptors;
 };
 }

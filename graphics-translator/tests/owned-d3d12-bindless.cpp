@@ -872,6 +872,18 @@ void testDescriptorViewPool(Gpu &g) {
     for (UINT index = 0; index < 12; ++index) srv(working.Get(), index, 0, true);
     working.Reset();
     source.Reset(); cpuOnly.Reset(); // Source heaps may be released after copy, before legal destination GPU use.
+    if (phase) {
+      // Seed both volatile slots with live pooled views. Rejected replacements must erase them.
+      srv(destination.Get(), 3, 0);
+      uav(destination.Get(), 11, 0);
+      D3D12_SHADER_RESOURCE_VIEW_DESC bad_srv{};
+      bad_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      g.device->CreateShaderResourceView(textures[0].Get(), &bad_srv, g.cpu(destination.Get(), 3, g.viewStride));
+      D3D12_UNORDERED_ACCESS_VIEW_DESC bad_uav{};
+      bad_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+      g.device->CreateUnorderedAccessView(textures[1].Get(), nullptr, &bad_uav,
+                                          g.cpu(destination.Get(), 11, g.viewStride));
+    }
     std::vector<uint32_t> guards(66, 0x6d6d6d6d);
     auto result = g.initBuffer(guards, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, keep);
     ID3D12DescriptorHeap *heaps[] = {destination.Get()};

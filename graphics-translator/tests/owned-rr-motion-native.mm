@@ -48,7 +48,8 @@ static void scratchPoolProof() {
   auto failed = make(128,50); failed->ready = false; core->recycle(failed);
   require(bool(failed),"pool-does-not-cache-partial-allocation");
   auto feature = [D3DALLOYRRFeature new]; feature->core = core;
-  auto execution = [D3DALLOYRRExecution new]; execution->core = core;
+  auto execution = [D3DALLOYRRExecution new]; execution->frame = [D3DALLOYRRFrame new];
+  execution->frame->core = core;
   execution->resources = make(128,100);
   struct WMTMetal4Call dormant{}; dormant.operation = WMTMetal4FXDormantTemporal;
   dormant.args[0] = uintptr_t(feature);
@@ -206,8 +207,12 @@ static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
     require(d3dalloyRRResources(frame,resources,bound),"native-resource-selection");
     auto allocator = [core->device newCommandAllocator];
     auto readback = [core->device newBufferWithLength:128*128*8 options:MTLResourceStorageModeShared];
-    for (auto texture : bound) if (texture) [resources.residency addAllocation:texture];
-    [resources.residency commit];
+    require(!resources.residency && !resources.table && !resources.params,"direct-frame-no-helper-allocations");
+    auto rd = [MTLResidencySetDescriptor new];
+    auto appResidency = [core->device newResidencySetWithDescriptor:rd error:nil]; [rd release];
+    require(appResidency != nil,"native-app-residency");
+    for (auto texture : bound) if (texture) [appResidency addAllocation:texture];
+    [appResidency commit];
     for (unsigned warm = 0; warm < 2; ++warm) {
       scaler.colorTexture=bound[0]; scaler.depthTexture=bound[1]; scaler.motionTexture=bound[2]; scaler.outputTexture=bound[3];
       scaler.diffuseAlbedoTexture=bound[7]; scaler.specularAlbedoTexture=bound[8]; scaler.normalTexture=bound[9];
@@ -218,7 +223,7 @@ static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
       simd_float4x4 world, projection; d3dalloy_rr::matrix(world,scene.world); d3dalloy_rr::matrix(projection,scene.projection);
       scaler.worldToViewMatrix=world; scaler.viewToClipMatrix=projection;
       auto command=[core->device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
-      [command useResidencySet:resources.residency]; [scaler encodeToCommandBuffer:command]; [command endCommandBuffer];
+      [command useResidencySet:appResidency]; [scaler encodeToCommandBuffer:command]; [command endCommandBuffer];
       [queue4 commit:&command count:1]; [queue4 signalEvent:event value:++value];
       require([event waitUntilSignaledValue:value timeoutMS:15000],"rr-native-completion");
       auto copy=[queue commandBuffer]; auto blit=[copy blitCommandEncoder];
@@ -242,7 +247,7 @@ static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
     scaler.colorTexture=scaler.depthTexture=scaler.motionTexture=scaler.outputTexture=nil;
     scaler.diffuseAlbedoTexture=scaler.specularAlbedoTexture=scaler.normalTexture=nil;
     scaler.roughnessTexture=scaler.specularHitDistanceTexture=scaler.reactiveMaskTexture=nil;
-    [readback release]; [allocator release]; [frame release];
+    [appResidency release]; [readback release]; [allocator release]; [frame release];
   }
   [event release]; [queue4 release]; [queue release];
   auto feature = [D3DALLOYRRFeature new]; feature->core = core;
@@ -255,10 +260,9 @@ static void descriptorReuse(const std::shared_ptr<d3dalloy_rr::Core> &owner) {
   for (const auto &cached : core->generations) require(!cached,"dormant-cache-empty");
   require(idleB.expired() && idleC.expired() && !retained.expired() &&
           prepared->generation->scaler != nil,"dormant-releases-only-idle-generations");
-  auto execution = [D3DALLOYRRExecution new]; execution->core = core;
-  execution->generation = prepared->generation;
+  auto execution = [D3DALLOYRRExecution new]; execution->frame = [prepared retain];
   [prepared release]; [feature release];
-  require(!retained.expired() && execution->generation->scaler != nil,"execution-retains-generation");
+  require(!retained.expired() && execution->frame->generation->scaler != nil,"execution-retains-generation");
   [execution release];
   require(retained.expired(),"retired-generation-released");
   std::puts("OWNED_RR_DORMANT_PASS cache_empty=1 idle_released=2 prepared_retained=1 execution_retained=1 retired_released=1");
@@ -310,7 +314,8 @@ int main() { @autoreleasepool {
     std::array<id<MTLTexture>,d3dalloy_rr::Count> bound{};
     const bool direct = variant == 0 || variant == 5 || variant == 8;
     if (!d3dalloyRRResources(frame,resources,bound) || (bound[2] == frame->inputs[2]) != direct ||
-        (resources.textures[2] == nil) != direct) {
+        (resources.textures[2] == nil) != direct || (resources.residency == nil) != direct ||
+        (resources.params == nil) != direct || (resources.table == nil) != direct) {
       std::fprintf(stderr,"OWNED_RR_MOTION_FAIL case=%u expected_direct=%u\n",variant,unsigned(direct));
       return 1;
     }

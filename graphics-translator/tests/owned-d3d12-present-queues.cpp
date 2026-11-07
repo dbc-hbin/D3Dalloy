@@ -591,14 +591,8 @@ void run() {
   // Frame 1's credit was transferred to the restart frame and frame 2's returned at restart;
   // only the restart frame returns one on GPU completion, and nothing else.
   const DWORD nativeRestartCredit = WaitForSingleObject(nativeWaitable, kCompletionTimeoutMs);
-  // Give the native completion handlers (traced as OWNED_GRAPHICS_NATIVE_PRESENT_DECISION) time
-  // to log before the swapchain and its layer are torn down.
-  const ULONGLONG nativePresentedDeadline = GetTickCount64() + kBlockedProbeMs;
-  while (GetTickCount64() < nativePresentedDeadline) {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    Sleep(0);
-  }
+  // On HWND swapchains retirement logs the native decision before releasing
+  // the credit and completing our queue fences. Both have been observed here.
   std::fputs("RESTART_NATIVE_END\n", stderr);
   std::fflush(stderr);
   const DWORD nativeExtraCredit = WaitForSingleObject(nativeWaitable, 0);

@@ -62,7 +62,7 @@ static bool IsPacked422(DXGI_FORMAT format) {
  * and allocation-info queries. Footprints are independent DXGI layout queries. */
 static bool IsResourceDescriptorCompatible(MTLD3D12Device *device, const D3D12_RESOURCE_DESC &desc) {
   if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
-    return desc.Width <= device->GetMTLDevice().maxBufferLength();
+    return desc.Width <= device->max_buffer_length;
   if (desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE &&
       !MakeStandardSwizzleLayout(device, desc))
     return false;
@@ -107,20 +107,6 @@ FindLibraryRootSignature(const void *blob, SIZE_T size, LPCWSTR name, std::vecto
   return S_OK;
 }
 
-/* Resolve an application GPU address into the Metal buffer that backs it. D3D12 GPU virtual
- * addresses in this runtime are Metal device addresses, so the resolved offset is directly
- * usable as a device pointer in the shaders that read the acceleration-structure header. */
-bool ResolveRTASGPUVA(void *context, D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t requiredBytes,
-    raytracing::BufferLocation &location) {
-  auto *device = static_cast<MTLD3D12Device *>(context);
-  uint64_t offset = 0;
-  auto allocation = device->LookupBufferByVA(address, &offset);
-  if (!allocation || offset > allocation->byteLength() || requiredBytes > allocation->byteLength() - offset)
-    return false;
-  location = {allocation->buffer(), offset, allocation->byteLength() - offset, allocation.ptr(), address, allocation};
-  return true;
-}
-
 class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt, IMTLD3D12FrameGenerationDevice, IMTLD3D12RayRegenerationDevice, IMTLD3D12Reflex, IMTLD3D12AntiLag, ID3D12DevicePreview, ID3D12DeviceConfiguration>> {
 
   Com<IMTLDXGIAdapter> adapter_;
@@ -139,18 +125,43 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
 
   d3dalloy::mutex residency_lock_;
   WMT::Reference<WMT::ResidencySet> residency_set_;
+  d3dalloy::shared_mutex native_precommit_;
+  std::array<WMT::Reference<WMT::Allocation>, 64> retired_allocations_;
+  size_t retired_count_ = 0;
+  uint64_t retired_bytes_ = 0;
   uint64_t pending_residency_adds_ = 0; // protected by residency_lock_
   void PublishResidencyLocked() {
-    if (!pending_residency_adds_) return;
+    if (!pending_residency_adds_ && !retired_count_) return;
     residency_set_.commit();
-    owned_graphics::Trace("residency_add_batch", ",\"allocations\":", pending_residency_adds_, ",\"commits\":1");
+    if (retired_count_) {
+      // A native commit that began before removal can still be walking the old set.
+      std::lock_guard quiescent(native_precommit_);
+      while (retired_count_) retired_allocations_[--retired_count_] = nullptr;
+      retired_bytes_ = 0;
+    }
+    if (pending_residency_adds_)
+      owned_graphics::Trace("residency_add_batch", ",\"allocations\":", pending_residency_adds_, ",\"commits\":1");
     pending_residency_adds_ = 0;
+  }
+  void AddResidencyAllocationsLocked(const WMT::Allocation *allocations, uint64_t count) {
+    // Finish the retirement batch before publishing a new generation of resource IDs.
+    if (retired_count_) PublishResidencyLocked();
+    residency_set_.addAllocations(allocations, count);
+  }
+  void RetireAllocationLocked(WMT::Allocation allocation) {
+    retired_allocations_[retired_count_++] = allocation;
+    residency_set_.removeAllocations(&allocation, 1);
+    retired_bytes_ += allocation.allocatedSize();
+    if (retired_count_ == retired_allocations_.size() || retired_bytes_ >= 64u * 1024 * 1024)
+      PublishResidencyLocked();
   }
   std::mutex sparse_mapping_queue_mutex_;
   WMT::Reference<WMT::MTL4CommandQueue> sparse_mapping_queue_;
   WMT::Reference<WMT::MTL4CommandAllocator> sparse_mapping_allocator_;
   WMT::Reference<WMT::MTL4CommandBuffer> sparse_mapping_command_buffer_;
   WMT::Reference<WMT::MTL4Submission> sparse_mapping_publication_;
+  std::mutex zero_constants_mutex_;
+  ShaderImmutableConstants zero_constants_;
   /* SM 6.6 64 bit atomic emulation lock table (SM50_ATOMIC_LOCK_TABLE_ENTRIES words). */
   WMT::Reference<WMT::Buffer> atomic_lock_table_;
   uint64_t atomic_lock_table_address_ = 0;
@@ -170,8 +181,9 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   owned_graphics::RTASMirror rtas_mirror_;
   std::vector<WMT::Reference<WMT::Buffer>> rtas_mirror_pages_;
   /* Stable mirror slot per D3D12 address, so the prepass always publishes into the same slot. */
-  std::unordered_map<raytracing::ArenaKey, uint32_t, RTASKeyHash> rtas_slots_;
+  std::unordered_map<const void *, std::unordered_map<uint64_t, uint32_t>> rtas_slots_;
   std::mutex rtas_pipeline_lock_;
+  std::atomic<bool> rtas_pipelines_ready_{false};
   RTASComputePipelines rtas_pipelines_;
   std::mutex rtas_sizes_lock_;
   owned_graphics::RTASSizeCache rtas_sizes_;
@@ -180,6 +192,16 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
     MTLD3D12PageableResidency *pageable;
     uint32_t occurrences;
   };
+
+  MTLD3D12PageableResidency *ResolvePageable(ID3D12Pageable *object) {
+    if (!object) return nullptr;
+    Com<ID3D12Device> device;
+    if (FAILED(object->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&device))) ||
+        device.ptr() != static_cast<ID3D12Device *>(this))
+      return nullptr;
+    auto *pageable = dynamic_cast<MTLD3D12PageableResidency *>(object);
+    return pageable && pageable->SupportsResidency() ? pageable : nullptr;
+  }
 
   HRESULT
   ResolveResidencyBatch(
@@ -192,21 +214,12 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
     indices.reserve(object_count);
     batch.reserve(object_count);
     for (UINT i = 0; i < object_count; ++i) {
-      if (!objects[i])
-        return E_INVALIDARG;
-      Com<ID3D12Device> object_device;
-      if (FAILED(objects[i]->GetDevice(__uuidof(ID3D12Device),
-                                       reinterpret_cast<void **>(&object_device))) ||
-          object_device.ptr() != static_cast<ID3D12Device *>(this))
-        return E_INVALIDARG;
-      auto *pageable = dynamic_cast<MTLD3D12PageableResidency *>(objects[i]);
-      if (!pageable || !pageable->SupportsResidency())
+      auto *pageable = ResolvePageable(objects[i]);
+      if (!pageable)
         return E_INVALIDARG;
       auto [entry, inserted] = indices.emplace(pageable, batch.size());
       if (inserted)
         batch.push_back({pageable, 1});
-      else if (batch[entry->second].occurrences == std::numeric_limits<uint32_t>::max())
-        return E_INVALIDARG;
       else
         ++batch[entry->second].occurrences;
     }
@@ -227,6 +240,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
       }
     }
     if (deny_overbudget) {
+      PublishResidencyLocked();
       const uint64_t resident_bytes = residency_set_.allocatedSize();
       const uint64_t budget = GetMTLDevice().recommendedMaxWorkingSetSize();
       if (resident_bytes > budget || addition_bytes > budget - resident_bytes)
@@ -241,7 +255,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
       }
     }
     if (!additions.empty()) {
-      residency_set_.addAllocations(additions.data(), additions.size());
+      AddResidencyAllocationsLocked(additions.data(), additions.size());
       residency_set_.commit();
     }
     for (const auto &entry : batch)
@@ -261,6 +275,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
       }
     }
     if (!removals.empty()) {
+      std::lock_guard quiescent(native_precommit_);
       residency_set_.removeAllocations(removals.data(), removals.size());
       residency_set_.commit();
     }
@@ -342,6 +357,7 @@ public:
       rtas_mirror_([this](uint64_t slot_count) { return CreateRTASMirrorPage(slot_count); }) {}
 
   ~MTLD3D12DeviceImpl() {
+    PublishResidencyLocked();
     if (metal4_compiler_) metal4_compiler_.FlushArchive();
     UnregisterExperimentalDevice(experimental_registration_);
   }
@@ -363,6 +379,7 @@ public:
       ERR("Failed to create MTLResidencySet: ", err.description().getUTF8String());
       return E_FAIL;
     }
+    max_buffer_length = GetMTLDevice().maxBufferLength();
     center_sample_positions_supported_ = GetMTLDevice().programmableSamplePositionsSupported();
     gpu_core_count_ = GetMTLDevice().gpuCoreCount();
     format_inspector_.Inspect(GetMTLDevice());
@@ -1108,7 +1125,6 @@ public:
       out->MSAA64KBAlignedTextureSupported = TRUE;
       // half/int16/uint16 arithmetic, buffer and stage I/O (sm6 suite: 16bit, packed, 16bit_io).
       out->Native16BitShaderOpsSupported = TRUE;
-      // TODO(d3d12): revise when d3d12 shared resource is implemented
       out->SharedResourceCompatibilityTier = D3D12_SHARED_RESOURCE_COMPATIBILITY_TIER_0;
       return S_OK;
     }
@@ -1342,11 +1358,11 @@ public:
       Heap->AddShaderResourceView(Index, pDesc);
       return;
     }
-    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
-    Heap->AddShaderResourceView(Index, static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC *>(nullptr));
-    auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
-    d3d12res->CreateShaderResourceView(pDesc, Descriptor);
-    Heap->SetDescriptorOwner(Index, d3d12res->owned_id);
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (FAILED(resource->CreateShaderResourceView(pDesc, Descriptor))) {
+      auto [heap, index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
+      heap->AddShaderResourceView(index, nullptr);
+    }
   };
 
   void STDMETHODCALLTYPE
@@ -1359,42 +1375,33 @@ public:
       Heap->AddUnorderedAccessView(Index, pDesc);
       return;
     }
-    auto [Heap, Index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
-    Heap->AddUnorderedAccessView(Index, static_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC *>(nullptr));
-    auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
-    d3d12res->CreateUnorderedAccessView(pCounter, pDesc, Descriptor);
-    Heap->SetDescriptorOwner(Index, d3d12res->owned_id,
-        pCounter ? static_cast<MTLD3D12Resource *>(pCounter)->owned_id : 0);
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (FAILED(resource->CreateUnorderedAccessView(pCounter, pDesc, Descriptor))) {
+      auto [heap, index] = GetShaderVisibleDescriptorHeap(this, Descriptor);
+      heap->AddUnorderedAccessView(index, nullptr);
+    }
   };
 
   void STDMETHODCALLTYPE
   CreateRenderTargetView(
       ID3D12Resource *pResource, const D3D12_RENDER_TARGET_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor
   ) {
-    if (!pResource) {
-      auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
-      Heap->AddRenderTarget(Index, nullptr);
-      return;
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (!resource || FAILED(resource->CreateRenderTargetView(pDesc, Descriptor))) {
+      auto [heap, index] = GetRenderTargetHeap(this, Descriptor);
+      heap->AddRenderTarget(index, nullptr);
     }
-    auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
-    Heap->AddRenderTarget(Index, nullptr);
-    auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
-    d3d12res->CreateRenderTargetView(pDesc, Descriptor);
   };
 
   void STDMETHODCALLTYPE
   CreateDepthStencilView(
       ID3D12Resource *pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC *pDesc, D3D12_CPU_DESCRIPTOR_HANDLE Descriptor
   ) {
-    if (!pResource) {
-      auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
-      Heap->AddRenderTarget(Index, nullptr);
-      return;
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (!resource || FAILED(resource->CreateDepthStencilView(pDesc, Descriptor))) {
+      auto [heap, index] = GetRenderTargetHeap(this, Descriptor);
+      heap->AddRenderTarget(index, nullptr);
     }
-    auto [Heap, Index] = GetRenderTargetHeap(this, Descriptor);
-    Heap->AddRenderTarget(Index, nullptr);
-    auto d3d12res = static_cast<MTLD3D12Resource *>(pResource);
-    d3d12res->CreateDepthStencilView(pDesc, Descriptor);
   };
 
   void STDMETHODCALLTYPE
@@ -1519,10 +1526,19 @@ public:
       UINT DescriptorCount, const D3D12_CPU_DESCRIPTOR_HANDLE DstDescriptorRangeOffset,
       const D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeOffset, D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapType
   ) {
-    CopyDescriptors(
-        1, &DstDescriptorRangeOffset, &DescriptorCount, 1, &SrcDescriptorRangeOffset, &DescriptorCount,
-        DescriptorHeapType
-    );
+    if (!DescriptorCount) return;
+    auto copy = [&](auto resolve) {
+      auto [src, from] = resolve(this, SrcDescriptorRangeOffset);
+      auto [dst, to] = resolve(this, DstDescriptorRangeOffset);
+      src->CopyDescriptors(from, dst, to, DescriptorCount);
+    };
+    switch (DescriptorHeapType) {
+    case D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV: copy(GetShaderVisibleDescriptorHeap); break;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER: copy(GetSamplerDescriptorHeap); break;
+    case D3D12_DESCRIPTOR_HEAP_TYPE_RTV:
+    case D3D12_DESCRIPTOR_HEAP_TYPE_DSV: copy(GetRenderTargetHeap); break;
+    default: break;
+    }
   };
 
   D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE
@@ -2113,21 +2129,16 @@ public:
   SetResidencyPriority(
       UINT ObjectCount, ID3D12Pageable *const *pObjects, const D3D12_RESIDENCY_PRIORITY *pPriorities
   ) {
-    if (ObjectCount && !pPriorities)
+    if (ObjectCount && (!pObjects || !pPriorities))
       return E_INVALIDARG;
     try {
       std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
-      std::vector<ResidencyBatchEntry> batch;
-      HRESULT hr = ResolveResidencyBatch(ObjectCount, pObjects, batch);
-      if (FAILED(hr))
-        return hr;
+      // Residency sets have no per-object priority. Validate the advisory hints at the API boundary.
       for (UINT i = 0; i < ObjectCount; ++i) {
-        if (pPriorities[i] < D3D12_RESIDENCY_PRIORITY_MINIMUM ||
+        if (!ResolvePageable(pObjects[i]) || pPriorities[i] < D3D12_RESIDENCY_PRIORITY_MINIMUM ||
             pPriorities[i] > D3D12_RESIDENCY_PRIORITY_MAXIMUM)
           return E_INVALIDARG;
       }
-      for (UINT i = 0; i < ObjectCount; ++i)
-        dynamic_cast<MTLD3D12PageableResidency *>(pObjects[i])->SetResidencyPriorityHint(pPriorities[i]);
       return S_OK;
     } catch (const std::bad_alloc &) {
       return E_OUTOFMEMORY;
@@ -2286,6 +2297,13 @@ public:
       D3D12_RESOURCE_ALLOCATION_INFO *__ret, UINT VisibleMask, UINT ResourceDestCount,
       const D3D12_RESOURCE_DESC *pDescs, D3D12_RESOURCE_ALLOCATION_INFO1 *pAllocationInfos
   ) {
+    return GetResourceAllocationInfoCore(__ret, VisibleMask, ResourceDestCount, pDescs, pAllocationInfos);
+  }
+
+  template <typename Desc>
+  D3D12_RESOURCE_ALLOCATION_INFO *GetResourceAllocationInfoCore(
+      D3D12_RESOURCE_ALLOCATION_INFO *__ret, UINT VisibleMask, UINT ResourceDestCount,
+      const Desc *pDescs, D3D12_RESOURCE_ALLOCATION_INFO1 *pAllocationInfos) {
     bool has_msaa = false;
     auto invalid = [&] {
       __ret->SizeInBytes = UINT64_MAX;
@@ -2305,7 +2323,7 @@ public:
 
     D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
     for (UINT i = 0; i < ResourceDestCount; i++) {
-      const auto &desc = pDescs[i];
+      const auto &desc = BaseResourceDesc(pDescs[i]);
       has_msaa |= desc.SampleDesc.Count > 1;
       if (FAILED(ValidateResourceDescs(this, &desc, &default_heap)))
         return invalid();
@@ -2419,6 +2437,13 @@ public:
 
   /* ---- ID3D12Device8 ---- */
 
+  static const D3D12_RESOURCE_DESC &BaseResourceDesc(const D3D12_RESOURCE_DESC &in) { return in; }
+
+  static D3D12_RESOURCE_DESC BaseResourceDesc(const D3D12_RESOURCE_DESC1 &in) {
+    return {in.Dimension, in.Alignment, in.Width, in.Height, in.DepthOrArraySize,
+            in.MipLevels, in.Format, in.SampleDesc, in.Layout, in.Flags};
+  }
+
   /* D3D12_RESOURCE_DESC1 of a non-feedback resource (a zero mip region) is a D3D12_RESOURCE_DESC. */
   static HRESULT
   NarrowResourceDesc(const D3D12_RESOURCE_DESC1 *in, D3D12_RESOURCE_DESC &out) {
@@ -2427,8 +2452,7 @@ public:
     if (sampler_feedback::IsFeedbackFormat(in->Format) || in->SamplerFeedbackMipRegion.Width ||
         in->SamplerFeedbackMipRegion.Height || in->SamplerFeedbackMipRegion.Depth)
       return E_INVALIDARG;
-    out = {in->Dimension, in->Alignment, in->Width,  in->Height,     in->DepthOrArraySize,
-           in->MipLevels, in->Format,    in->SampleDesc, in->Layout, in->Flags};
+    out = BaseResourceDesc(*in);
     return S_OK;
   }
 
@@ -2453,8 +2477,7 @@ public:
       ERR("CreateResource: invalid sampler feedback map");
       return E_INVALIDARG;
     }
-    narrowed = {desc.Dimension, desc.Alignment, desc.Width,      desc.Height, desc.DepthOrArraySize,
-                desc.MipLevels, desc.Format,    desc.SampleDesc, desc.Layout, desc.Flags};
+    narrowed = BaseResourceDesc(desc);
     return S_OK;
   }
 
@@ -2566,9 +2589,8 @@ public:
         return;
       }
     }
-    heap->AddSamplerFeedbackView(index, map->buffer.ptr(), layout.totalCells() * 4, pTargetedResource != nullptr,
+    heap->AddSamplerFeedbackView(index, map->owned_id, map->buffer.ptr(), layout.totalCells() * 4, pTargetedResource != nullptr,
                                  layout.word());
-    heap->SetDescriptorOwner(index, map->owned_id);
   }
 
   void STDMETHODCALLTYPE
@@ -2841,27 +2863,23 @@ public:
     };
     if (NumResourceDescs && !pResourceDescs)
       return invalid();
-    std::vector<D3D12_RESOURCE_DESC> descs;
-    try {
-      descs.resize(NumResourceDescs);
-    } catch (const std::bad_alloc &) {
-      return invalid();
-    }
+    // Check DESC1-only fields before publishing per-resource offsets.
     bool any_feedback = false;
     for (UINT i = 0; i < NumResourceDescs; ++i) {
       if (sampler_feedback::IsFeedbackFormat(pResourceDescs[i].Format)) {
         any_feedback = true;
         continue;
       }
-      if (FAILED(NarrowResourceDesc(&pResourceDescs[i], descs[i])))
+      D3D12_RESOURCE_DESC desc;
+      if (FAILED(NarrowResourceDesc(&pResourceDescs[i], desc)))
         return invalid();
       const UINT32 count = pNumCastableFormats ? pNumCastableFormats[i] : 0;
-      if (count && (!ppCastableFormats || FAILED(ValidateCastableFormats(this, descs[i], count, ppCastableFormats[i]))))
+      if (count && (!ppCastableFormats || FAILED(ValidateCastableFormats(this, desc, count, ppCastableFormats[i]))))
         return invalid();
     }
     // Castable formats only widen view usage; Metal texture sizes already include PixelFormatView.
     if (!any_feedback)
-      return GetResourceAllocationInfo1(__ret, VisibleMask, NumResourceDescs, descs.data(), pResourceAllocationInfo1);
+      return GetResourceAllocationInfoCore(__ret, VisibleMask, NumResourceDescs, pResourceDescs, pResourceAllocationInfo1);
     // Sampler feedback maps are buffers of cells; lay every description out one after another.
     if (VisibleMask > 1)
       return invalid();
@@ -2880,7 +2898,7 @@ public:
           return invalid();
       } else {
         D3D12_RESOURCE_ALLOCATION_INFO single;
-        GetResourceAllocationInfo1(&single, VisibleMask, 1, &descs[i], &info);
+        GetResourceAllocationInfoCore(&single, VisibleMask, 1, &pResourceDescs[i], &info);
         if (single.SizeInBytes == UINT64_MAX)
           return invalid();
         info.SizeInBytes = single.SizeInBytes;
@@ -2907,12 +2925,12 @@ public:
 
   WMT::Reference<WMT::MTL4Submission> CommitMetal4CommandBuffers(
       WMT::MTL4CommandQueue queue, const WMT::MTL4CommandBuffer *buffers, uint64_t count) override {
-    // Metal preCommit traverses borrowed allocation pointers after taking its
-    // residency snapshot. Unregister must not remove and release an allocation
-    // during that traversal. Share the mutation lock only through native commit;
-    // GPU waits and C++ retirement/destruction run after this guard is released.
-    std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
+    std::unique_lock lock(residency_lock_);
     PublishResidencyLocked();
+    // Reserve the lifetime of this snapshot before mutation resumes. Other
+    // queues can commit concurrently; retirement waits only for native preCommit.
+    std::shared_lock lifetime(native_precommit_);
+    lock.unlock();
     return queue.commit(buffers, count);
   }
 
@@ -2977,6 +2995,29 @@ public:
     return completion.completed && !completion.error_handle ? S_OK : DXGI_ERROR_DRIVER_INTERNAL_ERROR;
   }
 
+  HRESULT GetSharedZeroConstants(ShaderImmutableConstants &constants) override {
+    std::lock_guard lock(zero_constants_mutex_);
+    const bool create = !zero_constants_.buffer;
+    if (create) {
+      WMTBufferInfo info{};
+      info.length = 16 + 15;
+      info.options = WMTResourceHazardTrackingModeUntracked | WMT_RESOURCE_CPU_ADDRESSABLE;
+      auto buffer = GetMTLDevice().newBuffer(info);
+      if (!buffer) return E_OUTOFMEMORY;
+      auto *memory = static_cast<uint8_t *>(info.memory.get_accessible_or_null());
+      if (!memory) return E_FAIL;
+      zero_constants_.offset = (-info.gpu_address) & 15;
+      zero_constants_.gpu_address = info.gpu_address + zero_constants_.offset;
+      memset(memory + zero_constants_.offset, 0, 16);
+      zero_constants_.buffer = std::move(buffer);
+    }
+    constants.buffer = zero_constants_.buffer;
+    constants.offset = zero_constants_.offset;
+    constants.gpu_address = zero_constants_.gpu_address;
+    owned_graphics::Trace("shader_shared_zero", ",\"created\":", create, ",\"address\":", constants.gpu_address);
+    return S_OK;
+  }
+
   uint64_t
   GetAtomicLockTableAddress() override {
     return atomic_lock_table_address_;
@@ -3002,7 +3043,7 @@ public:
       }
       try {
         if (!owner || owner->ResidencyReferenceCount()) {
-          residency_set_.addAllocations(&allocation, 1);
+          AddResidencyAllocationsLocked(&allocation, 1);
           ++pending_residency_adds_;
         }
       } catch (...) {
@@ -3029,8 +3070,7 @@ public:
     HRESULT hr = S_OK;
     if (owner->ResidencyReferenceCount()) {
       try {
-        residency_set_.removeAllocations(&allocation, 1);
-        residency_set_.commit();
+        RetireAllocationLocked(allocation);
       } catch (...) {
         hr = E_FAIL;
       }
@@ -3122,7 +3162,8 @@ public:
   HRESULT STDMETHODCALLTYPE SupportsTemporalFeature(UINT feature_flags, BOOL *supported) final {
     if (!supported) return E_POINTER;
     *supported = FALSE;
-    if (feature_flags != 0 && feature_flags != 256 && feature_flags != 512) return E_INVALIDARG;
+    if (feature_flags != 0 && feature_flags != 256 && feature_flags != 512 && feature_flags != WMTMetal4FXSpatialFlag)
+      return E_INVALIDARG;
     *supported = WMT4::TemporalFeature::Supports(GetMTLDevice(), feature_flags);
     return S_OK;
   }
@@ -3144,8 +3185,7 @@ public:
     try {
       std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
       if (!owner || owner->ResidencyReferenceCount()) {
-        residency_set_.removeAllocations(&allocation, 1);
-        residency_set_.commit();
+        RetireAllocationLocked(allocation);
       }
       return S_OK;
     } catch (...) {
@@ -3195,7 +3235,7 @@ public:
         throw;
       }
       if (!owner || initially_resident) {
-        residency_set_.addAllocations(&buffer, 1);
+        AddResidencyAllocationsLocked(&buffer, 1);
         ++pending_residency_adds_;
       }
       return S_OK;
@@ -3216,30 +3256,32 @@ public:
    * hold is a no-op, so the null sidecar of a structure that was never built costs
    * nothing.
    */
-  void
+  bool
   UnregisterRTASResidency(const raytracing::ArenaKey &key, RTASState &state) {
     if (!state.sidecar)
-      return;
+      return false;
     // In-place refits publish a new version of the same native object. Sweeping the
     // previous version must not make any retained version nonresident, even when
     // a newer recording names a different sidecar than the GPU-live version.
     // Only versions at this key share a sidecar; other addresses allocate their own.
     if (rtas_.HasRetainedPayload(key, [&](const RTASState &current) { return current.sidecar == state.sidecar; }))
-      return;
+      return false;
     WMT::Allocation structure = state.sidecar.accelerationStructure();
     if (structure)
-      residency_set_.removeAllocations(&structure, 1);
+      RetireAllocationLocked(structure);
     WMT::Allocation instances = state.sidecar.instanceBuffer();
     if (instances)
-      residency_set_.removeAllocations(&instances, 1);
+      RetireAllocationLocked(instances);
     WMT::Allocation contributions = state.sidecar.contributionBuffer();
     if (contributions)
-      residency_set_.removeAllocations(&contributions, 1);
+      RetireAllocationLocked(contributions);
     const auto generations = state.sidecar.generations();
-    for (uint64_t i = 0; i < generations.count(); ++i) {
+    const uint64_t generation_count = generations.count();
+    for (uint64_t i = 0; i < generation_count; ++i) {
       auto allocation = generations.object(i);
-      residency_set_.removeAllocations(&allocation, 1);
+      RetireAllocationLocked(allocation);
     }
+    return structure || instances || contributions || generation_count;
   }
 
   HRESULT
@@ -3259,31 +3301,18 @@ public:
      * versions is released here: this is D3D12's own lifetime rule (the application may not free
      * a resource a submission still reads), not a release decision of ours.
      */
-    bool released_sidecars = false;
-    std::vector<raytracing::ArenaKey> dying;
-    rtas_.ForEachKey([&](const raytracing::ArenaKey &key) {
-      if (key.allocationIdentity == removal.retired_identity.ptr())
-        dying.push_back(key);
-    });
-    for (const auto &key : dying) {
-      for (auto &state : rtas_.ReleaseAll(key)) {
-        UnregisterRTASResidency(key, state);
-        released_sidecars = true;
+    auto owned = rtas_slots_.find(removal.retired_identity.ptr());
+    if (owned != rtas_slots_.end()) {
+      for (const auto &[offset, slot] : owned->second) {
+        raytracing::ArenaKey key{owned->first, offset};
+        for (auto &state : rtas_.ReleaseAll(key))
+          UnregisterRTASResidency(key, state);
+        rtas_mirror_.Free(slot);
       }
-      FreeRTASSlot(key);
+      rtas_slots_.erase(owned);
     }
-    if (allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap)) {
-      if (released_sidecars)
-        residency_set_.commit();
-      return S_OK;
-    }
-    auto buffer = allocation->buffer();
-    if (!owner || owner->ResidencyReferenceCount()) {
-      residency_set_.removeAllocations(&buffer, 1);
-      residency_set_.commit();
-    } else if (released_sidecars) {
-      residency_set_.commit();
-    }
+    if (!allocation->flags().test(BufferAllocationFlag::AllocatedOnHeap) && (!owner || owner->ResidencyReferenceCount()))
+      RetireAllocationLocked(allocation->buffer());
     return S_OK;
   }
 
@@ -3337,23 +3366,56 @@ public:
   }
 
   bool
-  FindRTAS(const raytracing::ArenaKey &key, RTASState &state) {
+  FindRTAS(const raytracing::ArenaKey &key, RTASState &state,
+      const raytracing::BuildInputs *update, const raytracing::ShadowPlan *plan) {
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     const RTASState *recorded = rtas_.FindRecorded(key);
     if (!recorded)
       return false;
+    // An abandoned recording may have published an incompatible shape for the same VA.
+    // Only reject when no retained source could be updated; the queue validates the actual writer.
+    if (update && recorded->info && !raytracing::IsCompatibleUpdate(*recorded->info, *update, *plan))
+      return rtas_.HasRetainedPayload(key, [&](const RTASState &candidate) {
+        if (candidate.info && !raytracing::IsCompatibleUpdate(*candidate.info, *update, *plan)) return false;
+        state = candidate;
+        return true;
+      });
     state = *recorded;
     return true;
   }
 
   bool
-  FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state) final {
+  FindRTASExecution(const raytracing::ArenaKey &key, uint64_t queue, RTASState &state,
+      WMT::ASGenerationInfo *current) final {
     std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
     const auto *encoded = rtas_.FindEncoded(key, queue);
     if (!encoded || !encoded->info || !encoded->execution.resourceID)
       return false;
+    if (current) *current = WMT::ReadASGeneration(encoded->sidecar);
     state = *encoded;
     return true;
+  }
+
+  bool
+  MatchRTASGeneration(const raytracing::ArenaKey &key, uint64_t resource_id, WMT::Reference<WMT::Allocation> &result) {
+    return rtas_.HasRetainedPayload(key, [&](const RTASState &state) {
+      if (!state.sidecar) return false;
+      result = WMT::FindASGeneration(state.sidecar, resource_id);
+      return bool(result);
+    });
+  }
+
+  WMT::Reference<WMT::Allocation>
+  FindNativeRTAS(const raytracing::ArenaKey &key, uint64_t resource_id) final {
+    std::lock_guard lock(residency_lock_);
+    WMT::Reference<WMT::Allocation> result;
+    if (resource_id && !MatchRTASGeneration(key, resource_id, result)) {
+      // A physical alias can expose a header built under another ArenaKey.
+      rtas_.ForEachKey([&](const raytracing::ArenaKey &other) {
+        if (!result && !(other == key)) MatchRTASGeneration(other, resource_id, result);
+      });
+    }
+    return result;
   }
 
   bool
@@ -3364,25 +3426,30 @@ public:
      * The mirror slot is reserved before anything is published, because a version whose token has
      * no slot to be published into could never be identified by the GPU and would be retained
      * forever. An address keeps one slot for its whole life, so this only allocates the first time;
-     * a slot of a released address is handed back by FreeRTASSlot, so the fixed page budget bounds
+     * a slot of a released allocation is handed back at VA removal, so the fixed page budget bounds
      * how many addresses are alive at once and not how many were ever created.
      */
-    uint32_t slot = 0;
-    auto found = rtas_slots_.find(key);
-    if (found == rtas_slots_.end()) {
+    auto &offsets = rtas_slots_[key.allocationIdentity];
+    auto [entry, inserted] = offsets.try_emplace(key.offset);
+    if (inserted) {
       const size_t page_count = rtas_mirror_pages_.size();
-      if (!rtas_mirror_.Allocate(&slot))
-        return false;
-      rtas_slots_.emplace(key, slot);
+      try {
+        if (!rtas_mirror_.Allocate(&entry->second)) {
+          offsets.erase(entry);
+          return false;
+        }
+      } catch (...) {
+        offsets.erase(entry);
+        throw;
+      }
       if (rtas_mirror_pages_.size() != page_count) {
         /* A page was created: it must be resident for the prepass that writes it. */
         WMT::Allocation page = rtas_mirror_pages_.back();
-        residency_set_.addAllocations(&page, 1);
+        AddResidencyAllocationsLocked(&page, 1);
         residency_set_.commit();
       }
-    } else {
-      slot = found->second;
     }
+    const uint32_t slot = entry->second;
     const size_t page_index = slot / owned_graphics::RTASMirror::kSlotsPerPage;
     if (page_index >= rtas_mirror_pages_.size())
       return false;
@@ -3398,9 +3465,12 @@ public:
      * executed yet has not superseded anything: only an observation of the mirror can retire the
      * version the header used to hold.
      */
+    const bool resident_sidecar = rtas_.HasRetainedPayload(key, [&](const RTASState &prior) {
+      return prior.sidecar == state.sidecar;
+    });
     const uint32_t published = rtas_.Publish(key, std::move(state));
     const RTASState *recorded = rtas_.FindRecorded(key);
-    if (recorded) {
+    if (recorded && !resident_sidecar && recorded->sidecar && recorded->sidecar.size()) {
       AddRTASResidency(*recorded);
       residency_set_.commit();
     }
@@ -3417,25 +3487,27 @@ public:
     auto released = rtas_.ReleaseLease(key, token);
     if (released.empty())
       return;
+    bool changed = false;
     for (auto &state : released)
-      UnregisterRTASResidency(key, state);
-    residency_set_.commit();
+      changed |= UnregisterRTASResidency(key, state);
+    if (changed) PublishResidencyLocked();
   }
 
   void
-  RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue,
+  RecordRTASExecution(const raytracing::ArenaKey &key, uint32_t token, uint64_t queue, uint64_t submission,
       const raytracing::ShadowMetadata *metadata) final {
     std::unique_lock<d3dalloy::mutex> lock(residency_lock_);
     rtas_.HoldLease(key, token);
-    auto *encoded = rtas_.RecordEncoding(key, token, queue);
+    auto *encoded = rtas_.RecordEncoding(key, token, queue, submission);
     if (!encoded)
       return;
     encoded->execution = {};
     if (metadata && encoded->info && encoded->sidecar) {
       encoded->execution.metadata = *metadata;
-      encoded->execution.resourceID = encoded->sidecar.resourceID();
-      encoded->execution.nativeSize = encoded->sidecar.size();
-      encoded->execution.instanceCount = encoded->sidecar.instanceCount();
+      const auto generation = WMT::ReadASGeneration(encoded->sidecar);
+      encoded->execution.resourceID = generation.resourceID;
+      encoded->execution.nativeSize = generation.nativeSize;
+      encoded->execution.instanceCount = generation.instanceCount;
     }
   }
 
@@ -3453,22 +3525,26 @@ public:
     auto released = rtas_.CompleteSubmission(id, leases, [&](const raytracing::ArenaKey &key) -> uint32_t {
       if (!observe_gpu)
         return 0;
-      auto found = rtas_slots_.find(key);
-      return found == rtas_slots_.end() ? 0 : rtas_mirror_.Load(found->second);
+      const auto owner = rtas_slots_.find(key.allocationIdentity);
+      if (owner == rtas_slots_.end()) return 0;
+      const auto found = owner->second.find(key.offset);
+      return found == owner->second.end() ? 0 : rtas_mirror_.Load(found->second);
     });
+    bool changed = false;
+    for (auto &[key, state] : released)
+      changed |= UnregisterRTASResidency(key, state);
+    if (changed) PublishResidencyLocked();
     if (!leases.empty() || !released.empty())
       owned_graphics::Trace("rtas_retirement_batch", ",\"submission\":", id, ",\"leases\":", leases.size(),
-          ",\"sweeps\":1,\"released\":", released.size(), ",\"residency_commits\":", released.empty() ? 0 : 1);
-    if (released.empty())
-      return;
-    for (auto &[key, state] : released)
-      UnregisterRTASResidency(key, state);
-    residency_set_.commit();
+          ",\"sweeps\":1,\"released\":", released.size(), ",\"residency_commits\":", changed ? 1 : 0);
   }
 
   /** Add one version's native structure and translation buffers to the residency set. */
   bool AllocateRTAS(WMT::AccelerationStructureSidecar sidecar, uint64_t size, uint64_t count) final {
     std::lock_guard<d3dalloy::mutex> lock(residency_lock_);
+    // Allocation and residency of each native generation are published together under this lock.
+    if (size && sidecar && sidecar.size() == size && sidecar.instanceCount() == count)
+      return true;
     if (!sidecar.allocate(GetMTLDevice(), size, count))
       return false;
     AddRTASResidency({sidecar, size, uint32_t(count), {}});
@@ -3483,31 +3559,16 @@ public:
       return;
     WMT::Allocation structure = state.sidecar.accelerationStructure();
     if (structure)
-      residency_set_.addAllocations(&structure, 1);
+      AddResidencyAllocationsLocked(&structure, 1);
     WMT::Allocation instances = state.sidecar.instanceBuffer();
     if (instances)
-      residency_set_.addAllocations(&instances, 1);
+      AddResidencyAllocationsLocked(&instances, 1);
     WMT::Allocation contributions = state.sidecar.contributionBuffer();
     if (contributions)
-      residency_set_.addAllocations(&contributions, 1);
+      AddResidencyAllocationsLocked(&contributions, 1);
   }
 
-  /**
-   * Return one address's mirror slot for reuse. Caller holds residency_lock_.
-   *
-   * The address is gone with its allocation, so no GPU work can still publish into this slot:
-   * D3D12 only lets an application release a resource no in-flight submission reads. Without
-   * this, every acceleration structure the application ever creates would consume a slot forever
-   * and the fixed page budget would become a cap on total AS creations rather than on live ones.
-   */
-  void
-  FreeRTASSlot(const raytracing::ArenaKey &key) {
-    auto found = rtas_slots_.find(key);
-    if (found == rtas_slots_.end())
-      return;
-    rtas_mirror_.Free(found->second);
-    rtas_slots_.erase(found);
-  }
+
 
   uint64_t
   BeginRTASSubmission() {
@@ -3548,8 +3609,10 @@ public:
     return cpu;
   }
 
-  HRESULT
-  GetRTASComputePipelines(RTASComputePipelines &pipelines) {
+  const RTASComputePipelines *
+  GetRTASComputePipelines() override {
+    if (rtas_pipelines_ready_.load(std::memory_order_acquire))
+      return &rtas_pipelines_;
     std::unique_lock<std::mutex> lock(rtas_pipeline_lock_);
     if (!rtas_pipelines_.prepass) {
       auto library = command_library.getLibrary();
@@ -3557,24 +3620,23 @@ public:
       auto prepass_function = WMT4::Library(library).newFunction("d3dalloy_as_prepass");
       auto prepass = GetMetal4Compiler().newComputePipelineState(prepass_function, error);
       if (error || !prepass)
-        return E_FAIL;
-      rtas_pipelines_.prepass = std::move(prepass);
-      const char *names[] = {"d3dalloy_as_shadow", "d3dalloy_as_postbuild", "d3dalloy_as_serialize",
+        return nullptr;
+      RTASComputePipelines prepared;
+      prepared.prepass = std::move(prepass);
+      const char *names[] = {"d3dalloy_as_shadow", "d3dalloy_as_shadow_batch", "d3dalloy_as_postbuild", "d3dalloy_as_serialize",
           "d3dalloy_as_deserialize", "d3dalloy_as_visualize", "d3dalloy_as_visualize_descriptors"};
-      WMT::Reference<WMT::ComputePipelineState> *states[] = {&rtas_pipelines_.shadow, &rtas_pipelines_.postbuild,
-          &rtas_pipelines_.serialize, &rtas_pipelines_.deserialize, &rtas_pipelines_.visualize,
-          &rtas_pipelines_.visualizeDescriptors};
-      for (uint32_t i = 0; i < 6; ++i) {
+      WMT::Reference<WMT::ComputePipelineState> *states[] = {&prepared.shadow, &prepared.shadowBatch, &prepared.postbuild,
+          &prepared.serialize, &prepared.deserialize, &prepared.visualize, &prepared.visualizeDescriptors};
+      for (size_t i = 0; i < std::size(names); ++i) {
         error = {};
         *states[i] = GetMetal4Compiler().newComputePipelineState(WMT4::Library(library).newFunction(names[i]), error);
-        if (error || !*states[i]) {
-          rtas_pipelines_ = {};
-          return E_FAIL;
-        }
+        if (error || !*states[i])
+          return nullptr;
       }
+      rtas_pipelines_ = std::move(prepared);
+      rtas_pipelines_ready_.store(true, std::memory_order_release);
     }
-    pipelines = rtas_pipelines_;
-    return S_OK;
+    return &rtas_pipelines_;
   }
 
   virtual FormatCapability
@@ -3585,9 +3647,6 @@ public:
     return format_inspector_.textureCapabilities.at(Format);
   };
 
-  /* ID3D12Device5 surface. The raytracing feature tier stays NOT_SUPPORTED until ray dispatch
-   * works end to end, so the state objects and meta commands that would only be reachable
-   * through it report E_NOTIMPL instead of pretending to exist. */
   HRESULT STDMETHODCALLTYPE
   CreateLifetimeTracker(ID3D12LifetimeOwner *, REFIID, void **tracker) final {
     InitReturnPtr(tracker);
@@ -3666,6 +3725,9 @@ CreateD3D12Device(IMTLDXGIAdapter *adapter, const IID &riid, void **ppDevice,
   device->runtime_configuration = configuration;
   device->independent_device = independent;
   device->diagnostics.Configure(configuration);
+  device->capture_annotations = configuration.debug || device->diagnostics.CaptureEnabled() ||
+      owned_graphics::TraceEnabled() || env::getEnvVar("MTL_CAPTURE_ENABLED") == "1" ||
+      env::getEnvVar("MTL_DEBUG_LAYER") == "1" || env::getEnvVar("MTL_SHADER_VALIDATION") == "1";
   HRESULT hr = device->Initialize();
   if (FAILED(hr))
     return hr;

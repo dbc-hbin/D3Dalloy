@@ -2,6 +2,7 @@
 // Imported from zzz-wine-yaagl-pr-runtime e9d0e50db84 d3dmetal-sidecar/fsr-rr.mm.
 #include "metalfx_amd_rr.hpp"
 #include "metalfx_texture_access.hpp"
+#include "../winemetal_metal4.h"
 #include "fsr-rr-kernels.inc"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -92,6 +93,8 @@ struct ExecutionBindings {
 struct NeuralGeneration {
     uint32_t width = 0, height = 0;
     std::array<Object,WMTRR_SIGNAL_COUNT> scalers;
+    std::array<MTLTextureUsage,6> commonUsage{};
+    MTLTextureUsage color{}, reactive{}, strength{}, output{}, hit{};
     // Albedo for the absent lighting component. Its first execution clears it
     // on the consuming command stream; later executions only read it.
     Storage zero;
@@ -289,18 +292,26 @@ static std::shared_ptr<NeuralGeneration> makeNeuralGeneration(Feature::Impl& fea
                 if (!generation->scalers[s]) {
                     fail(error,ErrorCode::ScalerCreationFailed,"MetalFX neural RR scaler creation failed"); return {};
                 }
+                generation->commonUsage[0] |= scaler.depthTextureUsage;
+                generation->commonUsage[1] |= scaler.motionTextureUsage;
+                generation->commonUsage[2] |= scaler.normalTextureUsage;
+                generation->commonUsage[3] |= scaler.roughnessTextureUsage;
+                generation->commonUsage[4] |= scaler.diffuseAlbedoTextureUsage;
+                generation->commonUsage[5] |= scaler.specularAlbedoTextureUsage;
+                generation->color |= scaler.colorTextureUsage;
+                if (@available(macOS 27.0,*)) generation->reactive |= scaler.reactiveMaskTextureUsage;
+                else generation->reactive |= [[(id)scaler valueForKey:@"reactiveTextureUsage"] unsignedIntegerValue];
+                generation->strength |= scaler.denoiseStrengthMaskTextureUsage;
+                generation->output |= scaler.outputTextureUsage;
+                if (s == 5) generation->hit |= scaler.specularHitDistanceTextureUsage;
             }
         } @finally { [descriptor release]; }
         auto device = (id<MTLDevice>)feature.device.get();
-        MTLTextureUsage zeroUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-        for (const auto& value : generation->scalers) if (value) {
-            auto scaler = (id<MTL4FXTemporalDenoisedScaler>)value.get();
-            zeroUsage |= scaler.diffuseAlbedoTextureUsage | scaler.specularAlbedoTextureUsage;
-        }
         auto zeroDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
             width:width height:height mipmapped:NO];
         zeroDescriptor.storageMode = MTLStorageModePrivate;
-        zeroDescriptor.usage = zeroUsage;
+        zeroDescriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+            generation->commonUsage[4] | generation->commonUsage[5];
         id<MTLTexture> zero = [device newTextureWithDescriptor:zeroDescriptor];
         if (!zero) { fail(error,ErrorCode::ResourceCreationFailed,"RR zero albedo allocation failed"); return {}; }
         Object zeroOwner(zero); [zero release];
@@ -696,8 +707,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             // and the decoded normal. Built once and read by every signal.
             // The decoded normal is also the neural scaler's normal input.
             MTLTextureUsage normalUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-            for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s])
-                normalUsage |= ((id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get()).normalTextureUsage;
+            if (generation) normalUsage |= generation->commonUsage[2];
             Storage guide = feature->texture(frame.width,frame.height);
             Storage decoded = feature->texture(frame.width,frame.height,MTLPixelFormatRGBA32Float,normalUsage);
             if (!guide || !decoded) return fail(error,ErrorCode::ResourceCreationFailed,"RR geometry guide allocation failed");
@@ -721,29 +731,8 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 if (!current->signals[s]) return fail(error,ErrorCode::ResourceCreationFailed,"RR independent signal allocation failed");
                 execution->allocations.push_back(current->signals[s]);
             }
-            std::array<MTLTextureUsage,6> commonUsage{};
-            struct { MTLTextureUsage color{}, reactive{}, strength{}, output{}, hit{}; } neuralUsage;
             bool transientUpper = false;
             for (unsigned s=0;s<WMTRR_SIGNAL_COUNT;++s) if (generation && generation->scalers[s]) {
-                auto scaler = (id<MTL4FXTemporalDenoisedScaler>)generation->scalers[s].get();
-                commonUsage[0] |= scaler.depthTextureUsage;
-                commonUsage[1] |= scaler.motionTextureUsage;
-                commonUsage[2] |= scaler.normalTextureUsage;
-                commonUsage[3] |= scaler.roughnessTextureUsage;
-                commonUsage[4] |= scaler.diffuseAlbedoTextureUsage;
-                commonUsage[5] |= scaler.specularAlbedoTextureUsage;
-                neuralUsage.color |= scaler.colorTextureUsage;
-                MTLTextureUsage reactiveUsage;
-                if (@available(macOS 27.0,*)) reactiveUsage = scaler.reactiveMaskTextureUsage;
-                else {
-                    // macOS 26 exposes this usage under the earlier public
-                    // property name; the 27 SDK renamed its typed accessor.
-                    reactiveUsage = [[(id)scaler valueForKey:@"reactiveTextureUsage"] unsignedIntegerValue];
-                }
-                neuralUsage.reactive |= reactiveUsage;
-                neuralUsage.strength |= scaler.denoiseStrengthMaskTextureUsage;
-                neuralUsage.output |= scaler.outputTextureUsage;
-                if (s == 5) neuralUsage.hit |= scaler.specularHitDistanceTextureUsage;
                 // Direct alpha is undefined for filtering but still belongs to
                 // the caller. Retain it separately for history-only holes.
                 if ((s == 1 || s == 2) && (feature->info.checkerboard&(1u<<s))) {
@@ -761,13 +750,13 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                     return value;
                 };
                 auto& n = neuralFrame;
-                n.color = allocate(MTLPixelFormatRGBA32Float,neuralUsage.color);
-                n.reactive = allocate(MTLPixelFormatR32Float,neuralUsage.reactive);
-                n.strength = allocate(MTLPixelFormatR32Float,neuralUsage.strength);
+                n.color = allocate(MTLPixelFormatRGBA32Float,generation->color);
+                n.reactive = allocate(MTLPixelFormatR32Float,generation->reactive);
+                n.strength = allocate(MTLPixelFormatR32Float,generation->strength);
                 n.lower = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
                 if (transientUpper) n.upper = allocate(MTLPixelFormatRGBA32Float,MTLTextureUsageShaderRead);
-                n.output = allocate(MTLPixelFormatRGBA32Float,neuralUsage.output);
-                if (feature->info.signals&(1u<<5)) n.hit = allocate(MTLPixelFormatR32Float,neuralUsage.hit);
+                n.output = allocate(MTLPixelFormatRGBA32Float,generation->output);
+                if (feature->info.signals&(1u<<5)) n.hit = allocate(MTLPixelFormatR32Float,generation->hit);
                 if (!n.color || !n.reactive || !n.strength || !n.lower || (transientUpper && !n.upper) || !n.output ||
                     ((feature->info.signals&(1u<<5)) && !n.hit))
                     return fail(error,ErrorCode::ResourceCreationFailed,"RR neural working-set allocation failed");
@@ -777,7 +766,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 MTLPixelFormat format = i == 1 ? MTLPixelFormatRG32Float :
                     i == 0 || i == 3 ? MTLPixelFormatR32Float : MTLPixelFormatRGBA32Float;
                 neuralCommon[i] = feature->texture(frame.width,frame.height,format,
-                    commonUsage[i] | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
+                    generation->commonUsage[i] | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite);
                 if (!neuralCommon[i]) return fail(error,ErrorCode::ResourceCreationFailed,"RR neural common resource allocation failed");
                 execution->allocations.push_back(neuralCommon[i]);
             }
@@ -874,11 +863,16 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
             [buffer useResidencySet:residency];
             id<MTL4ComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
             if (!encoder) return fail(error,ErrorCode::EncodeFailed,"RR compute encoder creation failed");
+            m4_hud_count(WMTMetal4HUDCompute);
             execution->objects.emplace_back(encoder);
             bool completed = false;
             @try {
                 [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
-                if (reuse) [encoder waitForFence:(id<MTLFence>)feature->historyFence.get() beforeEncoderStages:MTLStageDispatch];
+                m4_hud_count(WMTMetal4HUDFenceWait);
+                if (reuse) {
+                    [encoder waitForFence:(id<MTLFence>)feature->historyFence.get() beforeEncoderStages:MTLStageDispatch];
+                    m4_hud_count(WMTMetal4HUDFenceWait);
+                }
                 auto dispatch = [&](id<MTLComputePipelineState> state, unsigned parameter,
                                     const Bindings& textures, bool tiled = false) {
                     [table setAddress:parameters.gpuAddress+ParameterStride*parameter atIndex:0];
@@ -969,6 +963,7 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                 auto queueBarrier = [&]() -> bool {
                     id<MTL4ComputeCommandEncoder> boundary = [buffer computeCommandEncoder];
                     if (!boundary) return false;
+                    m4_hud_count(WMTMetal4HUDCompute);
                     [boundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll
                         visibilityOptions:MTL4VisibilityOptionDevice];
                     [boundary endEncoding];
@@ -1034,8 +1029,10 @@ bool PreparedFrame::encode(void* commandBuffer, void* fence,
                         return fail(error,ErrorCode::EncodeFailed,"RR neural suffix segment creation failed");
                     encoder = [buffer computeCommandEncoder];
                     if (!encoder) return fail(error,ErrorCode::EncodeFailed,"RR neural correction encoder creation failed");
+                    m4_hud_count(WMTMetal4HUDCompute);
                     execution->objects.emplace_back(encoder);
                     [encoder waitForFence:(id<MTLFence>)fence beforeEncoderStages:MTLStageDispatch];
+                    m4_hud_count(WMTMetal4HUDFenceWait);
                     bool readsDestination = !frame.legacy_mode && !(feature->info.checkerboard&(1u<<s));
                     id pipeline = readsDestination ? feature->neuralResolvePipeline.get() :
                         feature->neuralResolveWritePipeline.get();

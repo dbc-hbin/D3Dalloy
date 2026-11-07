@@ -88,7 +88,7 @@ enum class MTLAttributeFormat {
   FloatRGB9E5 = 55,
 };
 
-AIRBuilderResult pull_vec4_from_addr(
+AIRBuilderResult pull_vec4_from_addr_checked(
   MTLAttributeFormat format, pvalue base_addr, pvalue byte_offset
 );
 

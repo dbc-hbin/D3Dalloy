@@ -5,6 +5,7 @@
 #import <MetalFX/MetalFX.h>
 #include "../../src/winemetal/unix/metalfx_frame_generation.hpp"
 #include "../../src/winemetal/winemetal_metal4_fg.h"
+#include "../../src/winemetal/unix/winemetal_metal4_hud.c"
 #include "owned-fg-pattern.h"
 #include "fsr-kernels.inc"
 #include <cstdio>
@@ -36,7 +37,7 @@ struct Operations {
     uint64_t realPixels=0;
 };
 struct CompileCounts { unsigned libraries=0, pipelines=0; } compileCounts;
-constexpr unsigned fgPipelineCount = 7;
+constexpr unsigned fgPipelineCount = 8;
 using NewLibrary = id<MTLLibrary> (*)(id,SEL,NSString*,MTLCompileOptions*,NSError**);
 using NewPipeline = id<MTLComputePipelineState> (*)(id,SEL,id<MTLFunction>,NSError**);
 using SetPipeline = void (*)(id,SEL,id<MTLComputePipelineState>);
@@ -426,6 +427,63 @@ void finalizedPrepareProof(Harness& h) {
     std::printf("OWNED_FG_FINALIZED_PREPARE_PASS comparisons=%u frames_per_contract=4 source_offsets=1 motion_fp32=1 camera=1 invalid_vectors=1 reset=1 jitter_fallback=1 rejected_generate=1 already_executed_fallback=1 poison_after_prepare=1 destroy_before_generate=1 outputs=bit_exact optimized_snapshot_copies=%u raw_snapshot_copies=%u\n",
         compared,bakedCopies,rawCopies);
 }
+id<MTLTexture> boundDepth, boundMotion;
+void (*nativeEncode)(id, SEL, id<MTL4CommandBuffer>);
+void captureGuides(id<MTL4FXFrameInterpolator> effect, SEL sel, id<MTL4CommandBuffer> command) {
+    boundDepth = [effect.depthTexture retain]; boundMotion = [effect.motionTexture retain];
+    nativeEncode(effect,sel,command);
+}
+
+void dynamicGuideProof(Harness& h) {
+    auto desc = [MTLFXFrameInterpolatorDescriptor new];
+    desc.colorTextureFormat = desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
+    desc.depthTextureFormat = MTLPixelFormatR32Float; desc.motionTextureFormat = MTLPixelFormatRG16Float;
+    desc.inputWidth = desc.inputHeight = desc.outputWidth = desc.outputHeight = 128;
+    desc.requiresPrevColorTexture = NO;
+    auto probe = [desc newFrameInterpolatorWithDevice:h.device compiler:h.compiler];
+    require(probe != nil,"dynamic-guide-interpolator");
+    Method encode = class_getInstanceMethod(object_getClass(probe),@selector(encodeToCommandBuffer:));
+    nativeEncode = reinterpret_cast<decltype(nativeEncode)>(method_setImplementation(encode,reinterpret_cast<IMP>(captureGuides)));
+    const auto context = h.create();
+    for (unsigned frame=1;frame<=6;++frame) {
+        const unsigned active = frame==3 || frame==4 ? 96 : 64;
+        auto color=texture(h.device,MTLPixelFormatRGBA16Float), output=texture(h.device,MTLPixelFormatRGBA16Float);
+        auto depth=texture(h.device,MTLPixelFormatR32Float), motion=texture(h.device,MTLPixelFormatRG16Float);
+        auto scene=fgScene(frame);
+        std::vector<float> z(128*128,.875f);
+        std::vector<uint32_t> mv(128*128,0x4c004c00u);
+        for (unsigned y=0;y<active;++y) for (unsigned x=0;x<active;++x) {
+            z[y*128+x]=((x+y+frame)%7+1)/8.f;
+            mv[y*128+x]=(x/8+y/8+frame)%2 ? 0xbc004000u : 0x3c00c200u;
+        }
+        upload(h.device,h.queue,color,scene.data(),128*8);
+        upload(h.device,h.queue,depth,z.data(),128*4); upload(h.device,h.queue,motion,mv.data(),128*4);
+        h.execute(h.record(context,frame,color,depth,motion,output,0,active),{color,depth,motion,output});
+        require(boundDepth.width==128 && boundDepth.height==128 && boundMotion.width==128 && boundMotion.height==128,
+                "native-guides-match-physical-descriptor");
+        auto bytes=[h.device newBufferWithLength:2*128*128*4 options:MTLResourceStorageModeShared];
+        auto cb=[h.queue commandBuffer]; auto blit=[cb blitCommandEncoder];
+        NSUInteger offset=0;
+        for (auto guide : {boundDepth,boundMotion}) {
+            [blit copyFromTexture:guide sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                sourceSize:MTLSizeMake(128,128,1) toBuffer:bytes destinationOffset:offset
+                destinationBytesPerRow:512 destinationBytesPerImage:128*512];
+            offset+=128*512;
+        }
+        [blit endEncoding]; [cb commit]; [cb waitUntilCompleted]; require(!cb.error,"dynamic-guide-read");
+        for (unsigned y=0;y<128;++y) for (unsigned x=0;x<128;++x) {
+            unsigned i=y*128+x; bool inside=x<active && y<active;
+            require(static_cast<const float*>(bytes.contents)[i]==(inside?z[i]:0.f),"dynamic-depth-valid-and-padded");
+            require(static_cast<const uint32_t*>(bytes.contents)[128*128+i]==(inside?mv[i]:0u),"dynamic-motion-valid-and-padded");
+        }
+        [bytes release]; [boundDepth release]; [boundMotion release]; boundDepth=nil; boundMotion=nil;
+        [depth release]; [motion release]; [output release]; [color release];
+    }
+    method_setImplementation(encode,reinterpret_cast<IMP>(nativeEncode));
+    [probe release]; [desc release]; h.destroy(context);
+    std::puts("OWNED_FG_DYNAMIC_GUIDES_PASS content=64,96,64 descriptor=128 zero_padding=exact active_bytes=exact");
+}
+
 void normalizationProof(Harness& h, unsigned render) {
     Observer observer(h.device);
     uint64_t contexts[]={h.create(),h.create(),h.create()};
@@ -455,11 +513,13 @@ void normalizationProof(Harness& h, unsigned render) {
             require(afterCompile.libraries-beforeCompile.libraries==batches &&
                     afterCompile.pipelines-beforeCompile.pipelines==fgPipelineCount*batches, "device-kernel-library-count-and-reuse");
             snapshotSources[0]=snapshotSources[1]=nil; auto counts=operations;
-            require(counts.snapshots==(EXPECT_GUIDE_BAKING && mode==1 ? 1u : 2u),
+            const bool padded = render < 128;
+            const unsigned snapshots = EXPECT_GUIDE_BAKING && mode != 2 && padded ? 0 :
+                                       EXPECT_GUIDE_BAKING && mode == 1 ? 1 : 2;
+            require(counts.snapshots==snapshots,
                 "prepare-converts-only-the-finalized-guide-contract");
-            // Depth already matches the native input grid. Only scaled motion
-            // needs conversion; depth/motion resampling is checked separately.
-            const bool expectedDispatches = mode==1 ? counts.motion==1 && !counts.depth && !counts.fused :
+            const bool expectedDispatches = padded ? counts.fused==1 && !counts.depth && !counts.motion :
+                mode==1 ? counts.motion==1 && !counts.depth && !counts.fused :
                 !counts.depth && !counts.motion && !counts.fused;
             if (!expectedDispatches) std::fprintf(stderr,"OWNED_FG_NORMALIZATION_COUNTS_DIAGNOSTIC frame=%u mode=%u depth=%u motion=%u fused=%u decode=%u\n",
                 frame,mode,counts.depth,counts.motion,counts.fused,counts.decode);
@@ -503,7 +563,7 @@ void normalizationProof(Harness& h, unsigned render) {
 int main(int argc, char** argv) { @autoreleasepool {
     Harness h;
     if (argc==2 && !std::strcmp(argv[1],"--normalization-only")) {
-        normalizationProof(h,128); normalizationProof(h,64); return 0;
+        normalizationProof(h,128); normalizationProof(h,64); dynamicGuideProof(h); return 0;
     }
     if (argc==2 && !std::strcmp(argv[1],"--barriers-only")) {
         prepassDependencyProof(h); return 0;
@@ -547,6 +607,6 @@ int main(int argc, char** argv) { @autoreleasepool {
     pipelineBatchProof(h);
     equivalentPassProof(h);
     finalizedPrepareProof(h);
-    normalizationProof(h,128); normalizationProof(h,64);
+    normalizationProof(h,128); normalizationProof(h,64); dynamicGuideProof(h);
     prepassDependencyProof(h);
 } }

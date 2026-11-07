@@ -101,7 +101,7 @@ SIZE_T DescriptorHandleOf(const void *heap, uint32_t index);
 std::pair<void *, uint32_t> ResolveDescriptorHandle(SIZE_T handle, DescriptorHandleKind kind);
 #endif
 
-enum class ShaderVisibleDescriptorType {
+enum class ShaderVisibleDescriptorType : uint64_t {
   Null,
   SRVTexture,
   ConstantBuffer,
@@ -146,7 +146,6 @@ struct UAVBufferCPUStorage {
   Buffer *buffer = nullptr;
   BufferSlice slice{};
   Buffer *counter = nullptr;
-  uint64_t counter_offset = 0;
 };
 
 using SRVBufferCPUStorage = UAVBufferCPUStorage;
@@ -165,7 +164,10 @@ struct AccelerationStructureCPUStorage {
 };
 
 struct ShaderVisibleDescriptorCPUStorage {
-  ShaderVisibleDescriptorType type;
+  // Counter placement is 4 KiB aligned. Its page and the descriptor kind
+  // share the header so that copying CPU metadata fits one cache line.
+  ShaderVisibleDescriptorType type : 12;
+  uint64_t counter_page : 52;
   // Borrowed pointers are dereferenced only after acquiring this live owner.
   uint64_t owner_id = 0;
   uint64_t counter_owner_id = 0;
@@ -182,39 +184,40 @@ struct ShaderVisibleDescriptorCPUStorage {
     UAVBufferCPUStorage SamplerFeedback;
   };
 
-  ShaderVisibleDescriptorCPUStorage() : type(ShaderVisibleDescriptorType::Null) {}
+  ShaderVisibleDescriptorCPUStorage() : type(ShaderVisibleDescriptorType::Null), counter_page(0) {}
 };
+static_assert(sizeof(ShaderVisibleDescriptorCPUStorage) <= 64);
+static_assert(D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT == 4096);
 
 class MTLD3D12DescriptorHeap : public ID3D12DescriptorHeap {
 public:
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;
-  virtual void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id = 0) = 0;
   /* Native identity allows a recording to retain the descriptor pool and its backing residency. */
   virtual WMT::Buffer GetArgumentBuffer() const = 0;
 
   virtual HRESULT
-  AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
+  AddShaderResourceView(UINT Index, uint64_t owner_id, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
                         bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) = 0;
 
   virtual HRESULT AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) = 0;
 
   virtual HRESULT AddUnorderedAccessView(
-      UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults
+      UINT Index, uint64_t owner_id, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults
   ) = 0;
 
-  virtual HRESULT AddUnorderedAccessView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+  virtual HRESULT AddUnorderedAccessView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
 
   virtual HRESULT AddUnorderedAccessView(
-      UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes
+      UINT Index, uint64_t owner_id, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes, uint64_t counter_owner_id
   ) = 0;
 
-  virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+  virtual HRESULT AddShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
 
-  virtual HRESULT AddRGB32ShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice,
+  virtual HRESULT AddRGB32ShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferSlice Slice,
                                              UINT Shader4ComponentMapping) = 0;
 
-  virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice) = 0;
+  virtual HRESULT AddShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferSlice Slice) = 0;
 
   virtual HRESULT AddShaderResourceView(UINT Index, D3D12_SHADER_RESOURCE_VIEW_DESC const *pDesc) = 0;
 
@@ -235,7 +238,7 @@ public:
    * A sampler feedback UAV: q0 = the map's cell array address (0 when the paired texture is null,
    * so feedback writes are dropped), q1 = its layout word (d3d12_sampler_feedback.hpp).
    */
-  virtual HRESULT AddSamplerFeedbackView(UINT Index, Buffer *Cells, uint64_t CellBytes, bool Paired,
+  virtual HRESULT AddSamplerFeedbackView(UINT Index, uint64_t owner_id, Buffer *Cells, uint64_t CellBytes, bool Paired,
                                          uint64_t LayoutWord) = 0;
 
   virtual ShaderVisibleDescriptorCPUStorage const &GetDescriptor(UINT Index) = 0;

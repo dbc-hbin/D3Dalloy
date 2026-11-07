@@ -94,10 +94,8 @@
  * device is removed). A Metal shader cannot remove a device, so the bound is
  * enforced where the trace is emitted: the depth the traversal would run the next
  * shaders at is compared against the pipeline's configured limit, and a trace that
- * would exceed it is not issued at all. The limit is read from the dispatch
- * constants at run time (SM50_RT_DISPATCH_ARGUMENTS::RecursionDepth), so it
- * follows the pipeline actually being dispatched, and the compile-time
- * MaxRecursionDepth is used as the fallback and as the secondary bound. Metal's
+ * would exceed it is not issued at all. The limit is fixed by the linked state object and participates in the
+ * pipeline artifact cache key. Metal's
  * own default call stack depth (one additional frame) is never what bounds this.
  *
  * Invocation blocks. One `TraceRay` or `CallShader` is one invocation of the
@@ -158,6 +156,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Alignment.h"
@@ -248,7 +247,6 @@ enum TraversalMode : uint32_t {
  * second edit.
  */
 enum RtDispatchField : uint32_t {
-  kRtRecursionDepth = offsetof(SM50_RT_DISPATCH_ARGUMENTS, RecursionDepth),
   kRtDispatchWidth = offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchWidth),
   kRtDispatchHeight = offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchHeight),
   kRtDispatchDepth = offsetof(SM50_RT_DISPATCH_ARGUMENTS, DispatchDepth),
@@ -264,18 +262,6 @@ constexpr uint32_t kHitKindTriangleBackFace = 0xff;
 /** Metal's intersection_type, in the traversal result's first field. */
 constexpr uint32_t kIntersectionTypeNone = 0;
 constexpr uint32_t kIntersectionTypeTriangle = 1;
-
-/**
- * Bits of SM50_RT_FRAME::Flags.
- *
- * D3D12 removes the device when TraceRay is called past the pipeline's maximum
- * recursion depth. A Metal shader cannot, so the trace is not issued and the
- * violation is recorded on the invocation's frame instead of being absorbed
- * silently; the value is also what the runtime reads to report the condition.
- */
-enum RtFrameFlag : uint32_t {
-  kRtFrameFlagRecursionExceeded = 0x1,
-};
 
 namespace {
 
@@ -443,42 +429,6 @@ bool constantFlag(Value *flags, uint32_t bit, bool &set) {
   return true;
 }
 
-/** The i8* form of `value` in its own address space. */
-Value *bytePointerOf(IRBuilder<> &builder, Value *value) {
-  LLVMContext &llvm_context = value->getContext();
-  unsigned address_space = cast<PointerType>(value->getType())->getAddressSpace();
-  Type *i8ptr = Type::getInt8PtrTy(llvm_context, address_space);
-  return value->getType() == i8ptr ? value : builder.CreateBitCast(value, i8ptr);
-}
-
-/**
- * Emit `llvm.memcpy` between two pointers, which may live in different address
- * spaces (a payload object is in the thread space, the block it is copied into is
- * too, but the intersection stage's payload arrives in Metal's ray-data space).
- */
-void emitMemcpy(Module &module, IRBuilder<> &builder, Value *dest, Value *src, uint64_t size) {
-  LLVMContext &llvm_context = module.getContext();
-  Value *dest_bytes = bytePointerOf(builder, dest);
-  Value *src_bytes = bytePointerOf(builder, src);
-  std::string name = "llvm.memcpy.p" +
-                     std::to_string(cast<PointerType>(dest_bytes->getType())->getAddressSpace()) +
-                     "i8.p" +
-                     std::to_string(cast<PointerType>(src_bytes->getType())->getAddressSpace()) +
-                     "i8.i64";
-  FunctionCallee memcpy = module.getOrInsertFunction(
-    name,
-    FunctionType::get(
-      Type::getVoidTy(llvm_context),
-      {dest_bytes->getType(), src_bytes->getType(), builder.getInt64Ty(),
-       Type::getInt1Ty(llvm_context)},
-      false
-    )
-  );
-  builder.CreateCall(
-    memcpy, {dest_bytes, src_bytes, builder.getInt64(size), builder.getInt1(false)}
-  );
-}
-
 /* -------------------------------------------------------------------------- */
 /* The pass                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -492,97 +442,6 @@ void emitMemcpy(Module &module, IRBuilder<> &builder, Value *dest, Value *src, u
  * shared, by their `air.arg_name`), so it never guesses an index.
  */
 using RaytracingEntry = RaytracingEntryArguments;
-
-/**
- * Run `body` in a block that is entered only when `condition` holds, continuing in
- * a join block afterwards. A condition that folds to true emits nothing; one that
- * folds to false emits nothing either, so the guarded code never runs.
- */
-void emitConditional(
-  IRBuilder<> &builder, Value *condition, StringRef name,
-  function_ref<void(IRBuilder<> &)> body
-) {
-  if (auto *constant = dyn_cast<ConstantInt>(condition)) {
-    if (constant->isOne())
-      body(builder);
-    return;
-  }
-  BasicBlock *head = builder.GetInsertBlock();
-  Function *function = head->getParent();
-  BasicBlock *join_block;
-  if (builder.GetInsertPoint() != head->end()) {
-    join_block = head->splitBasicBlock(builder.GetInsertPoint(), name + ".join");
-    head->getTerminator()->eraseFromParent();
-  } else {
-    join_block = BasicBlock::Create(builder.getContext(), name + ".join", function);
-  }
-  BasicBlock *body_block = BasicBlock::Create(builder.getContext(), name, function, join_block);
-  builder.SetInsertPoint(head);
-  builder.CreateCondBr(condition, body_block, join_block);
-  builder.SetInsertPoint(body_block);
-  body(builder);
-  builder.CreateBr(join_block);
-  builder.SetInsertPoint(join_block, join_block->getFirstInsertionPt());
-}
-
-/**
- * Evaluate `body` in a block entered only when `condition` holds, and continue with
- * the merged value in a block that also carries everything that followed the
- * insertion point.
- *
- * The block is split at the insertion point first, so the instructions that come
- * after it stay reachable: the condition is tested where the value is needed, the
- * guarded block computes it, and the continuation - the rest of the original block -
- * receives either value. This is what allows a guard in the middle of a shader
- * without moving the shader's own instructions around.
- *
- * A select cannot be used instead wherever the guarded expression must not be
- * evaluated at all (a load through a null base faults in address space 1).
- */
-Value *emitGuardedValue(
-  IRBuilder<> &builder, Value *condition, Value *otherwise, StringRef name,
-  function_ref<Value *(IRBuilder<> &)> body
-) {
-  if (auto *constant = dyn_cast<ConstantInt>(condition))
-    return constant->isOne() ? body(builder) : otherwise;
-
-  LLVMContext &llvm_context = builder.getContext();
-  Function *function = builder.GetInsertBlock()->getParent();
-  BasicBlock *head = builder.GetInsertBlock();
-  /*
-   * Splitting keeps the instructions after the insertion point reachable. When the
-   * insertion point is already the end of the block there is nothing to keep, so the
-   * continuation is simply a new block.
-   *
-   * The terminator is erased inside the split case only, because that is the only case
-   * that has one. `splitBasicBlock` requires a terminator and appends a branch from
-   * `head` to the new block, and that branch is exactly what the conditional below
-   * replaces. A block whose insertion point is its end has no terminator - the normal
-   * state while a shader body is still being built - so there is nothing to erase
-   * there, and `head` still gets the conditional branch below as its only terminator.
-   */
-  BasicBlock *continuation = nullptr;
-  if (builder.GetInsertPoint() != head->end()) {
-    continuation = head->splitBasicBlock(builder.GetInsertPoint(), name + ".cont");
-    head->getTerminator()->eraseFromParent();
-  } else {
-    continuation = BasicBlock::Create(llvm_context, name + ".cont", function);
-  }
-
-  BasicBlock *guarded = BasicBlock::Create(llvm_context, name, function, continuation);
-  builder.SetInsertPoint(head);
-  builder.CreateCondBr(condition, guarded, continuation);
-  builder.SetInsertPoint(guarded);
-  Value *value = body(builder);
-  BasicBlock *guarded_end = builder.GetInsertBlock();
-  builder.CreateBr(continuation);
-
-  builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
-  PHINode *merged = builder.CreatePHI(otherwise->getType(), 2, name + ".value");
-  merged->addIncoming(otherwise, head);
-  merged->addIncoming(value, guarded_end);
-  return merged;
-}
 
 class RaytracingLowerer {
 public:
@@ -633,11 +492,6 @@ private:
   // callsite in this invocation can run. Deferred HitObjects own separate storage.
   DenseMap<Function *, AllocaInst *> synchronous_children;
 
-  /** Byte offset of SM50_RT_HIT_STATE inside a per-invocation block. */
-  uint32_t hitStateOffset() const { return layout.hit_state; }
-  uint32_t candidateOffset() const { return layout.candidate_control; }
-  uint32_t blockSize() const { return layout.block_size; }
-
   Value *loadDispatchField(IRBuilder<> &builder, uint32_t byte_offset, Type *type);
   /** The dispatch constants as an i8 pointer, or null when this invocation cannot reach them. */
   Value *dispatchBytes(IRBuilder<> &builder);
@@ -684,20 +538,8 @@ private:
    */
   Value *readHitState(IRBuilder<> &builder, Value *block, uint32_t byte_offset, Type *type);
   void storeHitState(IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value);
-  /** Address one field of a hit state block by byte offset. */
-  Value *hitStateFieldPointer(
-    IRBuilder<> &builder, Value *hit_state, uint32_t byte_offset, Type *type
-  );
   /** Write one word of a block's SM50_RT_FRAME. */
   void storeFrameWord(IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value);
-  /** Write one dword of a block's per-candidate control area (RtCandidateField). */
-  void storeCandidateWord(IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value);
-  /**
-   * Write one field of a block's per-candidate control area with the value's own
-   * type, for the fields that are not a dword (RtCandidateControl::TMin / TMax are
-   * floats): a store has to name a pointer to the stored type, so those fields
-   * cannot go through the dword helper.
-   */
   void storeCandidateField(
     IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value
   );
@@ -729,14 +571,14 @@ private:
   /** The block the shader being lowered runs with (see the definition). */
   Value *invocationBlockOf(IRBuilder<> &builder);
   /** The acceleration-structure declaration a `dx.op.createHandleForLib` names. */
-  const ResourceBinding *accelerationStructureOf(const CallInst &call) const;
+  const ResourceBinding *accelerationStructureOf(const CallInst &call, SmallVectorImpl<GEPOperator *> &indices) const;
   /**
    * Resolve a RaytracingAccelerationStructure declaration to the D3D12 GPU virtual
    * address its descriptor holds, through the export's binding map. The address is
    * an i64: the descriptor-table slot's first qword, or the root SRV argument
    * itself. Null when the root signature does not bind the declaration.
    */
-  Value *accelerationStructureAddress(const ResourceBinding &declaration, IRBuilder<> &builder);
+  Value *accelerationStructureAddress(const ResourceBinding &declaration, Value *index, IRBuilder<> &builder);
   /**
    * Turn a D3D12 GPU virtual address of an acceleration structure into the AIR
    * structure operand.
@@ -773,6 +615,7 @@ private:
    * own. Returns the child's payload area as the address the shaders see, or null
    * when the operand cannot be copied from.
    */
+  Error validatePayload(Value *operand) const;
   Value *copyPayloadInto(IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified = true);
   /** Copy a child block's payload area back to the object a trace named. */
   void copyPayloadBack(IRBuilder<> &builder, Value *child_block, Value *payload_operand, bool qualified = true);
@@ -789,7 +632,7 @@ private:
                             Value *geometry_cull, Value *opacity_cull, Value *forced_opacity, bool deferred);
   Error lowerCallShader(CallInst &call, IRBuilder<> &builder);
   Error lowerDispatchRaysIndex(CallInst &call, IRBuilder<> &builder);
-  Value *linearDispatchIndex(IRBuilder<> &builder);
+  Value *dispatchIndex(IRBuilder<> &builder, unsigned component);
   Error lowerDispatchRaysDimensions(CallInst &call, IRBuilder<> &builder);
   Error lowerHitStateRead(CallInst &call, uint32_t opcode, IRBuilder<> &builder);
   Error lowerCreateHandleForLib(CallInst &call, IRBuilder<> &builder);
@@ -807,13 +650,13 @@ private:
  * tracing against the structure it actually named.
  */
 Value *RaytracingLowerer::accelerationStructureAddress(
-  const ResourceBinding &declaration, IRBuilder<> &builder
+  const ResourceBinding &declaration, Value *index, IRBuilder<> &builder
 ) {
   if (!context.binding)
     return nullptr;
   llvm::air::AIRBuilder air{llvm::air::AIRBuilderOptions{}, builder, nulldebug};
   auto descriptor = context.binding->GetAccelerationStructure(
-    air, declaration.declaration_id, builder.getInt32(declaration.lower_bound)
+    air, declaration.declaration_id, index
   );
   if (!descriptor)
     return nullptr;
@@ -1014,7 +857,7 @@ Value *RaytracingLowerer::readHitState(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset, Type *type
 ) {
   Value *base = hitStatePointerOf(builder, block);
-  return builder.CreateAlignedLoad(type, hitStateFieldPointer(builder, base, byte_offset, type), Align(1));
+  return builder.CreateAlignedLoad(type, rtFieldPointer(builder, base, byte_offset, type), Align(1));
 }
 
 void RaytracingLowerer::storeHitState(
@@ -1022,109 +865,27 @@ void RaytracingLowerer::storeHitState(
 ) {
   Value *base = hitStatePointerOf(builder, block);
   builder.CreateAlignedStore(
-    value, hitStateFieldPointer(builder, base, byte_offset, value->getType()), Align(1)
+    value, rtFieldPointer(builder, base, byte_offset, value->getType()), Align(1)
   );
 }
 
-/**
- * Address one field of a hit state by byte offset.
- *
- * The block is addressed as bytes and cast to the field's own type: SM50_RT_HIT_STATE
- * mixes scalars and vectors, so a struct-field index would only line up with the byte
- * offsets by accident (and would load a vector out of a scalar field).
- */
-Value *RaytracingLowerer::hitStateFieldPointer(
-  IRBuilder<> &builder, Value *hit_state, uint32_t byte_offset, Type *type
-) {
-  LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, hit_state);
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(byte_offset)
-  );
-  unsigned address_space = cast<PointerType>(bytes->getType())->getAddressSpace();
-  return builder.CreateBitCast(field, type->getPointerTo(address_space));
-}
-
-/**
- * Write one field of a block's per-candidate control area, with the value's own
- * type.
- *
- * The control area mixes dwords and floats (RtCandidateControl), so a store into it
- * has to name a pointer to the stored type - the dword helper below can only serve
- * the integer fields. No room for the control block in this layout means the callback
- * layer is not part of this pipeline, so there is nothing to publish.
- */
 void RaytracingLowerer::storeCandidateField(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value
 ) {
   if (layout.candidate_control + kRtCandidateControlSize > layout.block_size)
     return;
   Value *base = candidatePointerOf(builder, block);
-  unsigned address_space = cast<PointerType>(base->getType())->getAddressSpace();
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(module.getContext()), bytePointerOf(builder, base),
-    builder.getInt32(byte_offset)
-  );
-  builder.CreateAlignedStore(
-    value, builder.CreateBitCast(field, value->getType()->getPointerTo(address_space)), Align(1)
-  );
+  builder.CreateAlignedStore(value, rtFieldPointer(builder, base, byte_offset, value->getType()), Align(1));
 }
 
-/**
- * Read one dword of a block's per-candidate control area.
- *
- * The mirror of `storeCandidateWord`, for the fields a tracing shader reads back
- * after the traversal: the committed hit's kind, which a procedural hit's
- * `dx.op.reportHit` recorded while the traversal was still running. Null when this
- * layout has no room for the control block, which the caller reports rather than
- * reading something else.
- */
 Value *RaytracingLowerer::loadCandidateWord(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset
 ) {
   if (layout.candidate_control + kRtCandidateControlSize > layout.block_size)
     return nullptr;
   Value *base = candidatePointerOf(builder, block);
-  unsigned address_space = cast<PointerType>(base->getType())->getAddressSpace();
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(module.getContext()), bytePointerOf(builder, base),
-    builder.getInt32(byte_offset)
-  );
-  return builder.CreateAlignedLoad(
-    builder.getInt32Ty(),
-    builder.CreateBitCast(field, builder.getInt32Ty()->getPointerTo(address_space)), Align(1)
-  );
-}
-
-/**
- * Write one dword of a block's per-candidate control area.
- *
- * The area is part of every invocation block at the same offset, so a callback the
- * traversal invokes can reach it from the payload pointer it was handed. The layout
- * is `RtCandidateControl` (dxil_rt_callbacks.hpp), which the callback layer shares.
- */
-void RaytracingLowerer::storeCandidateWord(
-  IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value
-) {
-  /*
-   * No room for the control block in this layout means the callback layer is not
-   * part of this pipeline, so there is nothing to publish.
-   */
-  if (layout.candidate_control + kRtCandidateControlSize > layout.block_size)
-    return;
-  LLVMContext &llvm_context = module.getContext();
-  Value *base = candidatePointerOf(builder, block);
-  Value *words = builder.CreateBitCast(
-    base, Type::getInt32PtrTy(
-            llvm_context, cast<PointerType>(base->getType())->getAddressSpace()
-          )
-  );
-  builder.CreateAlignedStore(
-    value,
-    builder.CreateGEP(
-      Type::getInt32Ty(llvm_context), words, builder.getInt32(byte_offset / 4)
-    ), Align(1)
-  );
+  auto *field = rtFieldPointer(builder, base, byte_offset, builder.getInt32Ty());
+  return builder.CreateAlignedLoad(builder.getInt32Ty(), field, Align(1));
 }
 
 /** Write one word of a block's SM50_RT_FRAME. */
@@ -1132,7 +893,7 @@ void RaytracingLowerer::storeFrameWord(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value
 ) {
   LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
+  Value *bytes = rtBytePointer(builder, block);
   Value *as_words = builder.CreateBitCast(
     bytes, Type::getInt32PtrTy(
              llvm_context, cast<PointerType>(bytes->getType())->getAddressSpace()
@@ -1150,28 +911,14 @@ void RaytracingLowerer::storeFrameWord(
 Value *RaytracingLowerer::loadFrameField(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset, Type *type
 ) {
-  LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
-  unsigned address_space = cast<PointerType>(bytes->getType())->getAddressSpace();
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(byte_offset)
-  );
-  return builder.CreateLoad(type, builder.CreateBitCast(field, type->getPointerTo(address_space)));
+  return builder.CreateLoad(type, rtFieldPointer(builder, block, byte_offset, type));
 }
 
 /** Write one field of a block's SM50_RT_FRAME, addressed by byte offset. */
 void RaytracingLowerer::storeFrameField(
   IRBuilder<> &builder, Value *block, uint32_t byte_offset, Value *value
 ) {
-  LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
-  unsigned address_space = cast<PointerType>(bytes->getType())->getAddressSpace();
-  Value *field = builder.CreateGEP(
-    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(byte_offset)
-  );
-  builder.CreateStore(
-    value, builder.CreateBitCast(field, value->getType()->getPointerTo(address_space))
-  );
+  builder.CreateStore(value, rtFieldPointer(builder, block, byte_offset, value->getType()));
 }
 
 /**
@@ -1250,9 +997,11 @@ Value *RaytracingLowerer::visibleFunctionTable(IRBuilder<> &builder) {
  */
 void RaytracingLowerer::publishRuntimeContext(IRBuilder<> &builder, Value *block) {
   Type *i64 = builder.getInt64Ty();
-  /* DispatchRaysIndex() is defined in every raytracing stage: the callee rebuilds it from this. */
-  if (Value *linear = linearDispatchIndex(builder))
-    storeFrameWord(builder, block, offsetof(SM50_RT_FRAME, LinearIndex), linear);
+  for (unsigned component = 0; component < 3; ++component) {
+    if (context.dispatch_index_mask & (1u << component))
+      storeFrameWord(builder, block, offsetof(SM50_RT_FRAME, DispatchIndex) + component * sizeof(uint32_t),
+                     dispatchIndex(builder, component));
+  }
   Value *dispatch = dispatchArgumentsAddress(builder);
   if (dispatch)
     storeFrameField(
@@ -1309,18 +1058,18 @@ Value *RaytracingLowerer::beginChildInvocation(IRBuilder<> &builder) {
   if (!slot) {
     BasicBlock &entry = function->getEntryBlock();
     IRBuilder<> at_entry(&entry, entry.getFirstInsertionPt());
-    auto *bytes = ArrayType::get(builder.getInt8Ty(), std::max(blockSize(), 1u));
+    auto *bytes = ArrayType::get(builder.getInt8Ty(), std::max(layout.block_size, 1u));
     slot = at_entry.CreateAlloca(bytes, nullptr, "rt.child");
     slot->setAlignment(Align(16));
   }
-  builder.CreateLifetimeStart(slot, builder.getInt64(blockSize()));
+  builder.CreateLifetimeStart(slot, builder.getInt64(layout.block_size));
   return slot;
 }
 
 /** i8* user payload area of `block`, passed to visible shaders. */
 Value *RaytracingLowerer::payloadPointerOf(IRBuilder<> &builder, Value *block) {
   LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
+  Value *bytes = rtBytePointer(builder, block);
   return builder.CreateGEP(
     Type::getInt8Ty(llvm_context), bytes, builder.getInt32(layout.frame_size)
   );
@@ -1329,19 +1078,28 @@ Value *RaytracingLowerer::payloadPointerOf(IRBuilder<> &builder, Value *block) {
 /** i8* SM50_RT_HIT_STATE of `block`. */
 Value *RaytracingLowerer::hitStatePointerOf(IRBuilder<> &builder, Value *block) {
   LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
+  Value *bytes = rtBytePointer(builder, block);
   return builder.CreateGEP(
-    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(hitStateOffset())
+    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(layout.hit_state)
   );
 }
 
 /** i8* per-candidate control area of `block`. */
 Value *RaytracingLowerer::candidatePointerOf(IRBuilder<> &builder, Value *block) {
   LLVMContext &llvm_context = module.getContext();
-  Value *bytes = bytePointerOf(builder, block);
+  Value *bytes = rtBytePointer(builder, block);
   return builder.CreateGEP(
-    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(candidateOffset())
+    Type::getInt8Ty(llvm_context), bytes, builder.getInt32(layout.candidate_control)
   );
+}
+
+Error RaytracingLowerer::validatePayload(Value *operand) const {
+  auto *pointer = dyn_cast<PointerType>(operand->getType());
+  if (!pointer || !pointer->getNonOpaquePointerElementType()->isSized())
+    return createError("dxil: expected a sized ray or callable payload");
+  if (module.getDataLayout().getTypeStoreSize(pointer->getNonOpaquePointerElementType()) > layout.payload_size)
+    return createError("dxil: payload exceeds ray invocation storage");
+  return Error::success();
 }
 
 /**
@@ -1367,7 +1125,8 @@ Value *RaytracingLowerer::copyPayloadInto(
   if (fields)
     CopyQualifiedRayPayload(builder, child_payload, payload_operand, cast<StructType>(type), fields, 2);
   else
-    emitMemcpy(module, builder, child_payload, payload_operand, layout.payload_size);
+    builder.CreateMemCpy(child_payload, MaybeAlign(), payload_operand, MaybeAlign(),
+                         module.getDataLayout().getTypeStoreSize(type));
   return child_payload;
 }
 
@@ -1382,7 +1141,8 @@ void RaytracingLowerer::copyPayloadBack(
   if (fields)
     CopyQualifiedRayPayload(builder, payload_operand, payloadPointerOf(builder, child_block), cast<StructType>(type), fields, 1);
   else
-    emitMemcpy(module, builder, payload_operand, payloadPointerOf(builder, child_block), layout.payload_size);
+    builder.CreateMemCpy(payload_operand, MaybeAlign(), payloadPointerOf(builder, child_block), MaybeAlign(),
+                         module.getDataLayout().getTypeStoreSize(type));
 }
 
 /**
@@ -1452,7 +1212,7 @@ Value *RaytracingLowerer::invocationBlockOf(IRBuilder<> &builder) {
    */
   BasicBlock &function_entry = entry.function->getEntryBlock();
   IRBuilder<> entry_builder(&function_entry, function_entry.getFirstInsertionPt());
-  Value *payload = bytePointerOf(entry_builder, entry.payload);
+  Value *payload = rtBytePointer(entry_builder, entry.payload);
   if (context.stage == SM50_RT_STAGE_RAYGEN ||
       (context.stage == SM50_RT_STAGE_INTERSECTION && !context.query_callbacks)) {
     entry_block = payload;
@@ -1473,7 +1233,9 @@ Value *RaytracingLowerer::invocationBlockOf(IRBuilder<> &builder) {
  * `!dx.resources` declaration the parser recorded; the declaration's kind is what
  * says whether this handle is an acceleration structure.
  */
-const ResourceBinding *RaytracingLowerer::accelerationStructureOf(const CallInst &call) const {
+const ResourceBinding *RaytracingLowerer::accelerationStructureOf(
+  const CallInst &call, SmallVectorImpl<GEPOperator *> &indices
+) const {
   if (call.arg_size() < 2)
     return nullptr;
   Value *operand = call.getArgOperand(1);
@@ -1482,12 +1244,13 @@ const ResourceBinding *RaytracingLowerer::accelerationStructureOf(const CallInst
       operand = load->getPointerOperand();
       continue;
     }
-    if (auto *gep = dyn_cast<GetElementPtrInst>(operand)) {
+    if (auto *gep = dyn_cast<GEPOperator>(operand)) {
+      indices.push_back(gep);
       operand = gep->getPointerOperand();
       continue;
     }
-    if (auto *cast = dyn_cast<CastInst>(operand)) {
-      operand = cast->getOperand(0);
+    if (isa<BitCastOperator>(operand) || isa<AddrSpaceCastOperator>(operand)) {
+      operand = cast<Operator>(operand)->getOperand(0);
       continue;
     }
     break;
@@ -1515,23 +1278,11 @@ const ResourceBinding *RaytracingLowerer::accelerationStructureOf(const CallInst
   return match;
 }
 
-/**
- * This invocation's DispatchRaysIndex linearized as x + Width * (y + Height * z), which D3D12's
- * Width * Height * Depth <= 2^30 keeps within 32 bits. The ray generation shader computes it from its
- * thread position; every other stage reads the frame its caller published it into.
- */
-Value *RaytracingLowerer::linearDispatchIndex(IRBuilder<> &builder) {
-  Type *u32 = builder.getInt32Ty();
-  if (!entry.thread_position)
-    return loadFrameField(builder, invocationBlockOf(builder), offsetof(SM50_RT_FRAME, LinearIndex), u32);
-  Value *width = loadDispatchField(builder, kRtDispatchWidth, u32);
-  Value *height = loadDispatchField(builder, kRtDispatchHeight, u32);
-  if (!width || !height)
-    return nullptr;
-  Value *x = builder.CreateExtractElement(entry.thread_position, builder.getInt64(0));
-  Value *y = builder.CreateExtractElement(entry.thread_position, builder.getInt64(1));
-  Value *z = builder.CreateExtractElement(entry.thread_position, builder.getInt64(2));
-  return builder.CreateAdd(x, builder.CreateMul(width, builder.CreateAdd(y, builder.CreateMul(height, z))));
+Value *RaytracingLowerer::dispatchIndex(IRBuilder<> &builder, unsigned component) {
+  if (entry.thread_position)
+    return builder.CreateExtractElement(entry.thread_position, builder.getInt32(component));
+  return loadFrameField(builder, invocationBlockOf(builder),
+                        offsetof(SM50_RT_FRAME, DispatchIndex) + component * sizeof(uint32_t), builder.getInt32Ty());
 }
 
 Error RaytracingLowerer::lowerDispatchRaysIndex(CallInst &call, IRBuilder<> &builder) {
@@ -1540,29 +1291,7 @@ Error RaytracingLowerer::lowerDispatchRaysIndex(CallInst &call, IRBuilder<> &bui
   auto *component = dyn_cast<ConstantInt>(call.getArgOperand(1));
   if (!component || component->getZExtValue() > 2)
     return createError("dx.op.dispatchRaysIndex component must be a constant 0, 1 or 2");
-  Value *lane = nullptr;
-  if (entry.thread_position) {
-    lane = builder.CreateExtractElement(entry.thread_position, builder.getInt64(component->getZExtValue()));
-  } else {
-    Type *u32 = builder.getInt32Ty();
-    Value *linear = linearDispatchIndex(builder);
-    Value *width = loadDispatchField(builder, kRtDispatchWidth, u32);
-    Value *height = loadDispatchField(builder, kRtDispatchHeight, u32);
-    if (!width || !height)
-      return createError("dxil: the dispatch arguments are not bound in this shader");
-    switch (component->getZExtValue()) {
-    case 0:
-      lane = builder.CreateURem(linear, width);
-      break;
-    case 1:
-      lane = builder.CreateURem(builder.CreateUDiv(linear, width), height);
-      break;
-    default:
-      lane = builder.CreateUDiv(linear, builder.CreateMul(width, height));
-      break;
-    }
-  }
-  call.replaceAllUsesWith(lane);
+  call.replaceAllUsesWith(dispatchIndex(builder, component->getZExtValue()));
   call.eraseFromParent();
   return Error::success();
 }
@@ -1728,7 +1457,7 @@ Value *RaytracingLowerer::emitQueryTraversal(
     {query, origin, direction, t_min, t_max, structure, b.CreateAnd(mask, b.getInt32(255)), b.getInt32(0),
      triangle_cull, geometry_cull, opacity_cull, forced_opacity, b.getInt32(3), b.getInt32(-1), b.getInt32(-1),
      b.getInt32(0), b.getFalse(), accept_first});
-  storeCandidateWord(b, child, kRtCandidateEndSearch, b.getInt32(0));
+  storeCandidateField(b, child, kRtCandidateEndSearch, b.getInt32(0));
   Function *function = b.GetInsertBlock()->getParent();
   BasicBlock *test = BasicBlock::Create(c, "rt.query.next", function);
   BasicBlock *candidate = BasicBlock::Create(c, "rt.query.candidate", function);
@@ -1769,15 +1498,17 @@ Value *RaytracingLowerer::emitQueryTraversal(
     storeHitState(g, child, kRtHitGeometryIndex, geometry);
     storeHitState(g, child, kRtHitInstanceIndex, instance);
     storeHitState(g, child, kRtHitInstanceID, get(g, "get_candidate_user_instance_id", i32));
-    storeHitState(g, child, kRtHitObjectOrigin, get(g, "get_candidate_ray_origin", v3));
-    storeHitState(g, child, kRtHitObjectDirection, get(g, "get_candidate_ray_direction", v3));
-    Value *o2w = get(g, "get_candidate_object_to_world_transform", matrix);
-    Value *w2o = get(g, "get_candidate_world_to_object_transform", matrix);
-    for (unsigned col = 0; col < 4; ++col) {
-      storeHitState(g, child, kRtHitObjectToWorld + col * 12, g.CreateExtractValue(o2w, col));
-      storeHitState(g, child, kRtHitWorldToObject + col * 12, g.CreateExtractValue(w2o, col));
+    if (context.uses_object_space) {
+      storeHitState(g, child, kRtHitObjectOrigin, get(g, "get_candidate_ray_origin", v3));
+      storeHitState(g, child, kRtHitObjectDirection, get(g, "get_candidate_ray_direction", v3));
+      Value *o2w = get(g, "get_candidate_object_to_world_transform", matrix);
+      Value *w2o = get(g, "get_candidate_world_to_object_transform", matrix);
+      for (unsigned col = 0; col < 4; ++col) {
+        storeHitState(g, child, kRtHitObjectToWorld + col * 12, g.CreateExtractValue(o2w, col));
+        storeHitState(g, child, kRtHitWorldToObject + col * 12, g.CreateExtractValue(w2o, col));
+      }
     }
-    storeCandidateWord(g, child, kRtCandidateDecision, g.getInt32(kRtCandidateNone));
+    storeCandidateField(g, child, kRtCandidateDecision, g.getInt32(kRtCandidateNone));
   };
   // Constant member maps are per compilation, never shared mutable LLVM IR.
   auto member = [&](IRBuilder<> &g, const uint32_t *indices, StringRef name) -> Value * {
@@ -1805,11 +1536,13 @@ Value *RaytracingLowerer::emitQueryTraversal(
   };
   BasicBlock *triangle = BasicBlock::Create(c, "rt.query.triangle", function);
   BasicBlock *box = BasicBlock::Create(c, "rt.query.box", function);
-  BasicBlock *advance = BasicBlock::Create(c, "rt.query.advance", function);
+  auto abortQuery = [&](IRBuilder<> &g) {
+    g.CreateCall(intrinsic("abort", g.getVoidTy(), {qp}, true), {query});
+  };
   b.CreateCondBr(is_triangle, triangle, box);
   b.SetInsertPoint(triangle);
   Value *any_hit = member(b, context.hit_group_any_hits, "d3dalloy.rt.query.any_hits");
-  Value *accepted = emitGuardedValue(b, b.CreateICmpNE(any_hit, b.getInt32(kRtRecordIndexNone)), b.getTrue(),
+  Value *decision = emitGuardedValue(b, b.CreateICmpNE(any_hit, b.getInt32(kRtRecordIndexNone)), b.getInt32(kRtCandidateNone),
     "rt.query.anyhit", [&](IRBuilder<> &g) -> Value * {
       prepareCallback(g);
       Value *front = get(g, "is_candidate_triangle_front_facing", i1);
@@ -1818,40 +1551,38 @@ Value *RaytracingLowerer::emitQueryTraversal(
       storeHitState(g, child, kRtHitKind, g.CreateSelect(front, g.getInt32(0xfe), g.getInt32(0xff)));
       storeHitState(g, child, kRtHitFrontFace, g.CreateZExt(front, i32));
       storeHitState(g, child, kRtHitBarycentric, bary);
-      Value *attributes = g.CreateGEP(g.getInt8Ty(), bytePointerOf(g, child), g.getInt32(layout.candidate_attribute));
+      Value *attributes = g.CreateGEP(g.getInt8Ty(), rtBytePointer(g, child), g.getInt32(layout.candidate_attribute));
       g.CreateAlignedStore(bary, g.CreateBitCast(attributes, v2->getPointerTo()), Align(1));
       callVisibleFunction(g, child, any_hit, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
-      return g.CreateICmpNE(loadCandidateWord(g, child, kRtCandidateDecision), g.getInt32(kRtCandidateReject));
+      return loadCandidateWord(g, child, kRtCandidateDecision);
     });
-  emitConditional(b, accepted, "rt.query.commit.triangle", [&](IRBuilder<> &g) {
+  emitConditional(b, b.CreateICmpNE(decision, b.getInt32(kRtCandidateReject)), "rt.query.commit.triangle",
+    [&](IRBuilder<> &g) {
       g.CreateCall(intrinsic("commit_triangle_intersection", g.getVoidTy(), {qp}, true), {query});
+      emitConditional(g, g.CreateICmpEQ(decision, g.getInt32(kRtCandidateAcceptAndEndSearch)), "rt.query.end", abortQuery);
     });
-  b.CreateBr(advance);
+  b.CreateBr(test);
   b.SetInsertPoint(box);
   Value *intersection = member(b, context.hit_group_intersections, "d3dalloy.rt.query.intersections");
   emitConditional(b, b.CreateICmpNE(intersection, b.getInt32(kRtRecordIndexNone)), "rt.query.intersection", [&](IRBuilder<> &g) {
     prepareCallback(g);
     Value *boxOpaque = opacity ? g.CreateICmpEQ(opacity, g.getInt32(2)) :
                                 g.CreateNot(get(g, "is_candidate_non_opaque_bounding_box", i1));
-    storeCandidateWord(g, child, kRtCandidateSkipAnyHit, g.CreateZExt(boxOpaque, i32));
+    storeCandidateField(g, child, kRtCandidateSkipAnyHit, g.CreateZExt(boxOpaque, i32));
     Value *upper = get(g, "get_committed_distance", f32);
     storeHitState(g, child, kRtHitTCurrent, upper);
     storeCandidateField(g, child, kRtCandidateTMax, upper);
     storeCandidateField(g, child, kRtCandidateDistance, upper);
-    storeCandidateWord(g, child, kRtCandidateCommitted, g.getInt32(0));
+    storeCandidateField(g, child, kRtCandidateCommitted, g.getInt32(0));
     callVisibleFunction(g, child, intersection, loadFrameField(g, child, offsetof(SM50_RT_FRAME, Depth), i32));
     emitConditional(g, g.CreateICmpNE(loadCandidateWord(g, child, kRtCandidateCommitted), g.getInt32(0)),
       "rt.query.commit.box", [&](IRBuilder<> &inner) {
         inner.CreateCall(intrinsic("commit_bounding_box_intersection", inner.getVoidTy(), {qp, f32}, true),
           {query, inner.CreateBitCast(loadCandidateWord(inner, child, kRtCandidateDistance), f32)});
+        Value *ended = loadCandidateWord(inner, child, kRtCandidateEndSearch);
+        emitConditional(inner, inner.CreateICmpNE(ended, inner.getInt32(0)), "rt.query.end", abortQuery);
       });
   });
-  b.CreateBr(advance);
-  b.SetInsertPoint(advance);
-  emitConditional(b, b.CreateICmpNE(loadCandidateWord(b, child, kRtCandidateEndSearch), b.getInt32(0)),
-    "rt.query.abort", [&](IRBuilder<> &g) {
-      g.CreateCall(intrinsic("abort", g.getVoidTy(), {qp}, true), {query});
-    });
   b.CreateBr(test);
   b.SetInsertPoint(done);
   Value *committed_type = get(b, "get_committed_intersection_type", i32);
@@ -1876,11 +1607,13 @@ Value *RaytracingLowerer::emitQueryTraversal(
         [&](IRBuilder<> &inner) -> Value * { return get(inner, "is_committed_triangle_front_facing", i1); });
       out = g.CreateInsertValue(out, committed_bary, 7);
       out = g.CreateInsertValue(out, committed_front, 8);
-      Value *world_to_object = get(g, "get_committed_world_to_object_transform", matrix);
-      Value *object_to_world = get(g, "get_committed_object_to_world_transform", matrix);
-      for (unsigned col = 0; col < 4; ++col) {
-        out = g.CreateInsertValue(out, g.CreateExtractValue(world_to_object, col), 9 + col);
-        out = g.CreateInsertValue(out, g.CreateExtractValue(object_to_world, col), 13 + col);
+      if (deferred || context.uses_object_space) {
+        Value *world_to_object = get(g, "get_committed_world_to_object_transform", matrix);
+        Value *object_to_world = get(g, "get_committed_object_to_world_transform", matrix);
+        for (unsigned col = 0; col < 4; ++col) {
+          out = g.CreateInsertValue(out, g.CreateExtractValue(world_to_object, col), 9 + col);
+          out = g.CreateInsertValue(out, g.CreateExtractValue(object_to_world, col), 13 + col);
+        }
       }
       return out;
     });
@@ -1962,11 +1695,9 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
   }
   Value *ray_flags = call.getArgOperand(2);
   Value *instance_mask = call.getArgOperand(3);
-  Value *contribution = call.getArgOperand(4);
-  Value *geometry_multiplier = call.getArgOperand(5);
-  Value *miss_index = call.getArgOperand(6);
-  if (deferred)
-    miss_index = builder.CreateAnd(miss_index, builder.getInt32(0xffff));
+  Value *contribution = builder.CreateAnd(call.getArgOperand(4), builder.getInt32(0xf));
+  Value *geometry_multiplier = builder.CreateAnd(call.getArgOperand(5), builder.getInt32(0xf));
+  Value *miss_index = builder.CreateAnd(call.getArgOperand(6), builder.getInt32(0xffff));
 
   Value *origin = PoisonValue::get(f32x3);
   Value *direction = PoisonValue::get(f32x3);
@@ -1992,6 +1723,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
    * survive the erasure of the call that named it.
    */
   Value *payload_operand = call.getArgOperand(15);
+  if (auto error = validatePayload(payload_operand)) return error;
   /*
    * The shaders this trace runs are visible functions, so the state every stage of
    * the pipeline shares - the dispatch constants' address, the two function tables
@@ -2009,11 +1741,6 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
     storeFrameField(
       builder, child, offsetof(SM50_RT_FRAME, ContributionArray), contributions
     );
-  /*
-   * Carry the complete invocation block, including the frame read by callbacks.
-   * Visible shader calls still receive the user payload within this block.
-   */
-
   /* D3D12 ray flags -> traversal configuration. */
   Value *forced_opacity = flagField(builder, ray_flags, 0);
   Value *triangle_cull = triangleCullMode(builder, ray_flags);
@@ -2042,6 +1769,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
       (constant_flags->getZExtValue() & (kRayFlagForceOpaque | kRayFlagForceNonOpaque)) == kRayFlagForceOpaque &&
       ((constant_flags->getZExtValue() | context.pipeline_flags) & kRayFlagSkipProcedural);
   const bool query_traversal = (context.pipeline_flags & 0x400) || (context.query_callbacks && !opaque_triangles);
+  const bool callback_free = opaque_triangles && !query_traversal;
   bool skip_closest_hit = false;
   const bool skip_is_constant = constantFlag(ray_flags, kRayFlagSkipClosestHitShader, skip_closest_hit);
   Value *skip_value = nullptr;
@@ -2087,42 +1815,26 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
    * interval, which RayTCurrent does not carry until the traversal is over. The
    * decision word is cleared so a stale decision cannot be mistaken for this one's.
    */
-  storeCandidateWord(builder, child, kRtCandidateDecision, builder.getInt32(kRtCandidateNone));
-  storeCandidateWord(builder, child, kRtCandidateEndSearch, builder.getInt32(0));
-  storeCandidateWord(builder, child, kRtCandidateCommitted, builder.getInt32(0));
-  storeCandidateField(builder, child, kRtCandidateDistance, t_max);
-  storeCandidateWord(builder, child, kRtCandidateHitGroupBase, contribution);
-  storeCandidateWord(builder, child, kRtCandidateGeometryMultiplier, geometry_multiplier);
-  /*
-   * The active ray's interval is two floats (RtCandidateControl::TMin / TMax), so
-   * those two fields are stored with the value's own type: a dword store would name
-   * an i32 pointer for a float value, which is not a store this IR defines.
-   */
-  storeCandidateField(builder, child, kRtCandidateTMin, t_min);
-  storeCandidateField(builder, child, kRtCandidateTMax, t_max);
+  if (!callback_free) {
+    storeCandidateField(builder, child, kRtCandidateDecision, builder.getInt32(kRtCandidateNone));
+    storeCandidateField(builder, child, kRtCandidateEndSearch, builder.getInt32(0));
+    storeCandidateField(builder, child, kRtCandidateCommitted, builder.getInt32(0));
+    storeCandidateField(builder, child, kRtCandidateDistance, t_max);
+    storeCandidateField(builder, child, kRtCandidateHitGroupBase, contribution);
+    storeCandidateField(builder, child, kRtCandidateGeometryMultiplier, geometry_multiplier);
+    storeCandidateField(builder, child, kRtCandidateTMin, t_min);
+    storeCandidateField(builder, child, kRtCandidateTMax, t_max);
+  }
 
   /* Depth the shaders this trace runs will observe. D3D12's limit is exclusive: the
    * ray generation shader is depth 0 and a trace is legal while the shaders it runs
-   * are at most MaxTraceRecursionDepth, so the bound is on the *next* depth. The
-   * limit is read from the dispatch constants, which the runtime fills from the
-   * pipeline actually being dispatched; a limit of 0 therefore forbids tracing
-   * entirely, exactly as D3D12 does. The compile-time value is only the fallback for
-   * a module whose dispatch block is not bound. */
+   * are at most MaxTraceRecursionDepth, so the bound is on the *next* depth. A configured limit of zero therefore forbids tracing entirely. */
   Value *depth = entry.depth;
   if (!depth || !depth->getType()->isIntegerTy(32))
     depth = builder.getInt32(0);
   Value *next_depth = builder.CreateAdd(depth, builder.getInt32(1));
-  Value *limit = loadDispatchField(builder, kRtRecursionDepth, u32);
-  if (!limit)
-    limit = builder.getInt32(context.max_recursion_depth);
-  Value *within_depth = builder.CreateICmpULE(next_depth, limit);
+  Value *within_depth = builder.CreateICmpULE(next_depth, builder.getInt32(context.max_recursion_depth));
   storeFrameWord(builder, child, offsetof(SM50_RT_FRAME, Depth), next_depth);
-  storeFrameWord(
-    builder, child, offsetof(SM50_RT_FRAME, Flags),
-    builder.CreateSelect(
-      within_depth, builder.getInt32(0), builder.getInt32(kRtFrameFlagRecursionExceeded)
-    )
-  );
 
   /*
    * The traversal cannot be skipped by a select: issuing it would run shaders the
@@ -2146,11 +1858,18 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
         return emitQueryTraversal(tb, child, acceleration_structure, origin, direction, t_min, t_max,
                                   ray_flags, instance_mask, triangle_cull, geometry_cull, opacity_cull, forced_opacity,
                                   deferred);
+      // The Metal intersector overload without callbacks carries zero ray-data bytes.
+      // Miss and closest-hit still use the caller's private continuation block.
+      Value *table = callback_free
+          ? tb.CreateCall(declareRtIntrinsic(module, "air.get_null_intersection_function_table",
+                FunctionType::get(intersectionFunctionTableType(llvm_context), {}, false), false))
+          : intersectionFunctionTable(tb);
       return tb.CreateCall(
       traversal,
       {origin, direction, t_min, t_max,
-       acceleration_structure, instance_mask, intersectionFunctionTable(tb),
-       bytePointerOf(tb, child), tb.getInt64(layout.block_size),
+       acceleration_structure, instance_mask, table,
+       callback_free ? ConstantPointerNull::get(tb.getInt8PtrTy()) : rtBytePointer(tb, child),
+       tb.getInt64(callback_free ? 0 : layout.block_size),
        /* triangle_front_facing_winding: D3D12's default, reversed per instance by
         * D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE, which the
         * runtime carries in the Metal instance options. */
@@ -2189,7 +1908,8 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
     // Only the selected continuation reads an SBT record. A skipped closest-hit
     // keeps any-hit payload writes, but needs no final hit state or hit-table lookup.
     auto runContinuation = [&](IRBuilder<> &g, Value *record, Value *local_entry) {
-      storeFrameWord(g, child, offsetof(SM50_RT_FRAME, RecordIndex), record);
+      if (deferred)
+        storeFrameWord(g, child, layout.block_size + 8, record);
       storeFrameField(g, child, offsetof(SM50_RT_FRAME, LocalRootEntry), local_entry);
       if (!deferred)
         emitConditional(g, g.CreateICmpNE(record, g.getInt32(kRtRecordIndexNone)), "rt.run",
@@ -2215,7 +1935,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
       // The native result has no procedural HitKind; the winning ReportHit owns it.
       Value *triangle_kind = g.CreateSelect(front_facing, g.getInt32(kHitKindTriangleFrontFace),
                                            g.getInt32(kHitKindTriangleBackFace));
-      Value *kind = emitGuardedValue(g, g.CreateNot(is_triangle), triangle_kind, "rt.procedural.kind",
+      Value *kind = callback_free ? triangle_kind : emitGuardedValue(g, g.CreateNot(is_triangle), triangle_kind, "rt.procedural.kind",
                                     [&](IRBuilder<> &inner) -> Value * {
         return loadCandidateWord(inner, child, kRtCandidateHitKind);
       });
@@ -2224,31 +1944,33 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
       storeHitState(g, child, kRtHitFrontFace, g.CreateZExt(front_facing, g.getInt32Ty()));
       if (deferred && layout.attribute_size >= 8)
         emitConditional(g, is_triangle, "rt.hitobject.barycentrics", [&](IRBuilder<> &inner) {
-          Value *attributes = inner.CreateGEP(inner.getInt8Ty(), bytePointerOf(inner, child),
+          Value *attributes = inner.CreateGEP(inner.getInt8Ty(), rtBytePointer(inner, child),
                                               inner.getInt32(layout.attribute));
           inner.CreateAlignedStore(barycentrics,
             inner.CreateBitCast(attributes, barycentrics->getType()->getPointerTo()), Align(1));
         });
       // Misses and ordinary skip-closest-hit rays never publish these 120 bytes.
-      Value *object_origin = nullptr, *object_direction = nullptr;
-      for (unsigned column = 0; column < 4; ++column) {
-        Value *w2o = g.CreateExtractValue(result, 9 + column);
-        Value *o2w = g.CreateExtractValue(result, 13 + column);
-        storeHitState(g, child, kRtHitObjectToWorld + column * 12, o2w);
-        storeHitState(g, child, kRtHitWorldToObject + column * 12, w2o);
-        if (column < 3) {
-          Value *origin_term = g.CreateFMul(w2o,
-            g.CreateVectorSplat(3, g.CreateExtractElement(origin, uint64_t(column))));
-          Value *direction_term = g.CreateFMul(w2o,
-            g.CreateVectorSplat(3, g.CreateExtractElement(direction, uint64_t(column))));
-          object_origin = object_origin ? g.CreateFAdd(object_origin, origin_term) : origin_term;
-          object_direction = object_direction ? g.CreateFAdd(object_direction, direction_term) : direction_term;
-        } else {
-          object_origin = g.CreateFAdd(object_origin, w2o);
+      if (deferred || context.uses_object_space) {
+        Value *object_origin = nullptr, *object_direction = nullptr;
+        for (unsigned column = 0; column < 4; ++column) {
+          Value *w2o = g.CreateExtractValue(result, 9 + column);
+          Value *o2w = g.CreateExtractValue(result, 13 + column);
+          storeHitState(g, child, kRtHitObjectToWorld + column * 12, o2w);
+          storeHitState(g, child, kRtHitWorldToObject + column * 12, w2o);
+          if (column < 3) {
+            Value *origin_term = g.CreateFMul(w2o,
+              g.CreateVectorSplat(3, g.CreateExtractElement(origin, uint64_t(column))));
+            Value *direction_term = g.CreateFMul(w2o,
+              g.CreateVectorSplat(3, g.CreateExtractElement(direction, uint64_t(column))));
+            object_origin = object_origin ? g.CreateFAdd(object_origin, origin_term) : origin_term;
+            object_direction = object_direction ? g.CreateFAdd(object_direction, direction_term) : direction_term;
+          } else {
+            object_origin = g.CreateFAdd(object_origin, w2o);
+          }
         }
+        storeHitState(g, child, kRtHitObjectOrigin, object_origin);
+        storeHitState(g, child, kRtHitObjectDirection, object_direction);
       }
-      storeHitState(g, child, kRtHitObjectOrigin, object_origin);
-      storeHitState(g, child, kRtHitObjectDirection, object_direction);
 
       Value *instance_contribution = loadInstanceContribution(g, child, instance_index);
       Value *hit_group_index = g.CreateAdd(
@@ -2311,7 +2033,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
     }
     if (deferred) {
       storeFrameField(b, child, layout.block_size, b.getInt32(2));
-      storeFrameField(b, child, layout.block_size + 4, b.CreateAnd(miss_index, b.getInt32(0xffff)));
+      storeFrameField(b, child, layout.block_size + 4, miss_index);
     }
     runContinuation(b, miss_lookup.export_index, miss_lookup.local_entry);
     b.CreateBr(join);
@@ -2342,7 +2064,7 @@ Error RaytracingLowerer::lowerTraceRay(CallInst &call, IRBuilder<> &builder, boo
 
   if (!deferred) {
     IRBuilder<> resume(&*tail->getFirstInsertionPt());
-    resume.CreateLifetimeEnd(child, resume.getInt64(blockSize()));
+    resume.CreateLifetimeEnd(child, resume.getInt64(layout.block_size));
   }
   return failure;
 }
@@ -2360,6 +2082,7 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
    * the caller observes. It borrows child scratch for that call.
    */
   Value *child = beginChildInvocation(builder);
+  if (auto error = validatePayload(call.getArgOperand(2))) return error;
   Value *callable_index = call.getArgOperand(1);
   RtShaderRecord callable;
   if (!shaderRecord(builder, RtShaderTable::Callable, callable_index, callable))
@@ -2391,7 +2114,7 @@ Error RaytracingLowerer::lowerCallShader(CallInst &call, IRBuilder<> &builder) {
       copyPayloadBack(inner, child, call.getArgOperand(2), false);
     }
   );
-  builder.CreateLifetimeEnd(child, builder.getInt64(blockSize()));
+  builder.CreateLifetimeEnd(child, builder.getInt64(layout.block_size));
   call.eraseFromParent();
   return Error::success();
 }
@@ -2411,7 +2134,8 @@ Error RaytracingLowerer::lowerCreateHandleForLib(CallInst &call, IRBuilder<> &bu
    * resolves to a native structure. A shader may therefore name several structures
    * and select one dynamically.
    */
-  const ResourceBinding *declaration = accelerationStructureOf(call);
+  SmallVector<GEPOperator *, 2> indices;
+  const ResourceBinding *declaration = accelerationStructureOf(call, indices);
   if (!declaration)
     return Error::success();
 
@@ -2423,7 +2147,26 @@ Error RaytracingLowerer::lowerCreateHandleForLib(CallInst &call, IRBuilder<> &bu
    * declaration the export's root signature does not bind is a shader the runtime
    * cannot have dispatched, so it is reported rather than bound to something else.
    */
-  Value *address = accelerationStructureAddress(*declaration, builder);
+  // GEP indexes address resource objects, not bytes in the descriptor heap.
+  // Flatten arrays to descriptor slots; constant-expression GEPs use the same path.
+  Value *index = builder.getInt32(declaration->lower_bound);
+  for (const auto *gep : indices) {
+    Type *element = gep->getSourceElementType();
+    for (auto i = gep->idx_begin(); i != gep->idx_end(); ++i) {
+      if (i != gep->idx_begin()) {
+        auto *array = dyn_cast<ArrayType>(element);
+        if (!array)
+          return createError("dxil: invalid acceleration structure array access");
+        element = array->getElementType();
+      }
+      uint32_t stride = 1;
+      for (auto *array = dyn_cast<ArrayType>(element); array; array = dyn_cast<ArrayType>(array->getElementType()))
+        stride *= array->getNumElements();
+      Value *offset = builder.CreateZExtOrTrunc(i->get(), builder.getInt32Ty());
+      index = builder.CreateAdd(index, builder.CreateMul(offset, builder.getInt32(stride)));
+    }
+  }
+  Value *address = accelerationStructureAddress(*declaration, index, builder);
   if (!address)
     return createError(
       "dxil: the acceleration structure '" + declaration->name +
@@ -2490,23 +2233,25 @@ Error RaytracingLowerer::lowerCreateHandleForLib(CallInst &call, IRBuilder<> &bu
 Value *RaytracingLowerer::allocateHitObject(IRBuilder<> &b) {
   BasicBlock &function_entry = b.GetInsertBlock()->getParent()->getEntryBlock();
   IRBuilder<> entry_builder(&function_entry, function_entry.getFirstInsertionPt());
-  auto *storage = entry_builder.CreateAlloca(ArrayType::get(b.getInt8Ty(), layout.block_size + 8), nullptr, "rt.hitobject");
+  auto *storage = entry_builder.CreateAlloca(ArrayType::get(b.getInt8Ty(), layout.block_size + 12), nullptr, "rt.hitobject");
   storage->setAlignment(Align(16));
-  b.CreateMemSet(bytePointerOf(b, storage), b.getInt8(0), layout.block_size + 8, Align(16));
-  storeFrameWord(b, storage, offsetof(SM50_RT_FRAME, RecordIndex), b.getInt32(kRtRecordIndexNone));
+  b.CreateMemSet(rtBytePointer(b, storage), b.getInt8(0), layout.block_size + 12, Align(16));
+  storeFrameWord(b, storage, layout.block_size + 8, b.getInt32(kRtRecordIndexNone));
   return storage;
 }
 
 // The DXIL opaque carrier becomes a true value. In particular a loop can retain a
 // hit from an earlier traversal without aliasing the next traversal's workspace.
-// Payload and candidate scratch are not part of a HitObject snapshot.
+// Payload and candidate scratch are not part of a HitObject snapshot. Its
+// trailing words hold kind, table index and resolved export; ordinary traces
+// call the resolved export directly and do not need to carry those words.
 Value *RaytracingLowerer::hitObjectValue(IRBuilder<> &b, Value *block, Type *type) {
   auto *carrier = cast<StructType>(type);
-  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4};
+  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4, layout.block_size + 8};
   Value *value = PoisonValue::get(type);
-  for (unsigned i = 0; i < 5; ++i) {
+  for (unsigned i = 0; i < std::size(offsets); ++i) {
     Type *field = carrier->getElementType(i);
-    Value *ptr = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(offsets[i]));
+    Value *ptr = b.CreateGEP(b.getInt8Ty(), rtBytePointer(b, block), b.getInt32(offsets[i]));
     value = b.CreateInsertValue(value, b.CreateAlignedLoad(field, b.CreateBitCast(ptr, field->getPointerTo()), Align(1)), i);
   }
   return value;
@@ -2514,10 +2259,10 @@ Value *RaytracingLowerer::hitObjectValue(IRBuilder<> &b, Value *block, Type *typ
 
 Value *RaytracingLowerer::hitObjectBlock(IRBuilder<> &b, Value *object) {
   Value *block = allocateHitObject(b);
-  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4};
-  for (unsigned i = 0; i < 5; ++i) {
+  const uint32_t offsets[] = {0, layout.hit_state, layout.attribute, layout.block_size, layout.block_size + 4, layout.block_size + 8};
+  for (unsigned i = 0; i < std::size(offsets); ++i) {
     Value *field = b.CreateExtractValue(object, i);
-    Value *ptr = b.CreateGEP(b.getInt8Ty(), bytePointerOf(b, block), b.getInt32(offsets[i]));
+    Value *ptr = b.CreateGEP(b.getInt8Ty(), rtBytePointer(b, block), b.getInt32(offsets[i]));
     b.CreateAlignedStore(field, b.CreateBitCast(ptr, field->getType()->getPointerTo()), Align(1));
   }
   return block;
@@ -2557,7 +2302,7 @@ Error RaytracingLowerer::bindHitObject(IRBuilder<> &b, Value *block, Value *inde
     }
     Value *record = g.CreateSelect(hit, hitContinuation(g, hg.export_index), miss.export_index);
     storeFrameField(g, block, layout.block_size + 4, selected);
-    storeFrameWord(g, block, offsetof(SM50_RT_FRAME, RecordIndex), record);
+    storeFrameWord(g, block, layout.block_size + 8, record);
     storeFrameField(g, block, offsetof(SM50_RT_FRAME, LocalRootEntry), g.CreateSelect(hit, hg.local_entry, miss.local_entry));
   });
   return failure;
@@ -2595,10 +2340,10 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
         call.getArgOperand(3)->getType()->getPointerElementType()) : 0;
       if (attribute_bytes > layout.attribute_size)
         return createError("dxil: FromRayQuery attribute type exceeds configured size");
-      SmallVector<Value *, 10> args = {b.getInt32(opcode), call.getArgOperand(1), bytePointerOf(b, block),
+      SmallVector<Value *, 10> args = {b.getInt32(opcode), call.getArgOperand(1), rtBytePointer(b, block),
         b.getInt32(layout.hit_state), b.getInt32(layout.attribute), b.getInt32(layout.block_size),
         b.getInt32(layout.attribute_size), opcode == 264 ? call.getArgOperand(2) : b.getInt32(0),
-        opcode == 264 ? bytePointerOf(b, call.getArgOperand(3)) : ConstantPointerNull::get(b.getInt8PtrTy()),
+        opcode == 264 ? rtBytePointer(b, call.getArgOperand(3)) : ConstantPointerNull::get(b.getInt8PtrTy()),
         b.getInt32(attribute_bytes)};
       SmallVector<Type *, 10> types;
       for (Value *arg : args)
@@ -2616,20 +2361,16 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
       if (call.arg_size() != 3)
         return createError("dxil: HitObject Invoke expects object and payload");
       Value *payload = call.getArgOperand(2);
+      if (auto error = validatePayload(payload)) return error;
       Value *depth = b.CreateAdd(entry.depth ? entry.depth : b.getInt32(0), b.getInt32(1));
-      Value *limit = loadDispatchField(b, kRtRecursionDepth, b.getInt32Ty());
-      if (!limit)
-        limit = b.getInt32(context.max_recursion_depth);
-      Value *record = loadFrameField(b, block, offsetof(SM50_RT_FRAME, RecordIndex), b.getInt32Ty());
-      Value *within_depth = b.CreateICmpULE(depth, limit);
+      Value *record = loadFrameField(b, block, layout.block_size + 8, b.getInt32Ty());
+      Value *within_depth = b.CreateICmpULE(depth, b.getInt32(context.max_recursion_depth));
       Value *flags = readHitState(b, block, kRtHitRayFlags, b.getInt32Ty());
       Value *skip = b.CreateAnd(b.CreateICmpEQ(type, b.getInt32(1)),
         b.CreateICmpNE(b.CreateAnd(flags, b.getInt32(kRayFlagSkipClosestHitShader)), b.getInt32(0)));
       Value *allowed = b.CreateAnd(within_depth,
         b.CreateAnd(b.CreateICmpNE(record, b.getInt32(kRtRecordIndexNone)), b.CreateNot(skip)));
       storeFrameWord(b, block, offsetof(SM50_RT_FRAME, Depth), depth);
-      storeFrameWord(b, block, offsetof(SM50_RT_FRAME, Flags), b.CreateSelect(within_depth,
-        b.getInt32(0), b.getInt32(kRtFrameFlagRecursionExceeded)));
       emitConditional(b, allowed, "rt.hitobject.invoke", [&](IRBuilder<> &g) {
         copyPayloadInto(g, block, payload);
         callVisibleFunction(g, block, record, depth);
@@ -2657,7 +2398,7 @@ Error RaytracingLowerer::lowerHitObject(CallInst &call, uint32_t opcode, IRBuild
         return createError("dxil: HitObject attribute type exceeds configured attribute size");
       Value *value = emitGuardedValue(b, b.CreateICmpEQ(type, b.getInt32(1)),
         Constant::getNullValue(attributes), "rt.hitobject.attributes", [&](IRBuilder<> &g) -> Value * {
-          Value *source = g.CreateGEP(g.getInt8Ty(), bytePointerOf(g, block), g.getInt32(layout.attribute));
+          Value *source = g.CreateGEP(g.getInt8Ty(), rtBytePointer(g, block), g.getInt32(layout.attribute));
           return g.CreateAlignedLoad(attributes, g.CreateBitCast(source, attributes->getPointerTo()), Align(1));
         });
       b.CreateAlignedStore(value, call.getArgOperand(2), Align(1));
@@ -2785,7 +2526,7 @@ Error RaytracingLowerer::run() {
     auto *snapshot = StructType::get(module.getContext(), {ArrayType::get(Type::getInt8Ty(module.getContext()), layout.frame_size),
       ArrayType::get(Type::getInt8Ty(module.getContext()), sizeof(SM50_RT_HIT_STATE)),
       ArrayType::get(Type::getInt8Ty(module.getContext()), layout.attribute_size),
-      Type::getInt32Ty(module.getContext()), Type::getInt32Ty(module.getContext())});
+      Type::getInt32Ty(module.getContext()), Type::getInt32Ty(module.getContext()), Type::getInt32Ty(module.getContext())});
     class HitObjectTypes final : public ValueMapTypeRemapper {
       DenseMap<Type *, Type *> mapped;
     public:
@@ -3005,13 +2746,6 @@ llvm::Error ResolveRaytracingEntryArguments(
     return nullptr;
   };
 
-  /*
-   * The dispatch constants are declared as `air.buffer` with arg_name "dispatch"
-   * (InputRaytracingDispatchArguments). They are NOT `air.indirect_buffer`: that kind
-   * belongs to the root-signature argument `setup_binding_rootsig` declares, which a
-   * raytracing export also carries, so matching it would hand the pass the root
-   * signature where it expects HitGroupRecordIndexBase / RecursionDepth.
-   */
   out.dispatch_arguments = match("air.buffer", "dispatch");
   /*
    * The two entries every root-signature shader of a dispatch shares, and only the

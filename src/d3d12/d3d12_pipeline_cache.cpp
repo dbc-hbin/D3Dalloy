@@ -300,17 +300,36 @@ public:
     for (uint32_t i = 0; i < v->user_count; ++i)
       add(v->users[i].hash, v->users[i].offset_dwords, v->users[i].size_bytes, v->users[i].flags);
   }
-  bool arguments(const SM50_SHADER_COMPILATION_ARGUMENT_DATA *arg) {
+  bool arguments(const SM50_SHADER_COMPILATION_ARGUMENT_DATA *arg, bool root_independent,
+                 std::span<const uint32_t> vertex_table_key) {
     bool sample_mask_constant = false;
-    for (auto *it = arg; it; it = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(it->next))
+    for (auto *it = arg; it; it = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(it->next)) {
       sample_mask_constant |= it->type == SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT;
+      if (it->type != SM50_SHADER_ROOT_SIGNATURE && it->type != SM50_SHADER_IA_INPUT_LAYOUT &&
+          it->type != SM50_SHADER_COMMON)
+        vertex_table_key = {};
+      // A direct statistics VS captures outputs to a fixed buffer. Key the full capture layout below.
+      if (it->type == SM50_SHADER_D3D12_PIPELINE_STATS ||
+          (it->type == SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE && it->next &&
+           static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(it->next)->type == SM50_SHADER_D3D12_PIPELINE_STATS))
+        continue;
+      // Indirect view routing and linked stages can synthesize root reads.
+      if (it->type != SM50_SHADER_COMMON && it->type != SM50_SHADER_ROOT_SIGNATURE &&
+          it->type != SM50_SHADER_IA_INPUT_LAYOUT && it->type != SM50_SHADER_PSO_PIXEL_SHADER &&
+          it->type != SM50_SHADER_D3D12_SAMPLE_MASK_CONSTANT)
+        root_independent = false;
+    }
     for (; arg; arg = static_cast<const SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(arg->next)) {
       add(arg->type);
       switch (arg->type) {
       case SM50_SHADER_ROOT_SIGNATURE:
       case SM50_SHADER_ROOT_SIGNATURE2: {
         const auto &v = *reinterpret_cast<const SM50_SHADER_ROOT_SIGNATURE_DATA *>(arg);
-        bytes(v.bytecode, v.bytecode_length);
+        if (root_independent) add(UINT64_MAX);
+        else if (!vertex_table_key.empty()) {
+          add(UINT64_MAX - 1);
+          bytes(vertex_table_key.data(), vertex_table_key.size_bytes());
+        } else bytes(v.bytecode, v.bytecode_length);
         break;
       }
       case SM50_SHADER_COMMON: {
@@ -694,13 +713,19 @@ int DeviceShaderArtifactCache::CompileRaytracing(const SM50_RT_PIPELINE_DESC &de
     SM50_COMPILED_BITCODE &code, std::vector<SM50_RT_FUNCTION_INFO> &functions, uint32_t &count,
     sm50_error_t *error, std::shared_ptr<const RaytracingArtifact> &artifact, bool bypass) {
   artifact.reset();
-  auto compile = [&] { return SM50CompileRaytracingPipeline(&desc, output, &code, functions.data(), functions.size(), &count, error); };
+  SM50ShaderBitcode reusable;
+  auto compile = [&] {
+    int result = SM50CompileRaytracingPipeline(&desc, output, &code, functions.data(), functions.size(), &count, error);
+    if (desc.Incremental) *(&reusable) = std::exchange(desc.Incremental->Result, sm50_bitcode_t{});
+    return result;
+  };
   if (bypass) return compile();
   int result = 1; bool compiled = false;
   try {
     StageKeyBuilder key;
     key.add(uint32_t(AIRCONV_VERSION), desc.MetalVersion, desc.MaxRecursionDepth, desc.MaxPayloadSize,
-            desc.MaxAttributeSize, desc.Flags, desc.LibraryCount, desc.ExportCount, desc.LinkExportCount);
+            desc.MaxAttributeSize, desc.Flags, desc.LibraryCount, desc.ExportCount, desc.LinkExportCount,
+            bool(desc.Incremental));
     key.bytes(desc.GlobalRootSignature, desc.GlobalRootSignatureSize);
     for (uint32_t i = 0; i < desc.LibraryCount; ++i) key.bytes(desc.Libraries[i].Bytecode, desc.Libraries[i].Size);
     for (uint32_t i = 0; i < desc.ExportCount; ++i) {
@@ -715,22 +740,32 @@ int DeviceShaderArtifactCache::CompileRaytracing(const SM50_RT_PIPELINE_DESC &de
       compiled = true;
       if (!(result = compile()) || !count || count > functions.size()) return {};
       auto value = std::make_shared<RaytracingArtifact>();
+      if (desc.Incremental) {
+        *(&value->reusable_exports) = std::exchange(*(&reusable), sm50_bitcode_t{});
+        value->reusable_bytes = desc.Incremental->RetainedBytes;
+      }
       if (!CopyCompiledArtifact(*output, code, *value)) return {};
       value->names.resize(count); value->export_names.resize(count);
       value->functions.assign(functions.begin(), functions.begin() + count);
       const uintptr_t begin = reinterpret_cast<uintptr_t>(desc.FunctionNames);
-      const auto copy_name = [&](const char *name, std::string &target, bool required) {
-        if (!name) return !required;
+      const auto copy_name = [&](const char *name, std::string &target) {
+        if (!name) return false;
         const uintptr_t address = reinterpret_cast<uintptr_t>(name);
         if (address < begin || address - begin >= desc.FunctionNamesSize) return false;
         const size_t remaining = desc.FunctionNamesSize - (address - begin);
         const char *end = static_cast<const char *>(memchr(name, 0, remaining));
-        if (!end || (required && end == name)) return false;
+        if (!end || end == name) return false;
         target.assign(name, end); return true;
       };
       for (uint32_t i = 0; i < count; ++i) {
         auto &entry = value->functions[i];
-        if (!copy_name(entry.Name, value->names[i], true) || !copy_name(entry.ExportName, value->export_names[i], false)) return {};
+        if (!copy_name(entry.Name, value->names[i])) return {};
+        if (entry.ExportName) {
+          // ExportName points into the input description, while Name uses FunctionNames.
+          if (entry.ExportIndex >= desc.ExportCount || entry.ExportName != desc.Exports[entry.ExportIndex].EntryPoint)
+            return {};
+          value->export_names[i] = entry.ExportName;
+        }
         entry.Name = value->names[i].c_str();
         entry.ExportName = entry.ExportName ? value->export_names[i].c_str() : nullptr;
       }
@@ -812,7 +847,8 @@ int DeviceShaderArtifactCache::InitializeCompiler(
 
 int PipelineCache::Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3D12_SHADER_BYTECODE source,
                            sm50_shader_t shader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-                           const char *name, sm50_error_t *error) {
+                           const char *name, sm50_error_t *error, ID3D12RootSignature *root,
+                           const MTL_SHADER_REFLECTION &reflection) {
   if (loaded()) return 0;
   auto lower = [&](sm50_bitcode_t *out, sm50_error_t *err) {
     SM50Shader local;
@@ -822,15 +858,20 @@ int PipelineCache::Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3
     }
     return SM50Compile(shader, args, name, out, err);
   };
+  const auto *signature = static_cast<MTLD3D12RootSignature *>(root);
   return artifacts.Compile("ordinary", {source}, args, name, output(stage), error, stage_artifacts_[stage],
-                           std::ref(lower), &stage_keys_[stage]);
+                           std::ref(lower), &stage_keys_[stage],
+                           reflection.RootArgumentsUnused && signature && !signature->IsLocal,
+                           stage == Vertex && signature ? std::span<const uint32_t>(signature->vertex_table_key)
+                                                       : std::span<const uint32_t>{});
 }
 
 int DeviceShaderArtifactCache::Compile(
     const char *family, std::initializer_list<D3D12_SHADER_BYTECODE> sources,
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *output,
     sm50_error_t *error, std::shared_ptr<const ShaderStageArtifact> &artifact,
-    const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &lower, Sha1Digest *stage_key) {
+    const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &lower, Sha1Digest *stage_key,
+    bool root_independent, std::span<const uint32_t> vertex_table_key) {
   int result = 0;
   StageKeyBuilder key;
   auto compile = [&] {
@@ -843,7 +884,7 @@ int DeviceShaderArtifactCache::Compile(
     key.bytes(family, strlen(family));
     for (const auto &source : sources) key.bytes(source.pShaderBytecode, source.BytecodeLength);
     key.bytes(name, strlen(name));
-    if (!key.arguments(args)) return compile();
+    if (!key.arguments(args, root_independent, vertex_table_key)) return compile();
     if (stage_key) *stage_key = key.key.digest();
     artifact = impl_->stages.Get(key.key, "air_compile", [&]() -> std::shared_ptr<const ShaderStageArtifact> {
       if ((result = compile())) {
@@ -857,20 +898,8 @@ int DeviceShaderArtifactCache::Compile(
       SM50_COMPILED_BITCODE code{};
       SM50GetCompiledBitcode(*output, &code);
       auto value = std::make_shared<ShaderStageArtifact>();
-      value->library.resize(code.Size);
-      value->constants.resize((code.ConstantDataSize + 7) / 8);
-      value->relocations.resize(code.ConstantRelocationCount);
-      if (!SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_LIBRARY, code.Data,
-                                  value->library.data(), code.Size) ||
-          !SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_CONSTANTS, code.ConstantData,
-                                  value->constants.data(), code.ConstantDataSize) ||
-          !SM50ReadCompiledBitcode(*output, SM50_COMPILED_BITCODE_PART_RELOCATIONS, code.ConstantRelocations,
-                                  value->relocations.data(), code.ConstantRelocationCount * sizeof(SM50_CONSTANT_RELOCATION)))
+      if (!CopyCompiledArtifact(*output, code, *value))
         return {}; // The producer can still consume its compiler-owned output.
-      value->view = code;
-      value->view.Data = value->library.data();
-      value->view.ConstantData = code.ConstantDataSize ? value->constants.data() : nullptr;
-      value->view.ConstantRelocations = code.ConstantRelocationCount ? value->relocations.data() : nullptr;
       for (const auto &[data, size] : key.outputs) {
         const auto *bytes = static_cast<const uint8_t *>(data);
         value->metadata.insert(value->metadata.end(), bytes, bytes + size);
@@ -939,17 +968,38 @@ void PublishAutomaticStageArtifact(const std::string &key,
   if (allowed) WriteAutomaticStageArtifact(key, *artifact);
 }
 
-int DeviceShaderArtifactCache::CompileShader(
-    D3D12_SHADER_BYTECODE source, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-    const char *name, sm50_bitcode_t *output, sm50_error_t *error,
-    std::shared_ptr<const ShaderStageArtifact> &artifact) {
+WMT::Reference<WMT4::Function> CompilePipelineVariant(
+    MTLD3D12Device *device, const SharedShaderBytecode &shader, const SharedShaderBytecode &explicit_root,
+    const char *name, void *next, ShaderImmutableConstants &constants, bool root_independent) {
+  auto &cache = device->GetShaderArtifactCache();
+  const auto &root_blob = explicit_root.empty() ? shader : explicit_root;
+  SM50_SHADER_ROOT_SIGNATURE_DATA root{next, SM50_SHADER_ROOT_SIGNATURE, root_blob.data(), root_blob.size()};
+  auto *args = reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root);
+  D3D12_SHADER_BYTECODE source{shader.data(), shader.size()};
   auto lower = [&](sm50_bitcode_t *out, sm50_error_t *err) {
-    SM50Shader shader;
-    if (int result = InitializeCompiler(source, &shader, err))
+    SM50Shader input;
+    if (int result = cache.InitializeCompiler(source, &input, err))
       return result;
-    return SM50Compile(shader, args, name, out, err);
+    return SM50Compile(input, args, name, out, err);
   };
-  return Compile("ordinary", {source}, args, name, output, error, artifact, std::ref(lower));
+  SM50ShaderBitcode compiled;
+  SM50Error compile_error;
+  std::shared_ptr<const ShaderStageArtifact> artifact;
+  if (cache.Compile("ordinary", {source}, args, name, &compiled, &compile_error, artifact, std::ref(lower),
+                    nullptr, root_independent)) {
+    ERR("Failed to compile pipeline variant ", name, ": ", SM50GetErrorMessageString(compile_error));
+    return {};
+  }
+  SM50_COMPILED_BITCODE code{};
+  if (artifact)
+    code = artifact->view;
+  else
+    SM50GetCompiledBitcode(compiled, &code);
+  if (FAILED(constants.Initialize(device, code, compiled, true)))
+    return {};
+  WMT::Reference<WMT::Error> error;
+  auto library = cache.Library(device->GetMetal4Compiler(), code, compiled, error);
+  return library ? cache.Function(library, name) : WMT::Reference<WMT4::Function>{};
 }
 
 WMT::Reference<WMT4::Library> DeviceShaderArtifactCache::Library(
@@ -978,14 +1028,14 @@ WMT::Reference<WMT4::Library> DeviceShaderArtifactCache::Library(
 }
 
 WMT::Reference<WMT4::Function> DeviceShaderArtifactCache::SampleMaskFunction(
-    WMT4::Library library, const char *name, D3D12_SHADER_BYTECODE root, uint32_t mask, WMT::Error &error) {
+    WMT4::Library library, const char *name, uint32_t mask, WMT::Error &error) {
+  WMTFunctionConstant constant{};
+  constant.index = 0; constant.type = WMTDataTypeUInt;
   StageKeyBuilder key;
-  key.add(library.handle, uint16_t(0), WMTDataTypeUInt, mask);
-  key.bytes(name, strlen(name)); key.bytes(root.pShaderBytecode, root.BytecodeLength);
+  key.add(library.handle, true, constant.index, constant.type, mask);
+  key.bytes(name, strlen(name));
   auto value = impl_->functions.Get(key.key, "specialize_function", [&]() -> std::shared_ptr<const NativeFunctionArtifact> {
     impl_->functions.Operation("specialize_function", key.key);
-    WMTFunctionConstant constant{};
-    constant.index = 0; constant.type = WMTDataTypeUInt;
     constant.data.set(&mask);
     auto function = library.newFunctionWithConstants(name, &constant, 1, error);
     if (!function) return {};
@@ -1092,12 +1142,12 @@ std::shared_ptr<const NativePipelineArtifact> DeviceShaderArtifactCache::NativeP
 
 std::shared_ptr<const NativeRaytracingArtifact> DeviceShaderArtifactCache::NativeRaytracing(
     WMT4::Compiler compiler, WMT4::Library library, const std::vector<SM50_RT_FUNCTION_INFO> &functions,
-    uint32_t max_call_stack_depth, WMT::Error &error) {
+    uint32_t max_call_stack_depth, bool indirect, WMT::Error &error) {
   StageKeyBuilder key;
   // A retained library fixes the complete emitted code, root layouts, constants
   // ABI and compiler options. Include ordered linkage and handle-table metadata;
   // do not key only by entry-point names or an application state-object pointer.
-  key.add(uint32_t(1), compiler.handle, library.handle, max_call_stack_depth, uint64_t(functions.size()));
+  key.add(uint32_t(1), compiler.handle, library.handle, max_call_stack_depth, indirect, uint64_t(functions.size()));
   for (const auto &function : functions) {
     if (!function.Name || !*function.Name) return {};
     key.bytes(function.Name, strlen(function.Name));
@@ -1115,7 +1165,8 @@ std::shared_ptr<const NativeRaytracingArtifact> DeviceShaderArtifactCache::Nativ
       const auto &function = functions[i];
       if ((function.Kind == SM50_RT_FUNCTION_RAYGEN && !(function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY)) ||
           function.Kind == SM50_RT_FUNCTION_INTERSECTION) continue;
-      auto parent = Function(library, function.Name);
+      const bool icb_entry = indirect && (function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY);
+      auto parent = Function(library, icb_entry ? SM50_RT_ICB_KERNEL : function.Name);
       if (!parent) return native;
       if (function.Flags & SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY) {
         if (dispatch || function.Kind != SM50_RT_FUNCTION_RAYGEN) return native;
@@ -1127,11 +1178,11 @@ std::shared_ptr<const NativeRaytracingArtifact> DeviceShaderArtifactCache::Nativ
     WMTComputePipelineInfo info;
     WMT::InitializeComputePipelineInfo(info);
     info.compute_function = dispatch;
-    info.support_indirect_command_buffers = false;
+    info.support_indirect_command_buffers = indirect;
     info.max_call_stack_depth = max_call_stack_depth;
     impl_->raytracing_native.Operation("native_rt_executable", key.key);
     native->compute = compiler.newComputePipelineStateWithLinkedFunctions(
-        info, linked.data(), static_cast<uint32_t>(linked.size()), native->error);
+        info, linked.data(), static_cast<uint32_t>(linked.size()), native->error, native->shader_validation);
     if (!native->compute) return native;
     for (size_t i = 0; i < functions.size(); ++i) {
       const auto &function = functions[i];
@@ -1156,7 +1207,7 @@ std::shared_ptr<const NativeRaytracingArtifact> DeviceShaderArtifactCache::Nativ
 
 HRESULT PipelineCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &desc, Sha1Digest &key) {
   KeyBuilder hash;
-  hash.add(uint32_t(4), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
+  hash.add(uint32_t(4), uint32_t(AIRCONV_VERSION), kD3D12ShaderMetalVersion, desc.NodeMask, desc.Flags);
   hash.root(desc.pRootSignature);
   hash.shader(desc.CS);
   return hash.finish(key);

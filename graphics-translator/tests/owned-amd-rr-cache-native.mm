@@ -3,6 +3,7 @@
 #define OWNED_RR_PROVIDER_SOURCE "../../src/winemetal/unix/metalfx_amd_rr.mm"
 #endif
 #include OWNED_RR_PROVIDER_SOURCE
+#include "../../src/winemetal/unix/winemetal_metal4_hud.c"
 #import <objc/runtime.h>
 #include <cstdio>
 #include <cstdlib>

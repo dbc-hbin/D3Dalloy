@@ -599,6 +599,9 @@ struct InputVisibleFunctionTable {
   std::string arg_name;
 };
 
+llvm::StructType *BuildRayFunctionTablePair(llvm::LLVMContext &context, unsigned argument_index,
+                                           llvm::MDNode *&argument_md);
+
 /**
  * The raytracing dispatch-arguments constant buffer (SM50_RT_DISPATCH_ARGUMENTS in
  * dxil_raytracing.h). Bound as an ordinary constant buffer at

@@ -30,7 +30,9 @@ static void wg_scheduler_frame(device WorkGraphSchedulerFrame &frame, uint node,
 kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buffer(0)]],
                                     constant WorkGraphSchedulerParams &p [[buffer(1)]]) {
   device auto *indirect = reinterpret_cast<device WorkGraphSchedulerIndirect *>(p.Indirect);
-  if (state.PendingPacket < p.NodeCount) {
+  if (!p.Indirect) {
+    compute_command(p.Commands, 0).reset();
+  } else if (state.PendingPacket < p.NodeCount) {
     indirect[state.PendingPacket] = WorkGraphSchedulerIndirect{};
     state.PendingPacket = kWorkGraphSchedulerNone;
   }
@@ -173,6 +175,14 @@ kernel void d3d12_work_graph_prepare(device WorkGraphSchedulerState &state [[buf
         // clears HostYield only after export/publication actually retires.
         state.HostYield = 1;
         ++state.HostSteps;
+      } else if (!p.Indirect) {
+        compute_command cmd(p.Commands, 0);
+        cmd.set_compute_pipeline_state(node.Pipeline);
+        cmd.set_kernel_buffer(reinterpret_cast<device uchar *>(p.Context), 18);
+        if (p.Roots) cmd.set_kernel_buffer(reinterpret_cast<device uchar *>(p.Roots), 0);
+        if (p.Samplers) cmd.set_kernel_buffer(reinterpret_cast<device uchar *>(p.Samplers), 1);
+        if (node.Constants) cmd.set_kernel_buffer(reinterpret_cast<device uchar *>(node.Constants), 29);
+        cmd.concurrent_dispatch_threadgroups(uint3(groups, 1, 1), uint3(node.Threads[0], node.Threads[1], node.Threads[2]));
       } else {
         indirect[frame.Node] = WorkGraphSchedulerIndirect{groups, 1, 1, 0};
         state.PendingPacket = frame.Node;

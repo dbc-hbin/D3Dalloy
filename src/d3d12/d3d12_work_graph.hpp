@@ -35,6 +35,7 @@ public:
     Com<MTLD3D12RootSignature> local_root;
     Com<MTLD3D12RootSignature> global_root;
     WMT::Reference<WMT::ComputePipelineState> pipeline;
+    uint64_t icb_pipeline_id = 0;
     std::shared_ptr<const WorkGraphArtifact> compiled_artifact;
     ShaderImmutableConstants constants;
     WMTSize threads{};
@@ -115,7 +116,7 @@ private:
   uint64_t token_ = 0;
   UINT flags_ = 0;
   HRESULT BuildGraph(const D3D12_WORK_GRAPH_DESC &desc, Graph &graph, const Graph *parent);
-  HRESULT Compile(Node &node, MTLD3D12RootSignature *root, bool validate_only = false);
+  HRESULT Compile(Node &node, MTLD3D12RootSignature *root, bool validate_only, bool use_icb = false);
   D3D12_PROGRAM_IDENTIFIER Identifier(UINT graph) const;
   D3D12_NODE_ID NodeID(UINT graph, UINT node) const;
 };
@@ -130,7 +131,7 @@ struct WorkGraphDispatch {
   uint32_t max_gpu_records = UINT32_MAX, max_gpu_node_inputs = UINT32_MAX;
   std::vector<Input> inputs;
   WMT::Reference<WMT::Buffer> arguments;
-  uint64_t roots = 0, samplers = 0;
+  uint64_t roots = 0, samplers = 0, arguments_address = 0;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> atomic64_tables;
   std::vector<Atomic64RootBinding> atomic64_roots;
   Com<MTLD3D12DescriptorHeap, false> atomic64_heap;

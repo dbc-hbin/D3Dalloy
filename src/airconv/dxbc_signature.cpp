@@ -136,8 +136,8 @@ void handle_signature_vs(
           if (ctx.ia_layout) {
             for (unsigned i = 0; i < ctx.ia_layout->num_elements; i++) {
               if (ctx.ia_layout->elements[i].reg == reg) {
-                ctx.prologue << pull_vertex_input(
-                  ctx.func_signature, reg, mask, ctx.ia_layout->elements[i],
+                ctx.prologue << pull_vertex_slot(
+                  ctx.func_signature, {{ctx.ia_layout->elements[i], mask}},
                   ctx.ia_layout->slot_mask, ctx.dense_vertex_table
                 );
                 break;
@@ -722,25 +722,14 @@ void handle_signature_hs(
   D3D10ShaderBinary::CInstruction &Inst, SM50ShaderInternal *sm50_shader,
   uint32_t phase
 ) {
-  uint32_t &max_input_register = sm50_shader->max_input_register;
   uint32_t &max_output_register = sm50_shader->max_output_register;
   uint32_t &max_patch_constant_output_register =
     sm50_shader->max_patch_constant_output_register;
 
   switch (Inst.m_OpCode) {
-  case D3D10_SB_OPCODE_DCL_INPUT_SGV: {
-    unsigned reg = Inst.m_Operands[0].m_Index[0].m_RegIndex;
-    // auto mask = Inst.m_Operands[0].m_WriteMask >> 4;
-    // auto MinPrecision = Inst.m_Operands[0].m_MinPrecision; // not used
-    auto sgv = Inst.m_InputDeclSGV.Name;
-    switch (sgv) {
-    default:
-      sm50_shader->initialization_error = "Unsupported DXBC hull shader system-value input";
-      return;
-    }
-    max_input_register = std::max(reg + 1, max_input_register);
-    break;
-  }
+  case D3D10_SB_OPCODE_DCL_INPUT_SGV:
+    sm50_shader->initialization_error = "Unsupported DXBC hull shader system-value input";
+    return;
   case D3D10_SB_OPCODE_DCL_INPUT: {
     D3D10_SB_OPERAND_TYPE RegType = Inst.m_Operands[0].m_Type;
 

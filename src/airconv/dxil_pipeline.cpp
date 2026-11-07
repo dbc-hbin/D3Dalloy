@@ -27,7 +27,6 @@
 #include "air_signature.hpp"
 #include "airconv_context.hpp"
 #include "dxbc_converter.hpp"
-#include "metallib_writer.hpp"
 #include "msaa_mesh.hpp"
 
 namespace d3dalloy::dxil {
@@ -44,11 +43,8 @@ constexpr uint8_t KIND_CULL_DISTANCE = 7;
 constexpr uint8_t KIND_SHADING_RATE = 29;
 
 /* DXIL::ComponentType */
-constexpr uint8_t COMPONENT_I1 = 1;
 constexpr uint8_t COMPONENT_I16 = 2;
-constexpr uint8_t COMPONENT_U16 = 3;
 constexpr uint8_t COMPONENT_I32 = 4;
-constexpr uint8_t COMPONENT_U32 = 5;
 constexpr uint8_t COMPONENT_F16 = 8;
 constexpr uint8_t COMPONENT_F32 = 9;
 
@@ -868,15 +864,8 @@ llvm::Expected<std::unique_ptr<SM50CompiledBitcodeInternal>> CompilePipelineStag
     if (auto error = msaa::transformMesh(*module, *msaa_mesh, conservative != nullptr))
       return std::move(error);
 
-  if (auto error = LowerAtomic64Phase(*module))
-    return std::move(error);
-  runOptimizationPasses(*module);
   auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (auto error = LowerImmutableConstants(*module, *compiled))
-    return std::move(error);
-  llvm::raw_svector_ostream stream(compiled->vec);
-  metallib::MetallibWriter writer;
-  if (auto error = writer.Write(*module, stream))
+  if (auto error = FinalizeShader(*module, *compiled, true))
     return std::move(error);
   return std::move(compiled);
 }

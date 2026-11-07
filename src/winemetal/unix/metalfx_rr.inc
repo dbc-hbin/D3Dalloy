@@ -20,7 +20,8 @@ struct Generation {
   const uint64_t serial;
   id<MTL4FXTemporalDenoisedScaler> scaler = nil;
   uint32_t width = 0, height = 0, outputWidth = 0, outputHeight = 0;
-  bool hit = false, reactive = false;
+  bool hit = false, reactive = false, overlay = false;
+  bool inlineFence = false;
   std::array<MTLPixelFormat, Count> formats{};
   explicit Generation(uint64_t value) : serial(value) {}
   ~Generation() { [scaler release]; }
@@ -251,7 +252,8 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
   for (const auto &cached : core.generations) {
     if (cached && cached->width == p.input_width && cached->height == p.input_height &&
         cached->outputWidth == p.output_rect.width && cached->outputHeight == p.output_rect.height &&
-        cached->hit == hit && cached->reactive == reactive && cached->formats == formats) {
+        cached->hit == hit && cached->reactive == reactive && cached->overlay == bool(p.composition) &&
+        cached->formats == formats) {
       // History is reset by encode order (lastGeneration), not descriptor lookup.
       return cached;
     }
@@ -268,19 +270,24 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     d.diffuseAlbedoTextureFormat = formats[7]; d.specularAlbedoTextureFormat = formats[8];
     d.normalTextureFormat = formats[9];
     d.reactiveMaskTextureEnabled = reactive; d.reactiveMaskTextureFormat = formats[5];
+    if (p.composition) {
+      d.transparencyOverlayTextureEnabled = YES;
+      d.transparencyOverlayTextureFormat = formats[6];
+    }
     d.specularHitDistanceTextureEnabled = hit;
     d.autoExposureEnabled = (core.info.feature_flags & 64) != 0;
-    // Build the final model before submission instead of encoding the slower
-    // interim model while its pipelines are still compiling in the background.
-    d.requiresSynchronousInitialization = YES;
+    // MetalFX can encode the initial frames while it compiles the faster variant.
+    d.requiresSynchronousInitialization = NO;
     // Apple non-fused GPU backend avoids the macOS 27 fused UBF K44 weight overread.
     if (![d respondsToSelector:@selector(setVersion:)]) return {};
     [d setVersion:0x10000];
     result->scaler = [d newTemporalDenoisedScalerWithDevice:core.device compiler:core.compiler];
     if (!result->scaler) return {};
+    if (@available(macOS 27.0, *))
+      result->inlineFence = [core.device supportsFamily:MTLGPUFamilyApple10];
     result->width = p.input_width; result->height = p.input_height;
     result->outputWidth = p.output_rect.width; result->outputHeight = p.output_rect.height;
-    result->hit = hit; result->reactive = reactive; result->formats = formats;
+    result->hit = hit; result->reactive = reactive; result->overlay = p.composition != 0; result->formats = formats;
     // Dynamic output keeps one feature across output extents. Cache only the
     // new and the last encoded output extent; prepared frames keep evictees.
     const Generation *last = nullptr;
@@ -317,8 +324,6 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
 - (void)dealloc { for (auto input : inputs) [input release]; [super dealloc]; }
 @end
 @interface D3DALLOYRRExecution : NSObject {
-@public std::shared_ptr<d3dalloy_rr::Core> core;
-@public std::shared_ptr<d3dalloy_rr::Generation> generation;
 @public std::unique_ptr<d3dalloy_rr::Resources> resources;
 @public D3DALLOYRRFrame *frame;
 }
@@ -329,8 +334,8 @@ std::shared_ptr<Generation> generation(Core &core, const WMTMetal4FXTemporalFram
     // Retirement runs after recording ownership has ended, including partial encode failure.
     // The retired set keeps its scratch; only the next owner mutates it.
     try {
-      std::lock_guard lock(core->mutex);
-      core->recycle(resources);
+      std::lock_guard lock(frame->core->mutex);
+      frame->core->recycle(resources);
     } catch (...) { resources.reset(); }
   }
   [frame release]; [super dealloc];
@@ -344,9 +349,11 @@ static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &
   auto &core = *frame->core;
   resources.ready = false;
   const auto scaler = frame->generation->scaler;
+  bool needsScratch = false;
   const MTLTextureUsage usages[Count] = {scaler.colorTextureUsage, scaler.depthTextureUsage,
     scaler.motionTextureUsage, scaler.outputTextureUsage, MTLTextureUsageShaderRead,
-    0, 0, scaler.diffuseAlbedoTextureUsage, scaler.specularAlbedoTextureUsage,
+    0, p.composition ? scaler.transparencyOverlayTextureUsage : MTLTextureUsageUnknown,
+    scaler.diffuseAlbedoTextureUsage, scaler.specularAlbedoTextureUsage,
     scaler.normalTextureUsage, scaler.roughnessTextureUsage, scaler.specularHitDistanceTextureUsage};
   for (size_t i = 0; i < Count; ++i) {
     auto discardScratch = [&] {
@@ -387,20 +394,28 @@ static bool d3dalloyRRResources(D3DALLOYRRFrame *frame, d3dalloy_rr::Resources &
       if (!scratch) return false;
     }
     bound[i] = scratch;
+    needsScratch = true;
   }
-  if (!resources.params) {
-    resources.params = [core.device newBufferWithLength:(Count + 1) * 256 options:MTLResourceStorageModeShared];
-    resources.residencyDirty = true;
+  if (needsScratch) {
+    if (!resources.params) {
+      resources.params = [core.device newBufferWithLength:(Count + 1) * 256 options:MTLResourceStorageModeShared];
+      resources.residencyDirty = true;
+    }
+    if (!resources.table) {
+      auto d = [MTL4ArgumentTableDescriptor new]; d.maxBufferBindCount = 1; d.maxTextureBindCount = 3;
+      resources.table = [core.device newArgumentTableWithDescriptor:d error:nil]; [d release];
+    }
+    if (!resources.residency) {
+      auto d = [MTLResidencySetDescriptor new]; d.initialCapacity = Count * 2 + 1;
+      resources.residency = [core.device newResidencySetWithDescriptor:d error:nil]; [d release];
+    }
+    if (!resources.params || !resources.table || !resources.residency) return false;
+  } else if (resources.residency) {
+    // A retired conversion set can serve a direct frame. Drop its scratch owners as well.
+    [resources.residency release]; resources.residency = nil;
+    [resources.params release]; resources.params = nil;
+    [resources.table release]; resources.table = nil;
   }
-  if (!resources.table) {
-    auto d = [MTL4ArgumentTableDescriptor new]; d.maxBufferBindCount = 1; d.maxTextureBindCount = 3;
-    resources.table = [core.device newArgumentTableWithDescriptor:d error:nil]; [d release];
-  }
-  if (!resources.residency) {
-    auto d = [MTLResidencySetDescriptor new]; d.initialCapacity = Count * 2 + 1;
-    resources.residency = [core.device newResidencySetWithDescriptor:d error:nil]; [d release];
-  }
-  if (!resources.params || !resources.table || !resources.residency) return false;
   resources.width = p.input_width; resources.height = p.input_height;
   resources.outputWidth = p.output_rect.width; resources.outputHeight = p.output_rect.height;
   resources.bytes = resources.params.allocatedSize;
@@ -459,7 +474,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     if (!p.reactive && (p.reactive_rect.x || p.reactive_rect.y)) return true;
     if (!p.input_width || !p.input_height || p.input_width > feature->core->info.input_width ||
         p.input_height > feature->core->info.input_height || p.roughness_packed > 1 || p.depth_linear > 1 ||
-        p.color_transfer || p.combine_composition || p.sharpening || p.cap_output || p.composition || p.debug_view ||
+        p.color_transfer || p.combine_composition || p.sharpening || p.cap_output || p.debug_view ||
         !std::isfinite(p.pre_exposure) || p.pre_exposure <= 0 || !std::isfinite(p.motion_scale_x) ||
         !std::isfinite(p.motion_scale_y) || !p.motion_scale_x || !p.motion_scale_y ||
         !std::isfinite(p.jitter_x) || !std::isfinite(p.jitter_y) || p.exposure_mode > 2 ||
@@ -475,9 +490,9 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     for (double scale : {double(p.output_rect.width) / p.input_width, double(p.output_rect.height) / p.input_height})
       if (scale < feature->core->minScale || scale > feature->core->maxScale) { call->ret[1] = 0x887a0004; return true; }
     auto holder = [[D3DALLOYRRFrame new] autorelease]; holder->core = feature->core; holder->props = p;
-    uint64_t handles[Count] = {p.color,p.depth,p.motion,p.output,p.exposure,p.reactive,0,
+    uint64_t handles[Count] = {p.color,p.depth,p.motion,p.output,p.exposure,p.reactive,p.composition,
       p.diffuse_albedo,p.specular_albedo,p.normals,p.roughness_packed ? p.normals : p.roughness,p.specular_hit_distance};
-    holder->rects = {p.color_rect,p.depth_rect,p.motion_rect,p.output_rect,{0,0,1,1},p.reactive_rect,{},
+    holder->rects = {p.color_rect,p.depth_rect,p.motion_rect,p.output_rect,{0,0,1,1},p.reactive_rect,p.composition_rect,
       p.diffuse_albedo_rect,p.specular_albedo_rect,p.normals_rect,p.roughness_packed ? p.normals_rect : p.roughness_rect,p.specular_hit_distance_rect};
     for (size_t i = 0; i < Count; ++i) {
       id<MTLTexture> texture = (id<MTLTexture>)handles[i];
@@ -487,6 +502,9 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
       if (i == 5 && texture.pixelFormat != MTLPixelFormatR8Unorm &&
           texture.pixelFormat != MTLPixelFormatR16Unorm && texture.pixelFormat != MTLPixelFormatR16Float &&
           texture.pixelFormat != MTLPixelFormatR32Float) return true;
+      if (i == 6 && texture.pixelFormat != MTLPixelFormatRGBA16Float && texture.pixelFormat != MTLPixelFormatRGBA32Float &&
+          texture.pixelFormat != MTLPixelFormatRGBA8Unorm && texture.pixelFormat != MTLPixelFormatBGRA8Unorm &&
+          texture.pixelFormat != MTLPixelFormatRGB10A2Unorm && texture.pixelFormat != MTLPixelFormatRGBA16Unorm) return true;
       if (i == 3) {
         if (!texture || texture.device != feature->core->device || texture.textureType != MTLTextureType2D ||
             texture.arrayLength != 1 || texture.sampleCount != 1 || texture.depth != 1 || texture.framebufferOnly ||
@@ -523,8 +541,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   if (call->operation != WMTMetal4FXEncodeTemporal || ![(id)call->args[1] isKindOfClass:[D3DALLOYRRFrame class]]) return false;
   call->ret[1] = 0x887a0020;
   auto frame = (D3DALLOYRRFrame *)call->args[1];
-  auto execution = [D3DALLOYRRExecution new]; execution->core = frame->core;
-  execution->generation = frame->generation; execution->frame = [frame retain];
+  auto execution = [D3DALLOYRRExecution new]; execution->frame = [frame retain];
   winemetal_metal4_retain_resource(call->args[0],execution); [execution release];
   winemetal_metal4_retain_resource(call->args[0],(id)call->args[2]);
   auto &core = *frame->core;
@@ -536,7 +553,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   const bool reset = p.reset || call->args[3] || core.lastGeneration != frame->generation->serial;
   std::array<id<MTLTexture>,Count> bound{};
   if (!d3dalloyRRResources(frame,resources,bound)) { call->ret[1] = 0x8007000e; return true; }
-  if (resources.residencyDirty) {
+  if (resources.residency && resources.residencyDirty) {
     [resources.residency removeAllAllocations];
     for (auto texture : resources.textures) if (texture) [resources.residency addAllocation:texture];
     [resources.residency addAllocation:resources.params]; [resources.residency commit];
@@ -572,7 +589,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   if (!command || command.device != core.device || !fence || fence.device != core.device) {
     call->ret[1] = 0x80070057; return true;
   }
-  [command useResidencySet:resources.residency];
+  if (resources.residency) [command useResidencySet:resources.residency];
   // Conversions read only app inputs and write disjoint scratch, so one encoder
   // behind one fence wait needs no intra-encoder barrier.
   // Both results must be computed from the original packed value. Reading the
@@ -584,7 +601,10 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     if (!prepass) {
       prepass = [command computeCommandEncoder];
       if (!prepass) return true;
+      m4_hud_count(WMTMetal4HUDCompute);
+      [prepass barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
       [prepass waitForFence:fence beforeEncoderStages:MTLStageDispatch];
+      m4_hud_count(WMTMetal4HUDFenceWait);
     }
     [resources.table setTexture:frame->inputs[i].gpuResourceID atIndex:0];
     [resources.table setTexture:bound[i].gpuResourceID atIndex:1];
@@ -603,17 +623,29 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   }
   auto scaler = frame->generation->scaler;
   @try {
-    // Metal4FX is isolated between preprocessing and suffix segments, as for SR.
-    // A recording split alone does not order the converter writes before RR.
-    auto prefixBoundary = [command computeCommandEncoder];
-    if (!prefixBoundary) return true;
-    [prefixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    [prefixBoundary endEncoding];
-    command = (id<MTL4CommandBuffer>)winemetal_metal4_split_command_buffer((void *)call->args[0]);
-    if (!command) return true;
-    [command useResidencySet:resources.residency];
+    const bool inlineFence = frame->generation->inlineFence;
+    const bool producer = inlineFence && !prepass && (call->args[4] & WMTMetal4FXProducer);
+    if (producer) call->ret[3] |= WMTMetal4FXProducer;
+    if (!inlineFence || (!prepass && !producer)) {
+      auto prefixBoundary = [command computeCommandEncoder];
+      if (!prefixBoundary) return true;
+      m4_hud_count(WMTMetal4HUDCompute);
+      if (inlineFence) {
+        [prefixBoundary barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+        [prefixBoundary updateFence:fence afterEncoderStages:MTLStageDispatch];
+      } else {
+        [prefixBoundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+      }
+      [prefixBoundary endEncoding];
+    }
+    if (!inlineFence) {
+      command = (id<MTL4CommandBuffer>)winemetal_metal4_split_command_buffer((void *)call->args[0]);
+      if (!command) return true;
+      if (resources.residency) [command useResidencySet:resources.residency];
+    }
     scaler.colorTexture = bound[0]; scaler.depthTexture = bound[1]; scaler.motionTexture = bound[2];
     scaler.outputTexture = bound[3]; scaler.exposureTexture = bound[4]; scaler.reactiveMaskTexture = bound[5];
+    if (p.composition) scaler.transparencyOverlayTexture = bound[6];
     scaler.diffuseAlbedoTexture = bound[7]; scaler.specularAlbedoTexture = bound[8]; scaler.normalTexture = bound[9];
     scaler.roughnessTexture = bound[10]; scaler.specularHitDistanceTexture = bound[11];
     scaler.preExposure = p.pre_exposure; scaler.jitterOffsetX = p.jitter_x; scaler.jitterOffsetY = p.jitter_y;
@@ -622,23 +654,38 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
     simd_float4x4 world, projection; matrix(world,p.world_to_view); matrix(projection,p.view_to_clip);
     scaler.worldToViewMatrix = world; scaler.viewToClipMatrix = projection; scaler.fence = fence;
     [scaler encodeToCommandBuffer:command];
-    command = (id<MTL4CommandBuffer>)winemetal_metal4_split_command_buffer((void *)call->args[0]);
-    if (!command) return true;
-    [command useResidencySet:resources.residency];
-    auto boundary = [command computeCommandEncoder];
-    if (!boundary) return true;
-    [boundary barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
-    // The queue barrier covers RR in the previous segment; fence scopes are encoder-local.
-    [boundary updateFence:fence afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
-    [boundary endEncoding];
-    if (bound[3] != frame->inputs[3]) {
+    if (!inlineFence) {
+      command = (id<MTL4CommandBuffer>)winemetal_metal4_split_command_buffer((void *)call->args[0]);
+      if (!command) return true;
+      if (resources.residency) [command useResidencySet:resources.residency];
+    }
+    const bool scatter = bound[3] != frame->inputs[3];
+    const bool consumer = inlineFence && !scatter && (call->args[4] & WMTMetal4FXConsumer);
+    if (consumer) call->ret[3] |= WMTMetal4FXConsumer;
+    if (!inlineFence || (!scatter && !consumer)) {
+      auto boundary = [command computeCommandEncoder];
+      if (!boundary) return true;
+      m4_hud_count(WMTMetal4HUDCompute);
+      if (inlineFence) {
+        [boundary waitForFence:fence beforeEncoderStages:MTLStageDispatch];
+        m4_hud_count(WMTMetal4HUDFenceWait);
+      }
+      [boundary barrierAfterStages:(inlineFence ? MTLStageDispatch : MTLStageAll)
+                beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+      [boundary updateFence:fence afterEncoderStages:MTLStageDispatch | MTLStageBlit | MTLStageAccelerationStructure];
+      [boundary endEncoding];
+    }
+    if (scatter) {
       auto encoder = [command computeCommandEncoder]; if (!encoder) return true;
-      if (bound[3].pixelFormat == frame->inputs[3].pixelFormat) {
-        [encoder waitForFence:fence beforeEncoderStages:MTLStageBlit];
+      m4_hud_count(WMTMetal4HUDCompute);
+      const bool blit = bound[3].pixelFormat == frame->inputs[3].pixelFormat;
+      const auto stage = blit ? MTLStageBlit : MTLStageDispatch;
+      [encoder waitForFence:fence beforeEncoderStages:stage];
+      m4_hud_count(WMTMetal4HUDFenceWait);
+      if (blit) {
         [encoder copyFromTexture:bound[3] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
           sourceSize:MTLSizeMake(p.output_rect.width,p.output_rect.height,1) toTexture:frame->inputs[3]
           destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(p.output_rect.x,p.output_rect.y,0)];
-        [encoder updateFence:fence afterEncoderStages:MTLStageBlit];
       } else {
         // Conversion also supports UAV outputs with a different channel precision.
         Params outputParams{}; outputParams.width = p.output_rect.width; outputParams.height = p.output_rect.height;
@@ -648,11 +695,12 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
         [resources.table setTexture:bound[3].gpuResourceID atIndex:0];
         [resources.table setTexture:frame->inputs[3].gpuResourceID atIndex:1];
         [resources.table setAddress:resources.params.gpuAddress + Count * 256 atIndex:0];
-        [encoder waitForFence:fence beforeEncoderStages:MTLStageDispatch];
         [encoder setComputePipelineState:core.pipelines->conversion]; [encoder setArgumentTable:resources.table];
         [encoder dispatchThreads:MTLSizeMake(outputParams.width,outputParams.height,1) threadsPerThreadgroup:MTLSizeMake(8,8,1)];
-        [encoder updateFence:fence afterEncoderStages:MTLStageDispatch];
       }
+      [encoder updateFence:fence afterEncoderStages:stage];
+      if (inlineFence)
+        [encoder barrierAfterStages:stage beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
       [encoder endEncoding];
     }
     core.lastGeneration = frame->generation->serial; core.lastJitterX = p.jitter_x; core.lastJitterY = p.jitter_y;
@@ -660,6 +708,7 @@ static bool d3dalloyRRCall(struct WMTMetal4Call *call) try {
   } @finally {
     scaler.colorTexture = scaler.depthTexture = scaler.motionTexture = scaler.outputTexture = nil;
     scaler.exposureTexture = scaler.reactiveMaskTexture = scaler.diffuseAlbedoTexture = scaler.specularAlbedoTexture = nil;
+    if (p.composition) scaler.transparencyOverlayTexture = nil;
     scaler.normalTexture = scaler.roughnessTexture = scaler.specularHitDistanceTexture = nil; scaler.fence = nil;
   }
   return true;

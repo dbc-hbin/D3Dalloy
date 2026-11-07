@@ -22,7 +22,8 @@ struct Core {
   MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC create{};
   WMT::Reference<WMT4::TemporalFeature> feature;
   WMT::Reference<WMT::SharedEvent> timeline;
-  std::mutex mutex;
+  // The queue holds this through history lookup, native encode and commit.
+  // Recording uses the native feature's independent preparation lock.
   std::mutex submission_mutex;
   uint64_t sequence = 0, last_executed_generation = 0;
   uint64_t last_queue = 0; // owned id of the queue that encoded `sequence`
@@ -44,17 +45,18 @@ WMTPixelFormat motionFormat(WMTPixelFormat format) {
 HRESULT retainTexture(MTLD3D12Device *device, ID3D12Resource *input,
                       Com<MTLD3D12Resource, false> &resource, TextureViewRef &view,
                       bool motion = false) {
-  if (!input) return E_INVALIDARG;
+  Com<MTLD3D12Resource> owned;
+  if (!input || FAILED(input->QueryInterface(kOwnedTextureId, reinterpret_cast<void **>(&owned))) || !owned)
+    return E_INVALIDARG;
   Com<ID3D12Device> owner;
-  if (FAILED(input->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
+  if (FAILED(owned->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void **>(&owner))) ||
       owner.ptr() != static_cast<ID3D12Device *>(device)) return E_INVALIDARG;
-  const auto desc = input->GetDesc();
+  const auto desc = static_cast<ID3D12Resource *>(owned.ptr())->GetDesc();
   if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
       desc.SampleDesc.Count != 1 || !desc.Width || !desc.Height) return E_INVALIDARG;
-  auto owned = static_cast<MTLD3D12Resource *>(input);
-  if (!owned->texture || !owned->texture->current()) return E_INVALIDARG;
-  resource = owned;
   auto texture = owned->texture;
+  if (!texture || !texture->current()) return E_INVALIDARG;
+  resource = owned.ptr();
   const auto format = motion ? motionFormat(texture->pixelFormat()) : texture->pixelFormat();
   if (motion && format == WMTPixelFormatInvalid) return DXGI_ERROR_UNSUPPORTED;
   const auto key = texture->createView({.format = format,
@@ -81,7 +83,7 @@ class OwnedTemporalState final : public ComObject<IMTLD3D12TemporalUpscaleState,
   std::shared_ptr<Core> core_;
 public:
   explicit OwnedTemporalState(std::shared_ptr<Core> core) : core_(std::move(core)) {}
-  ~OwnedTemporalState() { core_->feature.markDormant(); }
+  ~OwnedTemporalState() { if (core_->create.FeatureFlags != WMTMetal4FXSpatialFlag) core_->feature.markDormant(); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) final {
     if (!object) return E_POINTER;
     *object = nullptr;
@@ -94,6 +96,30 @@ public:
   HRESULT Prepare(MTLD3D12Device *device, const MTL_TEMPORAL_UPSCALE_D3D12_FRAME_DESC &desc,
                   std::shared_ptr<OwnedTemporalFrame> &result) final {
     if (device != core_->device.ptr() || !desc.InputContentWidth || !desc.InputContentHeight) return E_INVALIDARG;
+    if (core_->create.FeatureFlags == WMTMetal4FXSpatialFlag) {
+      if (desc.Color == desc.Output) return E_INVALIDARG;
+      auto frame = std::make_shared<OwnedTemporalFrame>();
+      frame->core = core_;
+      auto hr = retainTexture(device, desc.Color, frame->resources[0], frame->views[0]);
+      if (FAILED(hr)) return hr;
+      hr = retainTexture(device, desc.Output, frame->resources[3], frame->views[3]);
+      if (FAILED(hr)) return hr;
+      const auto color = static_cast<ID3D12Resource *>(frame->resources[0].ptr())->GetDesc();
+      const auto output = static_cast<ID3D12Resource *>(frame->resources[3].ptr())->GetDesc();
+      const uint64_t x = desc.ColorBaseX, y = desc.ColorBaseY;
+      if (x + desc.InputContentWidth > color.Width || y + desc.InputContentHeight > color.Height ||
+          x + core_->create.OutputWidth > output.Width || y + core_->create.OutputHeight > output.Height)
+        return E_INVALIDARG;
+      auto &p = frame->props;
+      p.color = frame->views[0].texture().handle;
+      p.output = frame->views[3].texture().handle;
+      p.color_rect = {desc.ColorBaseX, desc.ColorBaseY, desc.InputContentWidth, desc.InputContentHeight};
+      int32_t native_hr;
+      frame->native = core_->feature.prepare(p, native_hr, frame->generation, true);
+      if (native_hr < 0 || !frame->native) return native_hr < 0 ? HRESULT(native_hr) : E_FAIL;
+      result = std::move(frame);
+      return S_OK;
+    }
     for (float scalar : {desc.JitterOffsetX, desc.JitterOffsetY, desc.MotionVectorScaleX,
                          desc.MotionVectorScaleY, desc.PreExposure, desc.Sharpness})
       if (!std::isfinite(scalar)) return E_INVALIDARG;
@@ -159,7 +185,6 @@ public:
     p.sharpening = desc.EnableSharpening; p.sharpness = desc.Sharpness; p.cap_output = desc.CapOutputToTemporalMaxScale;
     p.debug_view = desc.DrawDebugView;
     int32_t native_hr;
-    std::lock_guard lock(core_->mutex);
     // Dynamic output stays on one native feature: its bounded scaler cache
     // keys generations by output extent and resets history on a switch.
     frame->native = core_->feature.prepare(p, native_hr, frame->generation);
@@ -180,8 +205,11 @@ HRESULT CreateOwnedTemporalState(MTLD3D12Device *device,
   if (!desc || desc->StructSize != sizeof(*desc) || !desc->InputWidth || !desc->InputHeight ||
       !desc->OutputWidth || !desc->OutputHeight || desc->InputWidth > 16384 || desc->InputHeight > 16384 ||
       desc->OutputWidth > 16384 || desc->OutputHeight > 16384) return E_INVALIDARG;
-  if (desc->CreationNodeMask > 1 || desc->VisibilityNodeMask > 1 || (desc->FeatureFlags & ~kSupportedFlags)) return E_NOTIMPL;
-  if (!WMT4::TemporalFeature::Supports(device->GetMTLDevice(), desc->FeatureFlags & 256u)) return DXGI_ERROR_UNSUPPORTED;
+  const bool spatial = desc->FeatureFlags == WMTMetal4FXSpatialFlag;
+  if (desc->CreationNodeMask > 1 || desc->VisibilityNodeMask > 1 || (!spatial && (desc->FeatureFlags & ~kSupportedFlags)))
+    return E_NOTIMPL;
+  if (!WMT4::TemporalFeature::Supports(device->GetMTLDevice(), spatial ? WMTMetal4FXSpatialFlag : desc->FeatureFlags & 256u))
+    return DXGI_ERROR_UNSUPPORTED;
   try {
     auto core = std::make_shared<Core>(); core->device = device; core->create = *desc;
     core->timeline = device->GetMTLDevice().newSharedEvent();
@@ -215,15 +243,13 @@ std::mutex &OwnedTemporalSubmissionMutex(const std::shared_ptr<OwnedTemporalFram
 }
 uint64_t OwnedTemporalFrameHistoryQueue(const std::shared_ptr<OwnedTemporalFrame> &frame) {
   auto &core = *frame->core;
-  std::lock_guard lock(core.mutex);
   return core.sequence ? core.last_queue : 0;
 }
-void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
+uint32_t EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
     WMT::MTL4CommandBuffer cmdbuf, WMT::Fence fence, uint64_t queue, uint64_t submission, uint64_t encoder,
     const std::function<void(WMT::Event, uint64_t)> &wait_event,
-    const std::function<void(WMT::Event, uint64_t)> &signal_event) {
+    const std::function<void(WMT::Event, uint64_t)> &signal_event, uint32_t handoff) {
   auto &core = *frame->core;
-  std::lock_guard lock(core.mutex);
   if (core.sequence && core.last_queue != queue) wait_event(core.timeline, core.sequence);
   const auto sequence = ++core.sequence;
   core.last_queue = queue;
@@ -233,10 +259,11 @@ void EncodeOwnedTemporalFrame(const std::shared_ptr<OwnedTemporalFrame> &frame,
       ",\"generation\":", frame->generation, ",\"history_sequence\":", sequence,
       ",\"caller_reset\":", frame->props.reset, ",\"reset\":", unsigned(reset),
       ",\"color\":", frame->resources[0]->owned_id, ",\"output\":", frame->resources[3]->owned_id);
-  const auto hr = frame->native.encode(cmdbuf, fence, reset);
+  const auto hr = frame->native.encode(cmdbuf, fence, reset, core.create.FeatureFlags == WMTMetal4FXSpatialFlag, handoff);
   if (hr < 0) core.device->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
   // Partial commands/leases remain attached. Always commit then signal: no stranded timeline.
   signal_event(core.timeline, sequence);
   core.last_executed_generation = hr < 0 ? 0 : frame->generation;
+  return hr < 0 ? 0 : handoff;
 }
 } // namespace d3dalloy

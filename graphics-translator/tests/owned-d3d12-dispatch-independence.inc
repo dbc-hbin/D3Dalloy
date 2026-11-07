@@ -136,6 +136,37 @@ void dispatchIndependence() {
     std::vector<uint32_t> expected(words,guard);expected[0]=0x13570000;verify(expected);
     expected[0]=guard;verify(expected,bytes);phase(name,false);
   }
+  // D3D12 permits these disjoint shader words without a UAV barrier. The
+  // descriptor footprints nevertheless have a RAW or WAR across dispatch
+  // 64/65. Only that pair needs a native dispatch barrier in the single encoder.
+  auto noop=makePipeline("[numthreads(1,1,1)] void cs(){}",root.Get());
+  for(UINT order=0;order<2;++order) {
+    auto list=c.list();initialize(list.list.Get(),output.Get());initialize(list.list.Get(),result.Get());bind(list.list.Get());
+    list.list->SetComputeRootDescriptorTable(1,gpu);
+    list.list->SetPipelineState(noop.Get());
+    for(UINT i=0;i<63;++i)list.list->Dispatch(1,1,1);
+    list.list->SetPredication(source.Get(),0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    list.list->SetPredication(nullptr,0,D3D12_PREDICATION_OP_EQUAL_ZERO);
+    // Empty direct grids must not consume a native command or change the
+    // 64/65 boundary. A mistakenly executed grid would overwrite a guard.
+    list.list->SetPipelineState(controlWriter.Get());
+    list.list->SetComputeRoot32BitConstant(2,2,0);
+    list.list->Dispatch(0,1,1);list.list->Dispatch(1,0,1);list.list->Dispatch(1,1,0);
+    for(UINT step=0;step<2;++step) {
+      const bool read=(step^order)!=0;
+      list.list->SetPipelineState(read?reader.Get():controlWriter.Get());
+      list.list->SetComputeRoot32BitConstant(2,read?1:0,0);list.list->Dispatch(1,1,1);
+    }
+    if(order) {
+      list.list->SetPipelineState(noop.Get());
+      for(UINT i=0;i<63;++i)list.list->Dispatch(1,1,1);
+    }
+    copy(list.list.Get(),output.Get(),0);copy(list.list.Get(),result.Get(),bytes);
+    const char *name=order?"dispatch_window_war_128":"dispatch_window_raw_65";
+    phase(name,true);c.execute({list.list.Get()});
+    std::vector<uint32_t> values(words,guard);values[0]=0x13570000;verify(values);
+    values[0]=guard;verify(values,bytes);phase(name,false);
+  }
   setView(0,0,words);
   auto bounded=c.list();initialize(bounded.list.Get(),output.Get());bind(bounded.list.Get());
   bounded.list->SetPipelineState(writer.Get());bounded.list->SetComputeRootDescriptorTable(1,gpu);
@@ -187,5 +218,5 @@ void dispatchIndependence() {
   phase("dispatch_external_backing",true);c.execute({aliases.list.Get()});
   expected.assign(words,guard);for(UINT i=0;i<3;++i)expected[i]=0x13570000+i;
   verify(expected);phase("dispatch_external_backing",false);
-  std::printf("%s_CASE_PASS case=dispatch_independence phases=9 table_replays=4 potential_raw_war_waw=serial budget=65 roots=8 external_alias=serial all_words_and_guards=exact\n",foundation);
+  std::printf("%s_CASE_PASS case=dispatch_independence phases=13 table_replays=4 potential_raw_war_waw=serial budget=65 roots=8 external_alias=serial all_words_and_guards=exact\n",foundation);
 }

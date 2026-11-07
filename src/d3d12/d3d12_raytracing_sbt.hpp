@@ -129,10 +129,8 @@ inline SbtStatus ValidateShaderTable(uint64_t address, uint64_t size, uint64_t s
 }
 
 inline SbtStatus PrepareDispatch(const DispatchDescription &desc, PreparedDispatch &prepared) {
-  if (!desc.width || !desc.height || !desc.depth)
-    return SbtStatus::InvalidDescription;
-  if (desc.width > kMaxDispatchDimension || desc.height > kMaxDispatchDimension ||
-      desc.depth > kMaxDispatchDimension)
+  // The limit is on the total thread count; a zero extent launches no threads.
+  if (desc.depth && uint64_t(desc.width) * desc.height > kMaxDispatchDimension / desc.depth)
     return SbtStatus::InvalidDescription;
   prepared = {};
   SbtStatus status =
@@ -179,8 +177,11 @@ struct RaysIndirectControl {
   uint32_t predicate_not_equal;
   uint32_t group_width;     // traversal threadgroup shape the written counts are for (depth 1)
   uint32_t group_height;
+  uint64_t icb, roots, static_samplers, immutable_constants;
+  uint64_t root_stride;
+  uint64_t first_command;
 };
-static_assert(sizeof(RaysIndirectControl) == 64);
+static_assert(sizeof(RaysIndirectControl) == 112);
 
 /**
  * One thread per command slot. A slot past the count buffer, a slot culled by
@@ -193,6 +194,7 @@ static_assert(sizeof(RaysIndirectControl) == 64);
  */
 inline constexpr const char kRaysIndirectMSL[] = R"metal(
 #include <metal_stdlib>
+#include <metal_command_buffer>
 using namespace metal;
 
 struct d3dalloy_rays_indirect_control {
@@ -207,6 +209,8 @@ struct d3dalloy_rays_indirect_control {
   uint predicate_not_equal;
   uint group_width;
   uint group_height;
+  command_buffer icb;
+  ulong roots, static_samplers, immutable_constants, root_stride, first_command;
 };
 
 struct d3dalloy_range { ulong address; ulong size; };
@@ -237,7 +241,12 @@ kernel void d3dalloy_rays_indirect(constant d3dalloy_rays_indirect_control &cont
                                uint slot [[thread_position_in_grid]]) {
   if (slot >= control.max_commands)
     return;
-  device uint *grid = (device uint *)(control.grids + ulong(slot) * 16);
+  device uint *grid = control.grids ? (device uint *)(control.grids + ulong(slot) * 16) : nullptr;
+  if (grid) {
+    grid[0] = grid[1] = grid[2] = 0;
+  } else {
+    compute_command(control.icb, uint(control.first_command) + slot).reset();
+  }
   const ulong self = control.dispatch_blocks + ulong(slot) * control.arguments_stride;
   device uchar *block = (device uchar *)self;
   uint count = control.count ? *(device const uint *)control.count : control.max_commands;
@@ -246,19 +255,20 @@ kernel void d3dalloy_rays_indirect(constant d3dalloy_rays_indirect_control &cont
     ulong value = *(device const ulong *)control.predicate;
     culled = control.predicate_not_equal ? value != 0 : value == 0;
   }
+  // Replaying the same recording can disable a slot which used to be live.
+  // Its indirect grid is authoritative. Do not consume the inactive D3D12 record.
+  if (slot >= count || culled)
+    return;
   d3dalloy_rays_desc d = *(device const d3dalloy_rays_desc *)(control.arguments + ulong(slot) * control.stride);
-  bool bad = slot >= count || culled;
-  bad |= !d.width || !d.height || !d.depth || d.width > 1073741824u || d.height > 1073741824u ||
-         d.depth > 1073741824u;
+  bool bad = !d.width || !d.height || !d.depth ||
+             ulong(d.width) * d.height > 1073741824ul / max(d.depth, 1u);
   bad |= !d.ray_generation.size || (d.ray_generation.address & 63) || d.ray_generation.size < 32 ||
          d.ray_generation.size > 4096;
   uint miss = table_records(d.miss, bad);
   uint hit = table_records(d.hit_group, bad);
   uint callable = table_records(d.callable, bad);
-  if (bad) {
-    grid[0] = grid[1] = grid[2] = 0;
+  if (bad)
     return;
-  }
   *(device ulong *)(block + D3DALLOY_RAYGEN_RECORD) = d.ray_generation.address;
   *(device ulong *)(block + D3DALLOY_MISS_BASE) = d.miss.address;
   *(device ulong *)(block + D3DALLOY_HIT_BASE) = d.hit_group.address;
@@ -273,9 +283,23 @@ kernel void d3dalloy_rays_indirect(constant d3dalloy_rays_indirect_control &cont
   *(device uint *)(block + D3DALLOY_HEIGHT) = d.height;
   *(device uint *)(block + D3DALLOY_DEPTH) = d.depth;
   *(device ulong *)(block + D3DALLOY_SELF) = self;
-  grid[0] = (d.width + control.group_width - 1) / control.group_width;
-  grid[1] = (d.height + control.group_height - 1) / control.group_height;
-  grid[2] = d.depth;
+  uint3 threads(control.group_width, control.group_height, 1);
+  uint3 groups = (uint3(d.width, d.height, d.depth) + threads - 1) / threads;
+  if (grid) {
+    grid[0] = groups.x; grid[1] = groups.y; grid[2] = groups.z;
+    return;
+  }
+  compute_command cmd(control.icb, uint(control.first_command) + slot);
+  cmd.set_kernel_buffer(block, D3DALLOY_DISPATCH_SLOT);
+  cmd.set_kernel_buffer(block + D3DALLOY_TABLES_OFFSET, D3DALLOY_TABLES_SLOT);
+  if (control.roots)
+    cmd.set_kernel_buffer((device uchar *)(control.roots + ulong(slot) * control.root_stride), D3DALLOY_ROOT_SLOT);
+  if (control.static_samplers)
+    cmd.set_kernel_buffer((device uchar *)control.static_samplers, D3DALLOY_SAMPLER_SLOT);
+  if (control.immutable_constants)
+    cmd.set_kernel_buffer((device uchar *)control.immutable_constants, D3DALLOY_CONSTANT_SLOT);
+  cmd.concurrent_dispatch_threadgroups(groups, threads);
+  cmd.set_barrier();
 }
 )metal";
 

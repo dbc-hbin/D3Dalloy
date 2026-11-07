@@ -45,7 +45,7 @@ constexpr UINT kHitOffset = 1024, kHitStride = 96, kHitCount = 8;
 constexpr UINT kCallableOffset = 2048, kCallableStride = 160, kCallableCount = 3;
 constexpr UINT kTableBytes = 4096;
 // Local descriptor slot of each record (heap index kGlobalDescriptors + slot).
-constexpr UINT kGlobalDescriptors = 3;
+constexpr UINT kGlobalDescriptors = 4;
 constexpr UINT kLocalMiss = 1, kLocalHit = kLocalMiss + kMissCount, kLocalCallable = kLocalHit + kHitCount;
 constexpr UINT kLocalCount = kLocalCallable + kCallableCount;
 
@@ -104,10 +104,10 @@ LaneSpec laneSpec(UINT lane) {
   switch (lane % 16) {
   case 0: case 1: case 2: aim(Target::Triangle, lane % 16); break;
   case 3: case 4: case 5: aim(Target::Box, lane % 16 - 3); break;
-  case 6: aim(Target::Triangle, 2), r.multiplier = 2, r.contribution = 2; break; // record 6
+  case 6: aim(Target::Triangle, 2), r.multiplier = 0x12, r.contribution = 0x22; break; // record 6
   case 7: aim(Target::Triangle, 1), r.multiplier = 3, r.contribution = 4; break; // record 7
-  case 8: r.missIndex = 0; break;
-  case 9: r.missIndex = 2; break;
+  case 8: aim(Target::Triangle, 0); break; // The ray would hit in Scenes[0], but selects the null TLAS.
+  case 9: r.missIndex = 0x10002; break;
   case 10: aim(Target::Triangle, 0), r.flags = kRayFlagSkipTriangles, r.missIndex = 1; break;
   case 11: aim(Target::Box, 1), r.flags = kRayFlagSkipProcedural, r.missIndex = 2; break;
   case 12: aim(Target::Box, 2), r.flags = kRayFlagSkipTriangles; break;
@@ -142,12 +142,12 @@ std::array<uint32_t, kSlotWords> expectedSlot(UINT x, UINT y, UINT z, UINT w, UI
     const auto [acc, data] = callChain(r.callRayGen);
     want[8] = acc, want[9] = data;
   }
-  const bool hit = (s.target == Target::Triangle && !(r.flags & kRayFlagSkipTriangles)) ||
-                   (s.target == Target::Box && !(r.flags & kRayFlagSkipProcedural));
+  const bool hit = lane % 16 != 8 && ((s.target == Target::Triangle && !(r.flags & kRayFlagSkipTriangles)) ||
+                                      (s.target == Target::Box && !(r.flags & kRayFlagSkipProcedural)));
   uint32_t kind = 2;
   if (hit) {
     const bool box = s.target == Target::Box;
-    const UINT record = (box ? kBoxContribution : 0) + r.contribution + r.multiplier * s.geometry;
+    const UINT record = (box ? kBoxContribution : 0) + (r.contribution & 15) + (r.multiplier & 15) * s.geometry;
     kind = box ? 3 : 1;
     want[11] = recordTag(kHitTable, record);
     want[12] = recordData(kHitTable, record);
@@ -161,8 +161,8 @@ std::array<uint32_t, kSlotWords> expectedSlot(UINT x, UINT y, UINT z, UINT w, UI
     if (box)
       want[18] = 0xB00 | s.geometry;
   } else {
-    want[11] = recordTag(kMissTable, r.missIndex);
-    want[12] = recordData(kMissTable, r.missIndex);
+    want[11] = recordTag(kMissTable, r.missIndex & 0xffff);
+    want[12] = recordData(kMissTable, r.missIndex & 0xffff);
   }
   want[10] = kind;
   if (r.callHit) {
@@ -377,11 +377,11 @@ private:
   void createRootSignatures() {
     D3D12_DESCRIPTOR_RANGE1 ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2;
+    ranges[0].NumDescriptors = 3;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 1;
-    ranges[1].OffsetInDescriptorsFromTableStart = 2;
+    ranges[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER1 global{};
     global.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     global.DescriptorTable = {2, ranges};
@@ -491,12 +491,12 @@ private:
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Buffer.NumElements = kLanes;
     srv.Buffer.StructureByteStride = sizeof(LaneRay);
-    device_->CreateShaderResourceView(rays_.Get(), &srv, cpuHandle(1));
+    device_->CreateShaderResourceView(rays_.Get(), &srv, cpuHandle(2));
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uav.Buffer.NumElements = kOutputWords;
     uav.Buffer.StructureByteStride = sizeof(uint32_t);
-    device_->CreateUnorderedAccessView(output_.Get(), nullptr, &uav, cpuHandle(2));
+    device_->CreateUnorderedAccessView(output_.Get(), nullptr, &uav, cpuHandle(3));
     // Each record's local table is one SRV whose only element is that record's data word.
     for (UINT slot = 0; slot < kLocalCount; ++slot) {
       D3D12_SHADER_RESOURCE_VIEW_DESC data{};
@@ -548,6 +548,8 @@ private:
     as.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     as.RaytracingAccelerationStructure.Location = tlas_->GetGPUVirtualAddress();
     device_->CreateShaderResourceView(nullptr, &as, cpuHandle(0));
+    as.RaytracingAccelerationStructure.Location = 0;
+    device_->CreateShaderResourceView(nullptr, &as, cpuHandle(1));
   }
 
   // Record layout (D3D12 local root layout): identifier, root constant at 32, table handle at 40.

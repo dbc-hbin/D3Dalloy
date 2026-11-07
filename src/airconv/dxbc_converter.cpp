@@ -26,7 +26,6 @@
 #include <string>
 #include <vector>
 
-#include "metallib_writer.hpp"
 #include "nt/air_builder.hpp"
 #include "shader_common.hpp"
 
@@ -899,7 +898,7 @@ llvm::Error convert_dxbc_pixel_shader(
   const uint32_t frontier_index = capture_frontier_enabled(pArgs) ? define_capture_frontier(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_PIXEL_SHADER, rootsig->bytecode,
-                                   rootsig->bytecode_length
+                                   rootsig->bytecode_length, ordinary_root_slot(*shader_info, pArgs)
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
 
@@ -1030,7 +1029,7 @@ llvm::Error convert_dxbc_compute_shader(
   const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D11_SB_COMPUTE_SHADER, rootsig->bytecode,
-                                   rootsig->bytecode_length
+                                   rootsig->bytecode_length, ordinary_root_slot(*shader_info, pArgs)
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
   setup_tgsm(shader_info, resource_map, types, module);
@@ -1272,7 +1271,7 @@ llvm::Error convert_dxbc_vertex_shader(
   const auto stats_arg = stats ? define_pipeline_statistics(func_signature) : ~0u;
   auto binding_map = rootsig ? setup_binding_rootsig(
                                    shader_info, func_signature, module, D3D10_SB_VERTEX_SHADER, rootsig->bytecode,
-                                   rootsig->bytecode_length
+                                   rootsig->bytecode_length, ordinary_root_slot(*shader_info, pArgs)
                                )
                              : setup_binding_table2(shader_info, func_signature, module);
 
@@ -1631,6 +1630,10 @@ d3dalloy::dxbc::build_argument_tables(d3dalloy::dxbc::SM50ShaderInternal *shader
       .SM50BindingSlot = range_id,
       .Flags = (MTL_SM50_SHADER_ARGUMENT_FLAG)0,
       .StructurePtrOffset = sampler.arg_index,
+      .RegisterSpace = sampler.range.space,
+      .RegisterLowerBound = sampler.range.lower_bound,
+      .RegisterCount = sampler.range.size,
+      .ShaderVisibilityMask = 1u << visibility,
     });
     binding_sampler_mask |= (1 << range_id);
   }
@@ -1803,6 +1806,8 @@ pRefl->ConstanttBufferTableBindIndex =
   pRefl->NumArguments = shader->args_reflection.size();
   pRefl->HasAtomic64 = 0;
   pRefl->PSCoverageInputs = 0;
+  pRefl->HasRayQuery = 0;
+  pRefl->RootArgumentsUnused = shader->shader_info.RootArgumentsUnused();
   if (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_MESH_SHADER ||
       shader->shader_type == microsoft::D3D12_SB_AMPLIFICATION_SHADER) {
@@ -2407,6 +2412,21 @@ static llvm::Error applyIndirectViewLocations(
   return Error::success();
 }
 
+static int finishShader(
+  llvm::Module &module, bool is_dxil, sm50_bitcode_t *ppBitcode, SM50ErrorInternal *errorObj,
+  llvm::raw_ostream &errorOut, sm50_error_t *ppError
+) {
+  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
+  if (auto error = d3dalloy::dxil::FinalizeShader(module, *compiled, is_dxil)) {
+    reportError(std::move(error), errorOut, errorObj);
+    failCall(errorObj, ppError);
+    return 1;
+  }
+  delete errorObj;
+  *ppBitcode = (sm50_bitcode_t)compiled.release();
+  return 0;
+}
+
 AIRCONV_API int SM50Compile(
   sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
@@ -2425,12 +2445,8 @@ AIRCONV_API int SM50Compile(
     return 1;
   }
 
-  // pArgs is ignored for now
-  LLVMContext context;
-
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
-
-  auto &shader_info = ((d3dalloy::dxbc::SM50ShaderInternal *)pShader)->shader_info;
+  auto *shader = (d3dalloy::dxbc::SM50ShaderInternal *)pShader;
+  auto &shader_info = shader->shader_info;
   SM50_SHADER_D3D12_MSAA_PIXEL_DATA *msaa_pixel = nullptr;
   d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_MSAA_PIXEL, SM50_SHADER_D3D12_MSAA_PIXEL_DATA>(pArgs, &msaa_pixel);
   SM50_SHADER_COMPILATION_ARGUMENT_DATA *coarse_shading = nullptr;
@@ -2453,7 +2469,7 @@ AIRCONV_API int SM50Compile(
   d3dalloy::dxbc::args_get_data<SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS,
     SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA>(pArgs, &indirect_views);
   const uint32_t sample_frequency_mask = !msaa_pixel && !msaa_vertex && pixel_pso &&
-    ((d3dalloy::dxbc::SM50ShaderInternal *)pShader)->ps_sample_frequency
+    shader->ps_sample_frequency
       ? pixel_pso->sample_mask : 0xffffffffu;
   const bool mark_rov_buffers = !msaa_vertex &&
     (!msaa_pixel || (msaa_pixel->variant & ~(SM50_MSAA_ATOMIC_HELPERS | SM50_MSAA_GPU_TILE_TASKS)) == SM50_MSAA_PIXEL ||
@@ -2477,116 +2493,33 @@ AIRCONV_API int SM50Compile(
     pArgs = (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&synthetic_capture;
   }
 
-  if (auto *sm50_shader = (d3dalloy::dxbc::SM50ShaderInternal *)pShader;
-      sm50_shader->dxil_bytecode) {
-    /* Shader Model 6.x: the parsed DXIL module is lowered in place and becomes the
-     * AIR module, so it uses its own context and module instead of `shader.air`. */
-    auto lowered = d3dalloy::dxil::LowerShader(*sm50_shader, FunctionName, pArgs);
+  // The lowered DXIL module owns a typed-pointer context. Keep that context
+  // alive through the same AIR transforms and serialization used by DXBC.
+  std::unique_ptr<LLVMContext> context;
+  std::unique_ptr<Module> pModule;
+  if (shader->dxil_bytecode) {
+    auto lowered = d3dalloy::dxil::LowerShader(*shader, FunctionName, pArgs);
     if (!lowered) {
       reportError(lowered.takeError(), errorOut, errorObj);
       failCall(errorObj, ppError);
       return 1;
     }
-    auto info = std::move(*lowered);
-    auto &pModule = info->module;
-    if (indirect_views) {
-      if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-    if (msaa_mesh) {
-      if (auto error = d3dalloy::msaa::transformMesh(*pModule, *msaa_mesh, conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-    if (msaa_pixel) {
-      if (auto error = d3dalloy::msaa::transformPixel(*pModule, *msaa_pixel, coarse_shading != nullptr,
-                                                   conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    } else if (msaa_vertex) {
-      if (auto error = d3dalloy::msaa::transformVertex(*pModule, *msaa_vertex, conservative_raster != nullptr)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    } else if (sample_frequency_mask != 0xffffffffu) {
-      if (auto error = d3dalloy::msaa::maskSampleFrequency(*pModule, sample_frequency_mask)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-    if (logic_op) {
-      if (auto error = d3dalloy::logic_op::applyLogicOp(*pModule, *logic_op)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-    if (mark_rov_buffers) {
-      if (auto error = activateRasterOrderedBuffers(*pModule, marker_samples, sample_frequency_mask)) {
-        reportError(std::move(error), errorOut, errorObj);
-        failCall(errorObj, ppError);
-        return 1;
-      }
-    }
-
-    if (shader_info.use_msad)
-      linkMSAD(*pModule);
-    if (shader_info.use_samplepos)
-      linkSamplePos(*pModule);
-
-    if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-      reportError(std::move(error), errorOut, errorObj);
+    context = std::move((*lowered)->context);
+    pModule = std::move((*lowered)->module);
+  } else {
+    context = std::make_unique<LLVMContext>();
+    context->setOpaquePointers(false);
+    pModule = std::make_unique<Module>("shader.air", *context);
+    initializeModule(*pModule);
+    d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pArgs);
+    if (coarse_shading) pModule->addModuleFlag(Module::Error, "d3dalloy.coarse.snapped", 1);
+    if (auto err = d3dalloy::dxbc::convertDXBC(pShader, FunctionName, *context, *pModule, pArgs)) {
+      llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) { errorOut << u.msg; });
       failCall(errorObj, ppError);
       return 1;
     }
-    runOptimizationPasses(*pModule);
-    auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-
-    raw_svector_ostream OS(compiled->vec);
-
-    metallib::MetallibWriter writer;
-
-    if (auto error = writer.Write(*pModule, OS)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-
-    info.reset();
-
-    delete errorObj;
-    *ppBitcode = (sm50_bitcode_t)compiled.release();
-    return 0;
   }
 
-  auto pModule = std::make_unique<Module>("shader.air", context);
-  initializeModule(*pModule);
-  d3dalloy::dxil::InitializeAtomic64Phase(*pModule, pArgs);
-  if (coarse_shading) pModule->addModuleFlag(Module::Error, "d3dalloy.coarse.snapped", 1);
-
-  if (auto err = d3dalloy::dxbc::convertDXBC(
-        pShader, FunctionName, context, *pModule, pArgs
-      )) {
-    llvm::handleAllErrors(std::move(err), [&](const UnsupportedFeature &u) {
-      errorOut << u.msg;
-    });
-    failCall(errorObj, ppError);
-    return 1;
-  }
   if (indirect_views) {
     if (auto error = applyIndirectViewLocations(*pModule, *indirect_views)) {
       reportError(std::move(error), errorOut, errorObj);
@@ -2641,38 +2574,7 @@ AIRCONV_API int SM50Compile(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
-  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-  runOptimizationPasses(*pModule);
-
-  // Serialize AIR
-  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-  }
-
-  raw_svector_ostream OS(compiled->vec);
-
-  metallib::MetallibWriter writer;
-
-  if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-
-  pModule.reset();
-
-  delete errorObj;
-  *ppBitcode = (sm50_bitcode_t)compiled.release();
-  return 0;
+  return finishShader(*pModule, shader->dxil_bytecode.has_value(), ppBitcode, errorObj, errorOut, ppError);
 }
 
 AIRCONV_API int SM50CompileTessellationPipelineHull(
@@ -2701,10 +2603,8 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
       dxil >= 0)
     return dxil;
 
-  // pArgs is ignored for now
   LLVMContext context;
-
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((d3dalloy::dxbc::SM50ShaderInternal *)pHullShader)->shader_info;
@@ -2730,38 +2630,7 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
     linkSamplePos(*pModule);
   linkTessellation(*pModule);
 
-  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-  runOptimizationPasses(*pModule);
-
-  // Serialize AIR
-  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-  }
-
-  raw_svector_ostream OS(compiled->vec);
-
-  metallib::MetallibWriter writer;
-
-  if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-
-  pModule.reset();
-
-  delete errorObj;
-  *ppBitcode = (sm50_bitcode_t)compiled.release();
-  return 0;
+  return finishShader(*pModule, false, ppBitcode, errorObj, errorOut, ppError);
 }
 
 AIRCONV_API int SM50CompileTessellationPipelineDomain(
@@ -2790,10 +2659,8 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
       dxil >= 0)
     return dxil;
 
-  // pArgs is ignored for now
   LLVMContext context;
-
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((d3dalloy::dxbc::SM50ShaderInternal *)pDomainShader)->shader_info;
@@ -2829,38 +2696,7 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
       return 1;
     }
 
-  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-  runOptimizationPasses(*pModule);
-
-  // Serialize AIR
-  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-  }
-
-  raw_svector_ostream OS(compiled->vec);
-
-  metallib::MetallibWriter writer;
-
-  if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-
-  pModule.reset();
-
-  delete errorObj;
-  *ppBitcode = (sm50_bitcode_t)compiled.release();
-  return 0;
+  return finishShader(*pModule, false, ppBitcode, errorObj, errorOut, ppError);
 }
 
 AIRCONV_API int SM50CompileGeometryPipelineVertex(
@@ -2889,10 +2725,8 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
       dxil >= 0)
     return dxil;
 
-  // pArgs is ignored for now
   LLVMContext context;
-
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info = ((d3dalloy::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
 
@@ -2925,38 +2759,7 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
-  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-  runOptimizationPasses(*pModule);
-
-  // Serialize AIR
-  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-  }
-
-  raw_svector_ostream OS(compiled->vec);
-
-  metallib::MetallibWriter writer;
-
-  if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-
-  pModule.reset();
-
-  delete errorObj;
-  *ppBitcode = (sm50_bitcode_t)compiled.release();
-  return 0;
+  return finishShader(*pModule, false, ppBitcode, errorObj, errorOut, ppError);
 }
 
 AIRCONV_API int SM50CompileGeometryPipelineGeometry(
@@ -2985,10 +2788,8 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
       dxil >= 0)
     return dxil;
 
-  // pArgs is ignored for now
   LLVMContext context;
-
-  context.setOpaquePointers(false); // I suspect Metal uses LLVM 14...
+  context.setOpaquePointers(false);
 
   auto &shader_info =
     ((d3dalloy::dxbc::SM50ShaderInternal *)pGeometryShader)->shader_info;
@@ -3024,38 +2825,7 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
   if (shader_info.use_samplepos)
     linkSamplePos(*pModule);
   
-  if (auto error = d3dalloy::dxil::LowerAtomic64Phase(*pModule)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-  runOptimizationPasses(*pModule);
-
-  // Serialize AIR
-  auto compiled = std::make_unique<SM50CompiledBitcodeInternal>();
-  if (pModule->getModuleFlag(d3dalloy::dxil::kAtomic64PhaseFlag)) {
-    if (auto error = d3dalloy::dxil::LowerImmutableConstants(*pModule, *compiled)) {
-      reportError(std::move(error), errorOut, errorObj);
-      failCall(errorObj, ppError);
-      return 1;
-    }
-  }
-
-  raw_svector_ostream OS(compiled->vec);
-
-  metallib::MetallibWriter writer;
-
-  if (auto error = writer.Write(*pModule, OS)) {
-    reportError(std::move(error), errorOut, errorObj);
-    failCall(errorObj, ppError);
-    return 1;
-  }
-
-  pModule.reset();
-
-  delete errorObj;
-  *ppBitcode = (sm50_bitcode_t)compiled.release();
-  return 0;
+  return finishShader(*pModule, false, ppBitcode, errorObj, errorOut, ppError);
 }
 
 AIRCONV_API void SM50GetCompiledBitcode(

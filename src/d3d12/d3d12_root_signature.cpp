@@ -41,6 +41,39 @@
 
 namespace d3dalloy {
 
+uint32_t StaticSamplerVisibility(MTLD3D12RootSignature *root, D3D12_SHADER_BYTECODE embedded,
+    std::span<const MTL_SM50_SHADER_ARGUMENT> bindings, uint32_t stages) {
+  if (root && !root->NumStaticSamplers) return 0;
+  uint32_t used = 0;
+  auto intersect = [&](UINT reg, UINT space, D3D12_SHADER_VISIBILITY visibility) {
+    const uint32_t visible = visibility == D3D12_SHADER_VISIBILITY_ALL ? stages : stages & (1u << visibility);
+    if (!(visible & ~used)) return;
+    for (const auto &b : bindings)
+      if (b.Type == SM50BindingType::Sampler && b.RegisterSpace == space &&
+          StaticSamplerRegisterInRange(reg, b.RegisterLowerBound, b.RegisterCount))
+        used |= visible & b.ShaderVisibilityMask;
+  };
+  if (root) {
+    for (const auto &s : root->static_sampler_bindings) intersect(s.reg, s.space, s.visibility);
+  } else {
+    uint32_t declared = 0;
+    for (const auto &b : bindings)
+      if (b.Type == SM50BindingType::Sampler) declared |= b.ShaderVisibilityMask & stages;
+    if (!declared) return 0;
+    const void *raw = nullptr;
+    UINT size = 0;
+    RootSignatureDeserializer deserializer;
+    if (FAILED(microsoft::DXBCGetRootSignature(embedded.pShaderBytecode, embedded.BytecodeLength, &raw, &size)) ||
+        FAILED(deserializer.Deserialize(raw, size))) return declared;
+    const auto &desc = deserializer.desc_1_1_.Desc_1_1;
+    for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
+      const auto &s = desc.pStaticSamplers[i];
+      intersect(s.ShaderRegister, s.RegisterSpace, s.ShaderVisibility);
+    }
+  }
+  return used;
+}
+
 /* Every global/local root used by one program shares this register-keyed immutable table. */
 HRESULT AppendRootStaticSamplers(
     MTLD3D12RootSignature *root, std::vector<D3D12_STATIC_SAMPLER_DESC> &table, UINT *appended
@@ -700,12 +733,15 @@ public:
 
     IsLocal = (static_cast<UINT>(desc.Flags) & 0x80u) != 0;
     Flags = static_cast<uint32_t>(desc.Flags);
+    CanReadSamplerHeap = (Flags & kRootSignatureFlagSamplerHeapDirectlyIndexed) != 0;
     NumStaticSamplers = desc.NumStaticSamplers;
     if (NumStaticSamplers) {
       try {
         std::set<MTLD3D12Device::StaticSamplerKey> unique;
+        static_sampler_bindings.reserve(desc.NumStaticSamplers);
         for (UINT i = 0; i < desc.NumStaticSamplers; ++i) {
           const auto &s = desc_1_2.pStaticSamplers[i];
+          static_sampler_bindings.push_back({s.ShaderRegister, s.RegisterSpace, s.ShaderVisibility});
           // Sampler flags distinguish otherwise identical states; they share the border word.
           unique.insert({static_cast<uint32_t>(s.Filter), static_cast<uint32_t>(s.AddressU),
                          static_cast<uint32_t>(s.AddressV), static_cast<uint32_t>(s.AddressW),
@@ -744,7 +780,7 @@ public:
         static_samplers_.reserve(desc.NumStaticSamplers);
         for (unsigned i = 0; i < desc.NumStaticSamplers; i++) {
           WMTSamplerInfo info;
-          PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i]);
+          PopulateWMTSamplerInfo(info, desc_1_2.pStaticSamplers[i]);
 
           auto sampler = device_->owned_native_states.SamplerState(device_->GetMTLDevice(), info, desc_1_2.pStaticSamplers[i].MipLODBias,
                                                 SamplerReductionMode(desc_1_2.pStaticSamplers[i].Filter));
@@ -794,6 +830,10 @@ public:
                                       ? previous_end : range.OffsetInDescriptorsFromTableStart;
           table_ranges_.push_back({offset, range.NumDescriptors, range.RangeType,
               range.RegisterSpace, range.BaseShaderRegister, parameter.ShaderVisibility, range.Flags});
+          CanReadSamplerHeap |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+          HasPixelUAVTable |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV &&
+              (parameter.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL ||
+               parameter.ShaderVisibility == D3D12_SHADER_VISIBILITY_PIXEL);
           HasTextureDescriptorTables |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
                                         range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
           previous_end = offset + range.NumDescriptors;
@@ -828,6 +868,28 @@ public:
     SlotQwordOffsets = qword_offsets_.data();
     ParameterTypes = parameter_types_.data();
     ParameterConstantCounts = parameter_constant_counts_.data();
+
+    // A table always consumes one qword. The ordinary VS never inspects ranges of a pixel-only
+    // table. Restrict this projection to table-only 1.0 roots with no sampler or hidden heap ABI.
+    const std::span parameters{desc.pParameters, desc.NumParameters};
+    if (deserializer.raw_root_sig_->Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && !NumStaticSamplers &&
+        !(Flags & ~D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT) &&
+        std::all_of(parameters.begin(), parameters.end(), [](const auto &p) {
+          return p.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        }) && std::any_of(parameters.begin(), parameters.end(), [](const auto &p) {
+          return p.ShaderVisibility == D3D12_SHADER_VISIBILITY_PIXEL;
+        })) {
+      vertex_table_key = {Flags, ParameterSlots};
+      for (const auto &p : parameters) {
+        vertex_table_key.push_back(p.ShaderVisibility);
+        if (p.ShaderVisibility == D3D12_SHADER_VISIBILITY_PIXEL)
+          continue;
+        vertex_table_key.push_back(p.DescriptorTable.NumDescriptorRanges);
+        for (const auto &range : std::span{p.DescriptorTable.pDescriptorRanges, p.DescriptorTable.NumDescriptorRanges})
+          vertex_table_key.insert(vertex_table_key.end(), {range.RangeType, range.NumDescriptors,
+              range.BaseShaderRegister, range.RegisterSpace, range.OffsetInDescriptorsFromTableStart});
+      }
+    }
 
     return S_OK;
   }

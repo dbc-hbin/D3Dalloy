@@ -10,10 +10,35 @@ library it links; the caller supplies no LLVM paths.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def plugin_images(plugin: Path, wine: Path) -> list[Path]:
+    dependencies = [wine / "dlls/ntdll/ntdll.so", wine / "dlls/winemac.drv/winemac.so",
+                    wine / "dlls/win32u/win32u.so"]
+    # dyld resolves a packaged plugin's imports from its own directory first.
+    # Only accept those paths for a manifest-identified owned compiler.
+    unix = plugin.parent
+    manifest = unix.parent.parent.parent / "owned-graphics-runtime.json"
+    if unix.parent.name == "wine" and unix.parent.parent.name == "lib" and manifest.is_file():
+        compiler = json.loads(manifest.read_text())["native_compiler"]
+        if (manifest.parent / compiler["path"]).resolve() == plugin:
+            if compiler["ownership"] != "self-owned" or sha256(plugin) != compiler["sha256"]:
+                raise SystemExit(f"OWNED_NULL_DESCRIPTOR_FAIL staged compiler differs from {manifest}")
+            staged = [plugin.with_name(p.name) for p in dependencies]
+            for path, built in zip(staged, dependencies):
+                if not path.is_file() or sha256(path) != sha256(built):
+                    raise SystemExit(f"OWNED_NULL_DESCRIPTOR_FAIL staged {path} differs from {built}")
+            dependencies = staged
+    return [plugin, *dependencies]
 
 
 def main() -> int:
@@ -82,8 +107,7 @@ def main() -> int:
     expected_images = []
     if args.unix_plugin:
         wine = args.wine_build.resolve()
-        expected_images = [args.unix_plugin.resolve(), wine / "dlls/ntdll/ntdll.so",
-                           wine / "dlls/winemac.drv/winemac.so", wine / "dlls/win32u/win32u.so"]
+        expected_images = plugin_images(args.unix_plugin.resolve(), wine)
         for image in expected_images:
             subprocess.run(["/usr/bin/lipo", "-verify_arch", args.native_arch, str(image)], check=True)
         environment["DYLD_LIBRARY_PATH"] = os.pathsep.join(str(image.parent) for image in expected_images)

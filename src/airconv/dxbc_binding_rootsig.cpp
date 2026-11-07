@@ -19,6 +19,7 @@
 #include "air_signature.hpp"
 #include "dxbc_converter.hpp"
 #include "dxbc_root_signature.hpp"
+#include "../d3d12/d3d12_sampler_metadata.hpp"
 #include "dxil_converter.hpp"
 #include "shader_common.hpp"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -267,6 +268,13 @@ public:
       return {};
     auto [SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder] =
         GetSamplerDescriptor(Builder, Table, Index, Sampler.range.lower_bound, Sampler.arg_index);
+    if (auto *slot = llvm::dyn_cast<llvm::ConstantInt>(Index)) {
+      const uint32_t index = uint32_t(slot->getZExtValue()) - Sampler.range.lower_bound + Sampler.arg_index;
+      if (index < StaticSamplerWords.size()) {
+        Metadata = Builder.builder.getInt64(StaticSamplerWords[index].first);
+        LodRange = Builder.builder.getInt64(StaticSamplerWords[index].second);
+      }
+    }
     return SamplerDescriptor{SamplerH, CubeSampler, Metadata, LodRange, Border, FloatBorder};
   }
 
@@ -873,6 +881,7 @@ public:
    */
   uint32_t RootSignatureArgumentSlot = ~0u;
   uint32_t StaticSamplerArgumentSlot = ~0u;
+  std::vector<std::pair<uint64_t, uint64_t>> StaticSamplerWords;
 
   /**
    * Entry type of the global root signature, i.e. of the command list's root
@@ -1683,7 +1692,7 @@ setup_binding_rootsig(
    * so declaring it would leave an argument the pipeline never binds. That is the
    * signature a raytracing pipeline with no global root signature gets.
    */
-  if (bind_signature_arguments && !builder.Empty())
+  if (bind_signature_arguments && root_sig_slot != ~0u && !builder.Empty())
     binding_map->RootSignatureArgumentSlot = func_signature.DefineInput(air::ArgumentBindingIndirectBuffer{
         .location_index = root_sig_slot, // SM50_BINDING_INDEX_ROOT_ARGUMENTS
         .array_size = 1,
@@ -1694,20 +1703,32 @@ setup_binding_rootsig(
         .arg_name = "rootsig",
     });
 
-  if (root_sig && root_sig->NumStaticSamplers) {
+  bool uses_static_sampler = false;
+  if (root_sig && root_sig->NumStaticSamplers && !shader_info->samplerMap.empty()) {
     for (unsigned i = 0; i < root_sig->NumStaticSamplers; i++) {
-      auto &State = root_sig->pStaticSamplers[i];
-
+      const auto &State = deserializer.desc_1_2_.Desc_1_2.pStaticSamplers[i];
+      if (!check_visibility(State.ShaderVisibility)) continue;
       for (auto &[_, sampler] : shader_info->samplerMap) {
         if (sampler.range.space != State.RegisterSpace)
           continue;
+        if (StaticSamplerRegisterInRange(State.ShaderRegister, sampler.range.lower_bound, sampler.range.size))
+          uses_static_sampler = true;
         if (sampler.range.lower_bound != State.ShaderRegister)
           continue;
-        if (!check_visibility(State.ShaderVisibility))
-          break;
         auto range_id = sampler.range.range_id;
         binding_map->Global.Samplers[range_id] = {sampler, ~0u};
         binding_map->Global.Samplers[range_id].first.arg_index = i;
+      }
+    }
+    if (uses_static_sampler) {
+      binding_map->StaticSamplerWords.reserve(root_sig->NumStaticSamplers);
+      for (unsigned i = 0; i < root_sig->NumStaticSamplers; ++i) {
+        const auto &state = deserializer.desc_1_2_.Desc_1_2.pStaticSamplers[i];
+        const auto flags = sampler_feedback::SamplerFlags(state.Filter, state.AddressU, state.AddressV,
+            state.MaxAnisotropy, state.Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES, state.AddressW,
+            UINT(state.BorderColor) >= kStaticBorderColorOpaqueBlackUint, state.ComparisonFunc);
+        binding_map->StaticSamplerWords.emplace_back(sampler_feedback::SamplerMetadata(state.MipLODBias, flags),
+            sampler_feedback::SamplerLodRange(state.MinLOD, state.MaxLOD));
       }
     }
   }
@@ -1783,6 +1804,12 @@ setup_binding_rootsig(
   if (!root_sig || root_sig->NumStaticSamplers == 0)
     return binding_map;
 
+  // Ordinary stages can reach static samplers only through a declared sampler.
+  // Raygen can forward the table to other exports through the invocation frame.
+  if (!uses_static_sampler && (shader_type <= D3D11_SB_COMPUTE_SHADER ||
+      shader_type == D3D12_SB_AMPLIFICATION_SHADER || shader_type == D3D12_SB_MESH_SHADER))
+    return binding_map;
+
   if (bind_signature_arguments)
     binding_map->StaticSamplerArgumentSlot = func_signature.DefineInput(air::ArgumentBindingBuffer{
         .buffer_size = {},
@@ -1806,7 +1833,7 @@ AIRCONV_API int SM50NeedsRasterOrderedBufferMarker(
   if (!pShader || !pRootSignature || !RootSignatureLength)
     return 0;
   const auto *shader = static_cast<const d3dalloy::dxbc::SM50ShaderInternal *>(pShader);
-  if (shader->shader_type != microsoft::D3D10_SB_PIXEL_SHADER)
+  if (shader->shader_type != microsoft::D3D10_SB_PIXEL_SHADER || shader->shader_info.uavMap.empty())
     return 0;
   d3dalloy::RootSignatureDeserializer deserializer;
   const auto *root = d3dalloy::dxbc::deserialize_root_signature(

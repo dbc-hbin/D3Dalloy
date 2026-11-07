@@ -20,6 +20,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_command_allocator.hpp"
+#include "d3dalloy_hud_state.hpp"
 #include "d3d12_enhanced_barrier.hpp"
 #include "d3d12_pageable.hpp"
 #include "d3d12_resource_contract.hpp"
@@ -48,6 +49,7 @@
 #include <cstdio>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <list>
 #include <deque>
@@ -55,6 +57,7 @@
 #include <stdexcept>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -86,7 +89,7 @@ struct SubmissionDescriptorCache {
   bool helper_passes = false;
 
   bool Current(MTLD3D12Device *device) const {
-    if (va_generation != device->buffer_va_generation.load(std::memory_order_acquire)) return false;
+    if (!buffers.empty() && va_generation != device->buffer_va_generation.load(std::memory_order_acquire)) return false;
     for (const auto &version : versions)
       if (version.heap->GetDescriptorVersion(version.index) != version.value) return false;
     for (const auto &resource : resources) {
@@ -118,16 +121,18 @@ struct SubmissionNode {
   bool concurrent_dispatches = false;
   bool external_backing = false;
   bool writes_external_backing = false;
-  uint64_t independent_dispatch_mask = 0;
+  small_vector<uint64_t, 1> independent_dispatch_masks;
   const char *dispatch_serial_reason = "unresolved";
   size_t dispatch_proof_checks = 0;
   bool boundary_before = false, boundary_after = false, force_fence_before = false, skip_clear = false;
+  bool explicit_refit_boundary = false;
   // The boundary only bounds planner frontier work: it orders no memory the
   // allocation summaries miss, so replay keeps in-flight tracking across it.
   bool partition_before = false;
   // Writable MSAA import/export helpers run around this node and wait on the
   // fence themselves: the node keeps its own wait and produces render stages.
   bool helper_passes = false;
+  bool has_immediate_marker = false;
   bool sparse_resource_used = false;
   bool placed_attachments = false;
   // A whole-surface AVERAGE ResolveSubresource immediately after this native
@@ -213,7 +218,10 @@ bool AppendAdmissionAccess(PhysicalAdmissionProof &proof, SubmissionAccess acces
         access.end > (*owner)->byteLength() || access.end == UINT64_MAX ||
         access.Key().owner != (*owner)->buffer().handle) return false;
     proof.buffers.push_back(*owner);
-    if (whole) { access.begin = 0; access.end = (*owner)->byteLength(); }
+    if (whole) {
+      access.begin = 0; access.end = (*owner)->byteLength();
+      access.byte_stride = access.element_bytes = 0;
+    }
   } else if (access.Key().domain == PhysicalDomain::Texture) {
     auto *allocation = const_cast<TextureAllocation *>(static_cast<const TextureAllocation *>(access.allocation));
     if (!PlainAdmissionTexture(allocation) || !access.aspects ||
@@ -240,7 +248,7 @@ bool AdmissionCovers(const GPUExecutionGate::Accesses &proof, const SubmissionAc
   if (!proof) return false;
   return std::any_of(proof->begin(), proof->end(), [&](const auto &prior) {
     if (prior.Key() != access.Key() || (access.writes && !prior.writes)) return false;
-    if (!prior.aspects && !access.aspects) return prior.begin <= access.begin && prior.end >= access.end;
+    if (!prior.aspects && !access.aspects) return prior.CoversBytes(access);
     return prior.aspects && access.aspects && (access.aspects & ~prior.aspects) == 0 &&
         prior.mip_begin <= access.mip_begin && prior.mip_end >= access.mip_end &&
         prior.slice_begin <= access.slice_begin && prior.slice_end >= access.slice_end;
@@ -269,7 +277,7 @@ bool AppendSubmissionAccess(SubmissionNode &node, SubmissionAccess access) {
   auto &slots = node.access_slots[access.Key()];
   for (const auto slot : slots) {
     auto &prior = node.accesses[slot];
-    if (prior.begin == access.begin && prior.end == access.end && prior.mip_begin == access.mip_begin &&
+    if (prior.SamePattern(access) && prior.begin == access.begin && prior.end == access.end && prior.mip_begin == access.mip_begin &&
         prior.mip_end == access.mip_end && prior.slice_begin == access.slice_begin && prior.slice_end == access.slice_end &&
         prior.aspects == access.aspects && prior.writes == access.writes && prior.attachment == access.attachment &&
         prior.allocation == access.allocation) {
@@ -322,7 +330,7 @@ void DiscardOverwrittenStores(SubmissionPlan &plan, size_t next, const ClearEnco
   for (size_t i = next; i && next - i < kSubmissionCandidateBudget;) {
     auto &node = plan.nodes[--i];
     if (node.list_ordinal != consumer.list_ordinal || !node.access_complete || node.boundary_after ||
-        node.helper_passes || node.external_backing || node.sparse_resource_used) return;
+        node.helper_passes || node.has_immediate_marker || node.external_backing || node.sparse_resource_used) return;
     if (std::any_of(node.scopes_after.begin(), node.scopes_after.end(),
                     [&](const SubmissionAccess &scope) { return AccessOverlaps(scope, range); })) return;
     if (std::any_of(node.accesses.begin(), node.accesses.end(),
@@ -389,6 +397,7 @@ const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Dev
   if (render.submission_root_srv_opaque) return "unresolved_root_srv";
   if (render.submission_snapshot_budget) return "recorded_buffer_budget";
   if (!render.submission_group_safe) return "shader_or_state_unresolved";
+  if (!access_only && render.fixed_indirect) return "fixed_indirect";
   // The pass's own accesses do not depend on why recording closed it. The
   // opaque endpoint still forces boundary_after, so the next node resets
   // in-flight tracking and keeps its fence wait (draining a skipped one).
@@ -470,21 +479,30 @@ const char *OrdinaryRenderRejection(const RenderEncoderData &render, MTLD3D12Dev
 }
 // No state_events inference: these summaries describe native allocation effects.
 bool AppendSubmissionBuffer(SubmissionNode &node, MTLD3D12Device *device,
-                            uint64_t address, uint64_t bytes, bool writes, uint64_t stages, SubmissionAccess *captured = nullptr) {
-  uint64_t offset = 0;
-  auto allocation_owner = device->LookupBufferByVA(address, &offset);
+                            uint64_t address, uint64_t bytes, bool writes, uint64_t stages, SubmissionAccess *captured = nullptr,
+                            uint32_t stride = 0, uint32_t count = 1) {
+  uint64_t offset = 0, begin = 0, end = 0, generation = 0;
+  auto allocation_owner = device->LookupBufferRangeByVA(address, &offset, &begin, &end, &generation);
   auto *allocation = allocation_owner.ptr();
   if (!allocation || offset >= allocation->byteLength()) return false;
   if (allocation->reservedResource || allocation->flags().test(BufferAllocationFlag::PlacementSparse)) {
     node.sparse_resource_used = true;
     return false;
   }
-  const uint64_t length = bytes == UINT64_MAX ? allocation->byteLength() - offset : bytes;
+  const uint64_t length = bytes == UINT64_MAX ? allocation->byteLength() - offset :
+      bytes + uint64_t(count - 1) * stride;
   if (length > allocation->byteLength() - offset) return false;
-  if (!length) return true;
+  // A later VA registration can shadow an interior interval of the original buffer.
+  if (count > 1 && (address >= end || length > end - address || allocation->canonicalHeap ||
+                    allocation->flags().test(BufferAllocationFlag::CpuPlaced))) return false;
   node.allocation_pins.push_back(std::move(allocation_owner));
-  const auto access = BufferAccess(allocation, bytes == UINT64_MAX ? 0 : offset,
+  if (!length) return true;
+  auto access = BufferAccess(allocation, bytes == UINT64_MAX ? 0 : offset,
       bytes == UINT64_MAX ? allocation->byteLength() : length, writes, stages);
+  if (count > 1 && stride > bytes) {
+    access.byte_stride = stride;
+    access.element_bytes = uint32_t(bytes);
+  }
   if (captured) *captured = access;
   return AppendSubmissionAccess(node, access);
 }
@@ -737,74 +755,57 @@ bool ResolveSubmissionTables(SubmissionPlan &plan, SubmissionNode &node, MTLD3D1
 bool IndependentComputeDispatches(SubmissionPlan &plan, SubmissionNode &node, MTLD3D12Device *device,
     const ClosedPassShape &shape, std::span<const SubmissionAccess> buffers, const SubmissionDescriptorCache *tables) {
   if (node.external_backing) { node.dispatch_serial_reason = "dispatch_external_backing"; return false; }
-  if (!shape.dispatch_access_complete || shape.dispatches.size() < 2) {
+  if (!shape.dispatch_access_complete || shape.dispatch_memberships.size() < 2) {
     node.dispatch_serial_reason = "dispatch_capture"; return false;
   }
-  constexpr size_t access_budget = 256, comparison_budget = 4096;
-  static_assert(kRecordedDispatchBudget <= 64);
-  uint64_t independent = 0;
-  bool has_dependency = false;
-  size_t access_count = 0;
-  std::unordered_map<PhysicalIdentity, std::vector<SubmissionAccess>, PhysicalIdentityHash> prior;
-  for (size_t i = 0; i < shape.dispatches.size(); ++i) {
-    const auto &dispatch = shape.dispatches[i];
-    SubmissionNode resolved{};
-    bool complete = true;
-    for (const auto index : dispatch.buffers) {
-      if (index >= buffers.size() || (buffers[index].allocation && !AppendSubmissionAccess(resolved, buffers[index]))) {
-        complete = false; break;
-      }
-    }
-    if (complete && tables && dispatch.uses_pass_descriptors) {
-      for (const auto &access : tables->accesses)
-        if (!AppendSubmissionAccess(resolved, access)) { complete = false; break; }
-    } else if (complete) complete = ResolveSubmissionTables(plan, resolved, device, dispatch);
-    for (auto &pin : resolved.allocation_pins) node.allocation_pins.push_back(std::move(pin));
-    if (!complete || resolved.sparse_resource_used || resolved.helper_passes) {
-      node.dispatch_serial_reason = "dispatch_access"; return false;
-    }
-    if (resolved.accesses.size() > access_budget - access_count) {
-      node.dispatch_serial_reason = "dispatch_budget"; return false;
-    }
-    access_count += resolved.accesses.size();
-    if (resolved.external_backing) {
-      node.external_backing = true;
-      node.writes_external_backing |= resolved.writes_external_backing;
-      node.dispatch_serial_reason = "dispatch_external_backing"; return false;
-    }
-    bool conflict = false;
-    for (const auto &access : resolved.accesses) {
-      const auto found = prior.find(access.Key());
-      if (found == prior.end()) continue;
-      for (const auto &earlier : found->second) {
-        if (!access.writes && !earlier.writes) continue;
-        if (++node.dispatch_proof_checks > comparison_budget) {
-          node.dispatch_serial_reason = "dispatch_budget"; return false;
-        }
-        if (AccessOverlaps(access, earlier)) {
-          conflict = true;
-          break;
+  small_vector<uint64_t, 1> masks;
+  DispatchDependencyProof proof;
+  SubmissionNode resolved{};
+  size_t last_membership = SIZE_MAX;
+  for (size_t i = 0; i < shape.dispatch_memberships.size(); ++i) {
+    const size_t membership = shape.dispatch_memberships[i];
+    if (membership != last_membership) {
+      last_membership = membership;
+      resolved = SubmissionNode{};
+      const auto &dispatch = shape.dispatches[membership];
+      bool complete = true;
+      for (uint64_t remaining = dispatch.buffers; remaining; remaining &= remaining - 1) {
+        const auto index = unsigned(__builtin_ctzll(remaining));
+        if (index >= buffers.size() || (buffers[index].allocation && !AppendSubmissionAccess(resolved, buffers[index]))) {
+          complete = false; break;
         }
       }
-      if (conflict) break;
+      if (complete && tables && dispatch.uses_pass_descriptors) {
+        for (const auto &access : tables->accesses)
+          if (!AppendSubmissionAccess(resolved, access)) { complete = false; break; }
+      } else if (complete) complete = ResolveSubmissionTables(plan, resolved, device, dispatch);
+      for (auto &pin : resolved.allocation_pins) node.allocation_pins.push_back(std::move(pin));
+      if (!complete || resolved.sparse_resource_used || resolved.helper_passes) {
+        node.dispatch_serial_reason = "dispatch_access"; return false;
+      }
+      if (resolved.external_backing) {
+        node.external_backing = true;
+        node.writes_external_backing |= resolved.writes_external_backing;
+        node.dispatch_serial_reason = "dispatch_external_backing"; return false;
+      }
     }
-    if (conflict) {
-      has_dependency = true;
-      prior.clear();
-    } else if (i) {
-      independent |= uint64_t(1) << i;
+    if (!proof.Append(i, resolved.accesses)) {
+      node.dispatch_proof_checks = proof.comparisons;
+      node.dispatch_serial_reason = "dispatch_budget";
+      return false;
     }
-    // Publish only after checking the entire dispatch: its own read/write
-    // aliases are intra-dispatch semantics and do not imply a preceding edge.
-    for (const auto &access : resolved.accesses) prior[access.Key()].push_back(access);
+    if (i % 64 == 63 || i + 1 == shape.dispatch_memberships.size()) masks.push_back(proof.independent);
   }
-  if (has_dependency) {
-    node.dispatch_serial_reason = independent ? "mixed_dependencies" : "dispatch_dependency";
-    node.independent_dispatch_mask = independent;
+  node.dispatch_proof_checks = proof.comparisons;
+  if (proof.needs_barrier) {
+    node.dispatch_serial_reason = proof.budget_barrier ? "dispatch_budget" :
+        (std::any_of(masks.begin(), masks.end(), [](uint64_t word) { return word != 0; })
+            ? "mixed_dependencies" : "dispatch_dependency");
+    node.independent_dispatch_masks = std::move(masks);
   } else {
     node.dispatch_serial_reason = "independent";
   }
-  return !has_dependency;
+  return !proof.needs_barrier;
 }
 const char *AppendRenderMember(RenderReplayGroup &group, const RenderEncoderData &render, bool first,
                               std::array<uint8_t, 8> &map) {
@@ -1162,6 +1163,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   WMT::Reference<WMT::Texture> null_shading_rate_image_; // submission thread only; never sampled
   WMT::Reference<WMT::SharedEvent> tile_mapping_event_;
   WMT::Reference<WMT::SharedEvent> tile_mapping_input_event_;
+  WMT::Reference<WMT::Buffer> auxiliary_mapping_marker_;
   uint64_t tile_mapping_value_ = 0; // submission thread only
   uint64_t tile_mapping_request_count_ = 0; // public FIFO order, tracing only
   /* Signal/wait pairs of this shared event flush sparse page aliases (a plain MTLEvent does not). */
@@ -1277,7 +1279,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     inflight_unsealed_ = false;
   }
   static bool SameAccessSpan(const SubmissionAccess &a, const SubmissionAccess &b) {
-    return a.begin == b.begin && a.end == b.end && a.mip_begin == b.mip_begin && a.mip_end == b.mip_end &&
+    return a.SamePattern(b) && a.begin == b.begin && a.end == b.end && a.mip_begin == b.mip_begin && a.mip_end == b.mip_end &&
         a.slice_begin == b.slice_begin && a.slice_end == b.slice_end && a.aspects == b.aspects &&
         a.writes == b.writes && a.attachment == b.attachment && a.Key() == b.Key();
   }
@@ -1478,6 +1480,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     Rc<Fence> fence;
     Fence::QueueTicket ticket;
     uint64_t fence_id = 0;
+    bool native_wait_armed = false;
   };
 
   struct PresentTask {
@@ -1619,8 +1622,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     // stay alive until completion, which checks each assembly's invariant status word.
     std::vector<std::shared_ptr<StreamOutputDrawData>> so_draws;
     std::vector<WMT::Reference<WMT::Buffer>> so_indirect_buffers;
-    std::vector<Rc<BufferAllocation>> mesh_indirect_owners;
-    std::vector<WMT::Reference<WMT::IndirectCommandBuffer>> so_indirect_icbs;
     std::vector<WMT::Reference<WMT::Buffer>> msaa_buffers;
     std::vector<WMT::Reference<WMT::Texture>> msaa_textures;
     struct ROVMarkerTexture {
@@ -1675,6 +1676,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<TextureViewRef> cast_views;
     std::vector<Rc<TextureAllocation>> cast_allocations;
     std::vector<WMT::Reference<WMT::Heap>> volume_heaps;
+    std::vector<WMT::Reference<WMT::MTL4Submission>> auxiliary_mappings;
     std::vector<WMT::Reference<WMT::Texture>> volume_textures;
     struct MappingResource {
       Com<MTLD3D12Resource, false> owner;
@@ -1709,7 +1711,6 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       keep(rtas_observations, fresh.rtas_observations); keep(temporal_frames, fresh.temporal_frames);
       keep(frame_generation_frames, fresh.frame_generation_frames); keep(ray_regeneration_frames, fresh.ray_regeneration_frames);
       keep(so_draws, fresh.so_draws); keep(so_indirect_buffers, fresh.so_indirect_buffers);
-      keep(mesh_indirect_owners, fresh.mesh_indirect_owners); keep(so_indirect_icbs, fresh.so_indirect_icbs);
       keep(msaa_buffers, fresh.msaa_buffers); keep(msaa_textures, fresh.msaa_textures); keep(rov_markers, fresh.rov_markers);
       keep(swizzle_buffers, fresh.swizzle_buffers); keep(swizzle_dirty_flags, fresh.swizzle_dirty_flags);
       keep(swizzle_batch_buffers, fresh.swizzle_batch_buffers);
@@ -1805,7 +1806,13 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       }
       const bool mapping_error = inflight.mapping_pending &&
           (!inflight.mapping_pre_submission || !mapping_pre.completed || mapping_pre.error_handle);
-      const bool metal_error = !inflight.submission || !completion.completed || completion.error_handle || mapping_error;
+      bool metal_error = !inflight.submission || !completion.completed || completion.error_handle || mapping_error;
+      for (auto &mapping : inflight.auxiliary_mappings) {
+        WMTMetal4SubmissionInfo info{};
+        mapping.waitUntilCompleted();
+        mapping.getInfo(info);
+        metal_error |= !info.completed || info.error_handle;
+      }
       if (inflight.mapping_pending) {
         inflight.mapping_pending.Retire(!metal_error);
         for (const auto &entry : inflight.mapping_resources)
@@ -1992,10 +1999,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       queue->device_->reflex.Submitted(inflight.reflex_work, inflight.cpu_submit_ns);
       auto target = native_queue ? native_queue : WMT::MTL4CommandQueue(queue->queue_);
       inflight.submission = queue->device_->CommitMetal4CommandBuffers(target, &buffer, 1);
+      if (inflight.submission && inflight.native_present && inflight.native_present->native_present_reserved)
+        HUDState::sampleStatistics(inflight.native_present->present_id);
       if (publish_swizzle_carry && inflight.submission)
         queue->PublishSwizzleCarry(inflight, seq);
       for (const auto &[event, value] : signals)
         target.signalEvent(event, value);
+      if (inflight.submission)
+        for (const auto &signal : inflight.fence_completions)
+          signal.fence->markQueueSignalSubmitted(signal.ticket);
       owned_graphics::Trace("submit", ",\"queue\":", queue->owned_id_, ",\"submission\":", seq,
                             ",\"cpu_submit_ns\":", inflight.cpu_submit_ns);
       queue->submission_ring_.publish(seq);
@@ -2090,6 +2102,28 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         } catch (HRESULT reason) {
           device_->ReportRemoval(reason);
         }
+      } else if (auto *wait = std::get_if<WaitTask>(&task);
+                 wait && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK &&
+                 !wait->ticket.latch->ready() && wait->ticket.order->hasSubmittedProducer(wait->ticket.value)) {
+        QueueTask next;
+        while (!wait->ticket.latch->ready() && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK &&
+               task_fifo_.tryPop(next)) {
+          if (auto *execute = std::get_if<ExecuteTask>(&next)) {
+            try {
+              ProcessExecute(*execute, nullptr, nullptr, wait);
+            } catch (const std::bad_alloc &) {
+              device_->ReportRemoval(E_OUTOFMEMORY);
+            } catch (HRESULT reason) {
+              device_->ReportRemoval(reason);
+            }
+          } else {
+            pending_task = std::move(next);
+            break;
+          }
+        }
+        // FIFO GPU work can share the one queue event. Host-side tasks still
+        // await validated completion, and each Execute must pass preflight.
+        if (!cancel_unsubmitted_ && !wait->ticket.latch->ready()) ProcessWait(*wait);
       } else if (auto *signal = std::get_if<SignalTask>(&task);
           signal && !cancel_unsubmitted_ && device_->RemovedReason() == S_OK) {
         try {
@@ -2385,7 +2419,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       std::lock_guard<d3dalloy::mutex> enqueue_lock(mutex_enqueue_);
       if (device_->RemovedReason() != S_OK)
         return false;
-      return task_fifo_.push(QueueTask{std::move(task)});
+      const bool accepted = task_fifo_.push(QueueTask{std::move(task)});
+      if (accepted) HUDState::addStatistic(HUDStatistic::TileUpdate);
+      return accepted;
     } catch (const std::bad_alloc &) {
       device_->ReportRemoval(DXGI_ERROR_DEVICE_REMOVED);
       return false;
@@ -2685,6 +2721,10 @@ public:
         ERR("UpdateTileMappings: ranges cover ", next, " tiles but regions ", tiles.size());
         return;
       }
+      if (native_heap && native_heap->placement_ranges &&
+          std::any_of(task.assignments.begin(), task.assignments.end(),
+                      [](const auto &assignment) { return bool(assignment.second.heap); }))
+        native_heap->placement_ranges->Disable();
       task.resource = native;
       PushTileMapping(std::move(task));
     } catch (const std::bad_alloc &) {
@@ -2848,18 +2888,6 @@ public:
     encoder.updateFence(fence_);
     encoder.endEncoding();
   }
-
-  struct SOIndirectExecution {
-    WMT::Reference<WMT::Buffer> storage;
-    WMT::Reference<WMT::IndirectCommandBuffer> icb;
-    std::vector<std::shared_ptr<StreamOutputDrawData>> draws;
-    const IndirectRenderCommandData *command = nullptr;
-    const SOIndirectCaptureBinding *bindings = nullptr;
-    uint64_t root_offset = 0;
-    uint64_t vertex_offset = 0;
-    uint64_t command_offset = 0;
-    uint32_t count = 0;
-  };
 
   struct MSAAExecution {
     WMT::Reference<WMT::Buffer> vertices;
@@ -3645,11 +3673,9 @@ public:
     encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&dispatch));
   }
 
-  struct MeshCaptureExecution;
   bool EncodeMSAAProducer(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                           RenderEncoderData &render, const MSAADrawData &draw,
-                          MSAAExecution &execution, const MeshCaptureExecution *capture_indirect = nullptr,
-                          uint32_t capture_command = UINT32_MAX) {
+                          MSAAExecution &execution) {
     auto metal = device_->GetMTLDevice();
     const uint64_t record_count = uint64_t(draw.assembly.vertex_count) * draw.assembly.instance_count;
     const uint64_t max_primitives = draw.assembly.max_primitives;
@@ -3794,8 +3820,6 @@ public:
       control_binding.next.set(draw.object_records ? nullptr : &render.cmd_head);
       encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&records));
       if (draw.object_records) EncodeObjectReplay(encoder, render, draw);
-      if (capture_indirect)
-        EncodeMeshCaptureDraws(encoder, *capture_indirect, render.capture_indirect_pass, capture_command);
       encoder.updateFence(fence_, WMTRenderStageObject | WMTRenderStageMesh);
       encoder.endEncoding();
     } else {
@@ -4179,6 +4203,7 @@ public:
         case WMTRenderCommandSetFragmentBytes: append_record.operator()<wmtcmd_render_setbytes>(); break;
         case WMTRenderCommandSetRasterizerState: {
           auto raster = *reinterpret_cast<const wmtcmd_render_setrasterizerstate *>(node);
+          raster.changed = WMTRasterAll; // Replay restores the complete overridden raster state.
           if (draw.line_mode != SM50_MSAA_LINE_NONE)
             raster.cull_mode = WMTCullModeNone;
           // Conservative replay geometry extrapolates the primitive's plane past its clipped extent; depth
@@ -4191,6 +4216,17 @@ public:
             raster.depth_bias_clamp = 0;
           }
           replay.commands.emplace_back(raster);
+          break;
+        }
+        case WMTRenderCommandSetViewportScissors: {
+          auto *body = reinterpret_cast<wmtcmd_render_set_viewport_scissors *>(node);
+          if (body->viewport_count) {
+            wmtcmd_render_setviewports viewport{};
+            viewport.type = WMTRenderCommandSetViewports;
+            viewport.viewport_count = body->viewport_count;
+            viewport.viewports.set(body + 1);
+            replay.commands.emplace_back(viewport);
+          }
           break;
         }
         case WMTRenderCommandSetViewports: append_record.operator()<wmtcmd_render_setviewports>(); break;
@@ -4890,34 +4926,6 @@ public:
     return true;
   }
 
-  /* One execution of a capture-sized ExecuteIndirect (MeshCaptureIndirectData): per active command, its captures,
-   * sized from its GPU-written arguments exactly as a direct draw of the same arguments. */
-  struct MeshCaptureCommand {
-    WMT::Reference<WMT::Buffer> scratch, list; // TS+GS DS capture and flat primitive list
-    WMT::Reference<WMT::Buffer> primitive_summaries;
-    PrimitiveScanPlan scan_plan;
-    uint64_t scan_control_offset = 0;
-    uint64_t slots = 0;
-    uint64_t args_offset = 0, capture_offset = 0, compact_offset = 0, dispatch_offset = 0;
-    uint32_t patches = 0, instances = 0, vertex_count = 0;
-    uint32_t slot = 0; // the command's index among the signature's commands
-    Rc<BufferAllocation> index_owner;
-    WMT::Buffer index_buffer;
-    uint64_t index_offset = 0;
-    // Strip expansion (MeshCaptureIndirectData::strip_expand): the command's list and its control/arguments
-    // (control at strip_control_offset of the execution storage, then 64 bytes of draw + object-grid arguments).
-    WMT::Reference<WMT::Buffer> strip_list;
-    uint64_t strip_control_offset = 0;
-    uint64_t strip_first_byte = 0; // byte offset of the command's first index in the index buffer
-    std::shared_ptr<StreamOutputDrawData> so;
-  };
-  struct MeshCaptureExecution {
-    std::shared_ptr<const MeshCaptureIndirectData> data;
-    WMT::Reference<WMT::Buffer> storage;
-    std::vector<MeshCaptureCommand> commands;
-    std::vector<std::shared_ptr<StreamOutputDrawData>> so_draws;
-  };
-
   /* IA primitives in `count` vertices of a D3D_PRIMITIVE_TOPOLOGY (list topologies, non-cut strips). */
   static uint64_t MeshCaptureInputPrimitives(uint32_t topology, uint32_t count) {
     switch (topology) {
@@ -4930,144 +4938,6 @@ public:
     case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ: return count > 3 ? count - 3 : 0;
     case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: return count / 6;
     default: return count > 5 ? (count - 4) / 2 : 0;
-    }
-  }
-
-  /* Appends the per-command draws after the recorded pipeline state of the pass, in API order: GS (one pass),
-   * or TS+GS pass 1 (VS+HS / DS capture) / pass 2 (capture fetch / GS). */
-  void
-  EncodeMeshCaptureDraws(WMT::MTL4RenderCommandEncoder encoder, const MeshCaptureExecution &execution, uint8_t pass,
-                        uint32_t selected = UINT32_MAX) {
-    const auto &data = *execution.data;
-    const WMTRenderStages object_mesh = WMTRenderStages(WMTRenderStageObject | WMTRenderStageMesh);
-    if (!execution.commands.empty())
-      encoder.useResource(execution.storage, WMTResourceUsageRead, object_mesh);
-    const uint32_t patch_per_group = data.geometry ? 0 : 32 / data.threads_per_patch;
-    if (data.statistics_claim && !execution.commands.empty())
-      encoder.useResource(data.statistics_claim, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageFragment);
-    for (const auto &command : execution.commands) {
-      if (selected != UINT32_MAX && command.slot != selected) continue;
-      if (data.root_stride) {
-        const uint64_t offset = data.root_offset + uint64_t(command.slot) * data.root_stride;
-        encoder.useResource(data.root_heap, WMTResourceUsageRead, object_mesh | WMTRenderStageFragment);
-        encoder.setObjectBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-        encoder.setMeshBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-        encoder.setFragmentBuffer(data.root_heap, offset, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
-      }
-      if (data.vertex_stride) {
-        encoder.useResource(data.vertex_heap, WMTResourceUsageRead, WMTRenderStageObject);
-        encoder.setObjectBuffer(data.vertex_heap, data.vertex_offset + uint64_t(command.slot) * data.vertex_stride,
-                                SM50_BINDING_INDEX_VERTEX_BUFFER);
-      }
-      if (data.statistics_claim && (data.geometry || pass == 2))
-        encoder.setFragmentBuffer(data.statistics_claim,
-                                  data.statistics_claim_offset + uint64_t(command.slot) * sizeof(SM50_STATISTICS_CLAIM_HEADER),
-                                  SM50_BINDING_INDEX_STATISTICS_CLAIM);
-      if (data.geometry) {
-        if (command.so) {
-          encoder.useResource(command.so->scratch, WMTResourceUsageWrite, WMTRenderStageMesh);
-          encoder.setMeshBuffer(execution.storage, command.so->control_offset, SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL);
-          encoder.setMeshBuffer(command.so->scratch, 0, SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH);
-        }
-        encoder.setObjectBuffer(execution.storage, command.args_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
-        if (data.strip_expand) {
-          // The expanded list: an indexed list draw over 32-bit values with the strip's base vertex.
-          const uint64_t arguments = command.strip_control_offset + sizeof(MeshStripCutControl);
-          encoder.useResource(command.strip_list, WMTResourceUsageRead, WMTRenderStageObject);
-          wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect draw{};
-          draw.type = WMTRenderCommandD3DalloyGeometryDrawIndexedIndirect;
-          draw.next.set(nullptr);
-          draw.index_buffer = command.strip_list;
-          draw.index_buffer_offset = 0;
-          draw.imm_draw_arguments = execution.storage;
-          draw.indirect_args_buffer = execution.storage;
-          draw.indirect_args_offset = arguments;
-          draw.dispatch_args_buffer = execution.storage;
-          draw.dispatch_args_offset = arguments + 8 * sizeof(uint32_t);
-          draw.vertex_per_warp = data.vertex_per_warp;
-          encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
-          continue;
-        }
-        const uint32_t warps = (command.vertex_count - 1) / data.warp_increment + 1;
-        if (data.indexed) {
-          wmtcmd_render_d3dalloy_geometry_draw_indexed draw{};
-          draw.type = WMTRenderCommandD3DalloyGeometryDrawIndexed;
-          draw.next.set(nullptr);
-          draw.draw_arguments_offset = command.args_offset;
-          draw.index_buffer = command.index_buffer;
-          draw.index_buffer_offset = command.index_offset;
-          draw.warp_count = warps;
-          draw.instance_count = command.instances;
-          draw.vertex_per_warp = data.vertex_per_warp;
-          encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
-        } else {
-          wmtcmd_render_d3dalloy_geometry_draw draw{};
-          draw.type = WMTRenderCommandD3DalloyGeometryDraw;
-          draw.next.set(nullptr);
-          draw.draw_arguments_offset = command.args_offset;
-          draw.warp_count = warps;
-          draw.instance_count = command.instances;
-          draw.vertex_per_warp = data.vertex_per_warp;
-          encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
-        }
-        continue;
-      }
-      if (pass == 1) {
-        if (data.domain_only && command.so) {
-          encoder.useResource(command.so->scratch, WMTResourceUsageRead | WMTResourceUsageWrite, WMTRenderStageMesh);
-          encoder.setMeshBuffer(execution.storage, command.so->control_offset, SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL);
-          encoder.setMeshBuffer(command.so->scratch, 0, SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH);
-        }
-        if (!data.domain_only) {
-        encoder.useResource(command.scratch, WMTResourceUsageWrite, WMTRenderStageMesh);
-        encoder.setMeshBuffer(command.scratch, 0, SM50_BINDING_INDEX_TESS_CAPTURE);
-        encoder.setMeshBuffer(execution.storage, command.capture_offset, SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL);
-        }
-        encoder.setObjectBuffer(execution.storage, command.args_offset, SM50_BINDING_INDEX_DRAW_ARGUMENTS);
-        const uint32_t groups = (command.patches - 1) / patch_per_group + 1;
-        if (data.indexed) {
-          wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed draw{};
-          draw.type = WMTRenderCommandD3DalloyTessellationMeshDrawIndexed;
-          draw.next.set(nullptr);
-          draw.draw_arguments_offset = command.args_offset;
-          draw.index_buffer = command.index_buffer;
-          draw.index_buffer_offset = command.index_offset;
-          draw.instance_count = command.instances;
-          draw.threads_per_patch = data.threads_per_patch;
-          draw.patch_per_group = patch_per_group;
-          draw.patch_per_mesh_instance = groups;
-          encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
-        } else {
-          wmtcmd_render_d3dalloy_tessellation_mesh_draw draw{};
-          draw.type = WMTRenderCommandD3DalloyTessellationMeshDraw;
-          draw.next.set(nullptr);
-          draw.draw_arguments_offset = command.args_offset;
-          draw.instance_count = command.instances;
-          draw.threads_per_patch = data.threads_per_patch;
-          draw.patch_per_group = patch_per_group;
-          draw.patch_per_mesh_instance = groups;
-          encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
-        }
-        continue;
-      }
-      encoder.useResource(command.scratch, WMTResourceUsageRead, WMTRenderStageObject);
-      encoder.useResource(command.list, WMTResourceUsageRead, WMTRenderStageObject);
-      encoder.setObjectBuffer(command.scratch, 0, SM50_BINDING_INDEX_TESS_CAPTURE);
-      encoder.setObjectBuffer(command.list, 0, SM50_BINDING_INDEX_TESS_CAPTURE_LIST);
-      encoder.setObjectBuffer(execution.storage, command.capture_offset, SM50_BINDING_INDEX_TESS_CAPTURE_CONTROL);
-      if (command.so) {
-        encoder.useResource(command.so->scratch, WMTResourceUsageWrite, WMTRenderStageMesh);
-        encoder.setMeshBuffer(execution.storage, command.so->control_offset, SM50_BINDING_INDEX_VERTEX_INDEX_CONTROL);
-        encoder.setMeshBuffer(command.so->scratch, 0, SM50_BINDING_INDEX_SO_CAPTURE_SCRATCH);
-      }
-      wmtcmd_render_draw_meshthreadgroups_indirect draw{};
-      draw.type = WMTRenderCommandDrawMeshThreadgroupsIndirect;
-      draw.next.set(nullptr);
-      draw.indirect_args_buffer = execution.storage;
-      draw.indirect_args_offset = command.dispatch_offset;
-      draw.object_threadgroup_size = {32, 1, 1};
-      draw.mesh_threadgroup_size = {1, 1, 1};
-      encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&draw));
     }
   }
 
@@ -5242,6 +5112,7 @@ public:
       WMT::Reference<WMT::Buffer> baseline;
     };
     std::vector<CastRegion> cast_regions;
+    std::vector<WMT::Reference<WMT::Heap>> auxiliary_heaps;
     Com<MTLD3D12Resource, false> descriptor_owner;
   };
 
@@ -5915,6 +5786,117 @@ public:
     return true;
   }
 
+  // Called under MappingQueueMutex, on the same native FIFO as the canonical
+  // mapping publication. Only changed pages move; an independent reader of
+  // an unchanged page keeps the same heap and offset.
+  bool UpdateAuxiliaryPages(ReservedResource &reserved, AuxiliarySparsePages &storage, WMT::Texture texture,
+                            std::unordered_set<uint32_t> wanted, uint32_t flat_x, uint32_t flat_y,
+                            InflightCommandBuffer &inflight) {
+    if (wanted == storage.mapped_pages) return true;
+    auto metal = device_->GetMTLDevice();
+    auto queue = device_->GetSparseMappingQueue();
+    auto allocator = metal.newMTL4CommandAllocator();
+    auto command = metal.newMTL4CommandBuffer();
+    if (!auxiliary_mapping_marker_) {
+      WMTBufferInfo info{};
+      info.length = sizeof(uint32_t);
+      info.options = WMTResourceStorageModePrivate;
+      auxiliary_mapping_marker_ = metal.newBuffer(info);
+    }
+    if (!queue || !allocator || !command || !auxiliary_mapping_marker_ || tile_mapping_value_ == UINT64_MAX)
+      return false;
+
+    std::vector<uint32_t> added;
+    std::vector<std::pair<uint32_t, ReservedTileTarget>> operations;
+    for (auto page : storage.mapped_pages)
+      if (!wanted.contains(page)) operations.emplace_back(page, ReservedTileTarget{});
+    const size_t removed = operations.size();
+    for (auto page : wanted)
+      if (!storage.mapped_pages.contains(page)) added.push_back(page);
+    operations.reserve(removed + added.size());
+    size_t next = 0;
+    auto fill = [&](auto &backing) {
+      for (uint32_t offset = 0; offset < backing.slots.size(); ++offset) {
+        auto &page = backing.slots[offset];
+        if (page && !wanted.contains(*page)) page.reset();
+        if (!page && next < added.size()) {
+          page = added[next++];
+          operations.emplace_back(*page, ReservedTileTarget{backing.heap, offset});
+        }
+      }
+    };
+    // Plan against a copy. Allocation failure must not publish a partially changed slot table.
+    auto backings = storage.backings;
+    for (auto &backing : backings) fill(backing);
+    std::erase_if(backings, [&](const auto &backing) {
+      if (std::any_of(backing.slots.begin(), backing.slots.end(), [](auto &page) { return page.has_value(); }))
+        return false;
+      inflight.volume_heaps.push_back(backing.heap);
+      return true;
+    });
+    while (next < added.size()) {
+      const size_t count = std::min<size_t>(64, added.size() - next);
+      WMTHeapInfo info{};
+      info.type = WMTHeapTypePlacement;
+      info.options = WMTResourceStorageModePrivate;
+      info.size = count * kReservedTileBytes;
+      auto heap = metal.newPlacementHeap(info, WMTSparsePageSize64);
+      if (!heap) return false;
+      auto &backing = backings.emplace_back();
+      backing.heap = std::move(heap);
+      backing.slots.resize(count);
+      fill(backing);
+    }
+
+    // Anchor ResourceState completion with a real blit before signalling.
+    // Other queues join the same generation without blocking their submitters.
+    command.begin(allocator);
+    command.useAllocation(auxiliary_mapping_marker_);
+    command.useAllocation(texture);
+    auto encoder = command.blitCommandEncoder();
+    encoder.barrierAfterQueueStages(WMTMetal4StageResourceState, WMTMetal4StageBlit,
+                                    WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
+    wmtcmd_blit_fillbuffer marker{};
+    marker.type = WMTBlitCommandFillBuffer;
+    marker.buffer = auxiliary_mapping_marker_;
+    marker.length = sizeof(uint32_t);
+    encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&marker));
+    encoder.barrierAfterStages(WMTMetal4StageBlit, WMTMetal4StageAll, WMTMetal4VisibilityDevice);
+    encoder.endEncoding();
+    command.end();
+    const WMT::MTL4CommandBuffer post = command;
+    inflight.auxiliary_mappings.reserve(inflight.auxiliary_mappings.size() + 1);
+    for (const auto &backing : backings) inflight.volume_heaps.push_back(backing.heap);
+    reserved.EncodeTexture(queue, texture, operations, flat_x, flat_y);
+    auto submission = device_->CommitMetal4CommandBuffers(queue, &post, 1);
+    if (!submission) return false;
+    inflight.auxiliary_mappings.push_back(std::move(submission));
+    storage.ready = tile_mapping_event_;
+    storage.ready_value = ++tile_mapping_value_;
+    storage.joined_queue = 0;
+    queue.signalEvent(storage.ready, storage.ready_value);
+    storage.backings = std::move(backings);
+    storage.mapped_pages = std::move(wanted);
+    owned_graphics::Trace("auxiliary_sparse_mapping", ",\"queue\":", owned_id_, ",\"added\":", added.size(),
+                          ",\"removed\":", removed, ",\"resident_pages\":", storage.mapped_pages.size());
+    return true;
+  }
+
+  void UseAuxiliaryPages(AuxiliarySparsePages &storage, WMT::MTL4CommandBuffer cmdbuf,
+                         InflightCommandBuffer &inflight, SwizzlePassResource &use) {
+    if (storage.ready && storage.joined_queue != owned_id_) {
+      inflight.mapping_join_events.push_back(storage.ready);
+      queue_.waitForEvent(storage.ready, storage.ready_value);
+      storage.joined_queue = owned_id_;
+    }
+    use.auxiliary_heaps.clear();
+    for (const auto &backing : storage.backings) {
+      cmdbuf.useAllocation(backing.heap);
+      inflight.volume_heaps.push_back(backing.heap);
+      use.auxiliary_heaps.push_back(backing.heap);
+    }
+  }
+
   bool EncodeBlockCast(WMT::MTL4CommandBuffer cmdbuf, InflightCommandBuffer &inflight,
                        SwizzlePassResource &use, bool to_native,
                        SwizzlePassResource::CastRegion *region = nullptr) {
@@ -6146,29 +6128,14 @@ public:
               if (tile>=sub.first_tile && tile<sub.first_tile+count) wanted.insert(tile);
           }
         }
-        if (wanted!=storage.mapped_pages) {
-          auto queue=device_->GetSparseMappingQueue();
-          if (!queue || !tile_mapping_event_) return false;
-          WMT::Reference<WMT::Heap> heap;
-          if (!wanted.empty()) {
-            WMTHeapInfo info{}; info.type=WMTHeapTypePlacement; info.options=WMTResourceStorageModePrivate;
-            info.size=uint64_t(wanted.size())*kReservedTileBytes;
-            heap=device_->GetMTLDevice().newPlacementHeap(info,WMTSparsePageSize64);
-            if (!heap) return false;
-          }
-          reserved->MapCastTiles(queue,view.castStorage,{},storage.mapped_pages);
-          reserved->MapCastTiles(queue,view.castStorage,heap,wanted);
-          queue.signalEvent(tile_mapping_event_,++tile_mapping_value_);
-          if (!tile_mapping_event_.waitUntilSignaledValue(tile_mapping_value_,10000)) return false;
-          if (storage.heap) inflight.volume_heaps.push_back(storage.heap);
-          storage.heap=std::move(heap); storage.mapped_pages=std::move(wanted);
+        if (!UpdateAuxiliaryPages(*reserved, storage, view.castStorage, std::move(wanted), 0, 0, inflight)) {
+          return false;
         }
         storage.mapping_generation=generation;
       }
-      if (storage.heap) {
-        cmdbuf.useAllocation(storage.heap);
-        inflight.volume_heaps.push_back(storage.heap);
-      }
+      UseAuxiliaryPages(storage, cmdbuf, inflight, use);
+      use.volume_cast_tiles.assign(storage.mapped_pages.begin(), storage.mapped_pages.end());
+      std::sort(use.volume_cast_tiles.begin(), use.volume_cast_tiles.end());
     }
     if (view.reservedCast && !view.castCompressed && !region) {
       auto &storage = *view.reservedCast;
@@ -6201,35 +6168,13 @@ public:
               }
             }
           }
-          if (wanted != storage.mapped_pages) {
-            auto queue=device_->GetSparseMappingQueue();
-            if (!queue || !tile_mapping_event_) return false;
-            WMT::Reference<WMT::Heap> heap;
-            if (!wanted.empty()) {
-              WMTHeapInfo info{}; info.type=WMTHeapTypePlacement; info.options=WMTResourceStorageModePrivate;
-              info.size=uint64_t(wanted.size())*kReservedTileBytes;
-              heap=device_->GetMTLDevice().newPlacementHeap(info,WMTSparsePageSize64);
-              if (!heap) return false;
-            }
-            std::vector<WMTSparseTextureMapping> mappings;
-            auto append=[&](uint32_t page, WMTSparseMappingMode mode, uint64_t offset) {
-              WMTSparseTextureMapping mapping{}; mapping.mode=mode; mapping.heap_offset=offset; mapping.size={1,1,1};
-              mapping.slice=page/(storage.pages_x*storage.pages_y);
-              mapping.origin={page%storage.pages_x,(page/storage.pages_x)%storage.pages_y,0};
-              mappings.push_back(mapping);
-            };
-            for (uint32_t page : storage.mapped_pages) append(page,WMTSparseMappingModeUnmap,0);
-            if (!mappings.empty()) queue.updateTextureMappings(view.castStorage,{},mappings.data(),mappings.size());
-            mappings.clear(); uint64_t offset=0;
-            for (uint32_t page : wanted) append(page,WMTSparseMappingModeMap,offset++);
-            if (!mappings.empty()) queue.updateTextureMappings(view.castStorage,heap,mappings.data(),mappings.size());
-            queue.signalEvent(tile_mapping_event_,++tile_mapping_value_);
-            if (!tile_mapping_event_.waitUntilSignaledValue(tile_mapping_value_,10000)) return false;
-            if (storage.heap) inflight.volume_heaps.push_back(storage.heap);
-            storage.heap=std::move(heap); storage.mapped_pages=std::move(wanted);
+          if (!UpdateAuxiliaryPages(*reserved, storage, view.castStorage, std::move(wanted),
+                                    storage.pages_x, storage.pages_y, inflight)) {
+            return false;
           }
           storage.mapping_generation=generation;
         }
+        UseAuxiliaryPages(storage, cmdbuf, inflight, use);
         use.cast_regions.clear();
         for (uint32_t page : storage.mapped_pages) {
           const uint32_t slice=page/(storage.pages_x*storage.pages_y);
@@ -6245,10 +6190,8 @@ public:
               std::min(storage.page_h*4,height-y),slice,{}});
         }
       }
-      if (storage.heap) {
-        cmdbuf.useAllocation(storage.heap);
-        inflight.volume_heaps.push_back(storage.heap);
-      }
+      if (to_native)
+        for (const auto &heap : use.auxiliary_heaps) cmdbuf.useAllocation(heap);
       for (auto &piece : use.cast_regions) {
         if (to_native) use.baseline=piece.baseline;
         if (!EncodeBlockCast(cmdbuf,inflight,use,to_native,&piece)) return false;
@@ -6310,9 +6253,10 @@ public:
           }
           auto *reserved=owner->reservedResource;
           const auto &sub=reserved->subresources()[array*owner->miplevelCount()+mip];
-          const auto &mapped=view.reservedCast->mapped_pages;
+          const auto &mapped = use.volume_cast_tiles;
           if (sub.packed) {
-            if (mapped.contains(sub.first_tile) && !transfer({},mip_width,mip_height)) return false;
+            if (std::binary_search(mapped.begin(), mapped.end(), sub.first_tile) &&
+                !transfer({}, mip_width, mip_height)) return false;
           } else {
             const auto shape=reserved->tileShape();
             const uint64_t end=uint64_t(sub.first_tile)+uint64_t(sub.tiles_x)*sub.tiles_y;
@@ -6536,39 +6480,9 @@ public:
                 for (uint32_t x = tx * layout.shape_w / volume.page_w; x <= (last_x - 1) / volume.page_w; ++x)
                   wanted.insert(((z - volume.first_w) * volume.pages_y + y) * volume.pages_x + x);
           }
-          if (wanted != volume.mapped_pages) {
-            auto queue = device_->GetSparseMappingQueue();
-            if (!queue || !tile_mapping_event_) return false;
-            WMT::Reference<WMT::Heap> heap;
-            if (!wanted.empty()) {
-              WMTHeapInfo info{};
-              info.type = WMTHeapTypePlacement;
-              info.options = WMTResourceStorageModePrivate;
-              info.size = uint64_t(wanted.size()) * kReservedTileBytes;
-              heap = device_->GetMTLDevice().newPlacementHeap(info, WMTSparsePageSize64);
-              if (!heap) return false;
-            }
-            std::vector<WMTSparseTextureMapping> operations;
-            operations.reserve(std::max(wanted.size(), volume.mapped_pages.size()));
-            auto append_page = [&](uint32_t page, WMTSparseMappingMode mode, uint64_t offset) {
-              WMTSparseTextureMapping op{};
-              op.mode = mode; op.heap_offset = offset; op.size = {1, 1, 1};
-              op.origin = {page % volume.pages_x, (page / volume.pages_x) % volume.pages_y, 0};
-              op.slice = page / (volume.pages_x * volume.pages_y);
-              operations.push_back(op);
-            };
-            for (uint32_t page : volume.mapped_pages) append_page(page, WMTSparseMappingModeUnmap, 0);
-            if (!operations.empty()) queue.updateTextureMappings(view.texture, {}, operations.data(), operations.size());
-            operations.clear();
-            uint64_t offset = 0;
-            for (uint32_t page : wanted) append_page(page, WMTSparseMappingModeMap, offset++);
-            if (!operations.empty()) queue.updateTextureMappings(view.texture, heap, operations.data(), operations.size());
-            queue.signalEvent(tile_mapping_event_, ++tile_mapping_value_);
-            if (!tile_mapping_event_.waitUntilSignaledValue(tile_mapping_value_, 10000)) return false;
-            for (const auto &old : volume.heaps) inflight.volume_heaps.push_back(old);
-            volume.heaps.clear();
-            if (heap) volume.heaps.push_back(std::move(heap));
-            volume.mapped_pages = std::move(wanted);
+          if (!UpdateAuxiliaryPages(*reserved, volume, view.texture, std::move(wanted),
+                                    volume.pages_x, volume.pages_y, inflight)) {
+            return false;
           }
           volume.mapping_generation = generation;
         }
@@ -6576,10 +6490,7 @@ public:
         active_pages.assign(volume.mapped_pages.begin(), volume.mapped_pages.end());
         // Residency of a sparse texture does not cover its private mapped heaps.
         // Register each backing allocation with this native recording as well.
-        for (const auto &heap : volume.heaps) {
-          cmdbuf.useAllocation(heap);
-          inflight.volume_heaps.push_back(heap);
-        }
+        UseAuxiliaryPages(volume, cmdbuf, inflight, use);
       }
       // Import NULL logical tiles sharing a mapped native page as well: blending
       // must see zeros, never stale contents. No unmapped native pages allocate.
@@ -6620,7 +6531,7 @@ public:
       return true;
     }
     if (use.volume_baselines.empty()) return true;
-    for (const auto &heap : volume.heaps) cmdbuf.useAllocation(heap);
+    for (const auto &heap : use.auxiliary_heaps) cmdbuf.useAllocation(heap);
     WMTPixelFormat publish_format = MTLGetUnsignedIntegerFormat(ORIGINAL_FORMAT(texture->pixelFormat(view.key)));
     if (publish_format == WMTPixelFormatInvalid) {
       publish_format = unit_bytes == 1 ? WMTPixelFormatR8Uint :
@@ -6903,9 +6814,39 @@ public:
     const auto *allocation = static_cast<const BufferAllocation *>(location.allocationIdentity);
     // Placed aliases, sparse remapping and shared/CPU-backed storage can change
     // the contents through a different ArenaKey. Keep their GPU readback path.
-    return allocation && !allocation->canonicalHeap && !allocation->reservedResource &&
+    return allocation && (!allocation->canonicalHeap || (allocation->exclusivePlacement &&
+        allocation->exclusivePlacement->load(std::memory_order_acquire))) && !allocation->reservedResource &&
         !allocation->flags().test(BufferAllocationFlag::PlacementSparse) &&
         !allocation->flags().test(BufferAllocationFlag::CpuPlaced);
+  }
+
+  // Build the physical read/write footprint before moving a native BLAS refit past another
+  // BLAS's shadow writer. Placed buffers use heap-relative ranges; sparse/external storage and
+  // opacity micromaps require the original ordered path. The mirror uses distinct slots per key.
+  static bool CollectBLASRefitAccess(const RTASEncoderData &as, uint64_t size,
+                                    std::vector<SubmissionAccess> &accesses) {
+    auto append = [&](const raytracing::BufferLocation &location, uint64_t bytes, bool writes) {
+      if (!bytes) return true;
+      const auto *allocation = static_cast<const BufferAllocation *>(location.allocationIdentity);
+      if (!allocation || allocation->reservedResource || bytes > location.available ||
+          allocation->flags().test(BufferAllocationFlag::CpuPlaced) ||
+          allocation->flags().test(BufferAllocationFlag::PlacementSparse) ||
+          allocation->flags().test(BufferAllocationFlag::SuballocateFromOnePage)) return false;
+      accesses.push_back(BufferAccess(const_cast<BufferAllocation *>(allocation), location.offset, bytes, writes, 0));
+      return true;
+    };
+    if (!append(as.destinationLocation, size, true) ||
+        (as.scratch && !append(as.refitScratch, as.nativeSizes.refitScratchSize, true))) return false;
+    for (const auto &g : as.deferredInputs.geometries) {
+      const bool boxes = g.type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+      const uint64_t count = boxes ? g.primitiveCount : g.vertexCount;
+      // ConvertBuildInputs already validated these byte products and source spans.
+      if ((!boxes && g.type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) ||
+          !append(g.verticesOrBoxes, count ? (count - 1) * g.stride + (boxes ? 24u : g.positionSize) : 0, false) ||
+          !append(g.indices, uint64_t(g.indexCount) * (g.indexFormat == DXGI_FORMAT_R16_UINT ? 2u : 4u), false) ||
+          !append(g.transform, g.hasTransform ? 48u : 0u, false)) return false;
+    }
+    return true;
   }
 
   // Internal AS helper kernels use GPU addresses in their POD parameters. Buffers used for
@@ -6913,10 +6854,12 @@ public:
   bool EncodeASHelper(WMT::MTL4CommandBuffer cmdbuf, WMT::ComputePipelineState pipeline,
                       const void *parameters, uint32_t bytes, uint32_t threads = raytracing::kHelperThreads,
                       WMT::Buffer geometries = {}, WMT::Buffer jobs = {},
-                      uint64_t jobsOffset = 0, uint64_t geometriesOffset = 0, uint32_t rows = 1) {
+                      uint64_t jobsOffset = 0, uint64_t geometriesOffset = 0, uint32_t rows = 1,
+                      WMT::Buffer mirror = {}, WMT::MTL4ComputeCommandEncoder batch_encoder = {}) {
     if (!pipeline) return false;
-    auto encoder = cmdbuf.computeCommandEncoder(false);
-    encoder.waitForFence(fence_);
+    auto encoder = batch_encoder ? batch_encoder : cmdbuf.computeCommandEncoder(false);
+    if (!encoder) return false;
+    if (!batch_encoder) encoder.waitForFence(fence_);
     wmtcmd_compute_nop head{};
     head.type = WMTComputeCommandNop;
     wmtcmd_compute_setpso pso{};
@@ -6928,12 +6871,12 @@ public:
     params.index = 0;
     params.length = bytes;
     params.bytes.set(const_cast<void *>(parameters));
-    wmtcmd_compute_setbuffer buffers[2]{};
-    for (uint32_t i = 0; i < 2; ++i) {
+    wmtcmd_compute_setbuffer buffers[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
       buffers[i].type = WMTComputeCommandSetBuffer;
       buffers[i].index = i + 1;
-      buffers[i].buffer = i ? jobs : geometries;
-      buffers[i].offset = i ? jobsOffset : geometriesOffset;
+      buffers[i].buffer = i == 2 ? mirror : i ? jobs : geometries;
+      buffers[i].offset = i == 2 ? 0 : i ? jobsOffset : geometriesOffset;
     }
     wmtcmd_compute_dispatch dispatch{};
     dispatch.type = WMTComputeCommandDispatchThreads;
@@ -6943,19 +6886,24 @@ public:
     if (geometries) {
       params.next.set(&buffers[0]);
       buffers[0].next.set(&buffers[1]);
-      buffers[1].next.set(&dispatch);
+      if (mirror) {
+        buffers[1].next.set(&buffers[2]);
+        buffers[2].next.set(&dispatch);
+      } else buffers[1].next.set(&dispatch);
     } else params.next.set(&dispatch);
     dispatch.next.set(nullptr);
     encoder.encodeCommands(&head);
-    encoder.updateFence(fence_);
-    encoder.endEncoding();
+    if (!batch_encoder) {
+      encoder.updateFence(fence_);
+      encoder.endEncoding();
+    }
     owned_graphics::Trace("rtas_helper_dispatch", ",\"queue\":", owned_id_, ",\"threads\":", threads, ",\"rows\":", rows);
     return true;
   }
 
   void
   ProcessExecute(ExecuteTask &task, std::vector<SignalTask> *folded_signals = nullptr,
-                 std::optional<QueueTask> *pending_task = nullptr) {
+                 std::optional<QueueTask> *pending_task = nullptr, WaitTask *prior_wait = nullptr) {
     uint64_t first_segment = 0;
     std::optional<CommittingScope> scope;
     struct AtomicPhasePermit {
@@ -6995,11 +6943,10 @@ public:
         for (const auto &list : task.lists) {
           const auto &head = *static_cast<const RecordingHead *>(list.entry);
           for (const auto &heap : head.descriptor_heaps) {
-            D3D12_DESCRIPTOR_HEAP_DESC desc{}; heap->GetDesc(&desc);
-            if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-              remember(static_cast<MTLD3D12DescriptorHeap *>(heap.ptr())->GetArgumentBuffer());
-            else if (desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
-              remember(static_cast<MTLD3D12SamplerDescriptorHeap *>(heap.ptr())->GetArgumentBuffer());
+            if (heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+              remember(static_cast<MTLD3D12DescriptorHeap *>(heap.heap.ptr())->GetArgumentBuffer());
+            else if (head.may_read_sampler_heap)
+              remember(static_cast<MTLD3D12SamplerDescriptorHeap *>(heap.heap.ptr())->GetArgumentBuffer());
           }
           for (const auto &allocation : head.root_allocations) remember(allocation->buffer());
           rtas_passes += head.raytracing_passes;
@@ -7138,7 +7085,6 @@ public:
       auto textures = previous.msaa_textures;
       auto markers = previous.rov_markers;
       auto indirect_buffers = previous.so_indirect_buffers;
-      auto indirect_owners = previous.mesh_indirect_owners;
       auto swizzle_buffers = previous.swizzle_buffers;
       auto swizzle_batch_buffers = previous.swizzle_batch_buffers;
       auto swizzle_dirty_flags = previous.swizzle_dirty_flags;
@@ -7159,7 +7105,6 @@ public:
       next.msaa_textures = std::move(textures);
       next.rov_markers = std::move(markers);
       next.so_indirect_buffers = std::move(indirect_buffers);
-      next.mesh_indirect_owners = std::move(indirect_owners);
       next.swizzle_buffers = std::move(swizzle_buffers);
       next.swizzle_scratch_length = swizzle_scratch_length;
       next.swizzle_batch_buffers = std::move(swizzle_batch_buffers);
@@ -7182,8 +7127,6 @@ public:
       reside(next.volume_heaps); reside(next.volume_textures);
       for (const auto &marker : next.rov_markers)
         next.cmdbuf.useAllocation(WMT::Allocation{marker.texture.handle});
-      for (const auto &owner : next.mesh_indirect_owners)
-        next.cmdbuf.useAllocation(WMT::Allocation{owner->buffer().handle});
       for (const auto &view : next.cast_views) {
         if (!view) continue;
         if (view->texture) next.cmdbuf.useAllocation(WMT::Allocation{view->texture.handle});
@@ -7345,8 +7288,7 @@ public:
           static_cast<MTLD3D12PipelineState *>(render.atomic64_pipeline.ptr()));
       return true;
     };
-    auto producer_participants = [&](const RenderEncoderData &render, const MSAADrawData *draw,
-                                     const MeshCaptureExecution *capture = nullptr, uint32_t selected = UINT32_MAX) -> uint64_t {
+    auto producer_participants = [&](const RenderEncoderData &render, const MSAADrawData *draw) -> uint64_t {
       if (draw && !draw->mesh_capture) {
         const uint64_t vertices = uint64_t(draw->assembly.vertex_count) * draw->assembly.instance_count;
         return ((vertices + 63) / 64) * 64;
@@ -7364,6 +7306,25 @@ public:
       for (auto *node = static_cast<const wmtcmd_base *>(render.cmd_head.next.get()); node;
            node = static_cast<const wmtcmd_base *>(node->next.get())) {
         switch (node->type) {
+        case WMTRenderCommandDrawRun:
+        case WMTRenderCommandDrawIndexedRun: {
+          const auto *run = reinterpret_cast<const wmtcmd_render_draw_run *>(node);
+          const void *tuples = wmt_draw_run_tuples(run);
+          for (uint32_t i = 0; i < run->count; ++i) {
+            const auto draw = wmt_draw_run_at(run, tuples, i);
+            if (!add({draw.count, draw.instances})) return UINT64_MAX;
+          }
+          break;
+        }
+        case WMTRenderCommandDrawCompact:
+          if (!add({reinterpret_cast<const wmtcmd_render_draw_compact *>(node)->vertex_count})) return UINT64_MAX;
+          break;
+        case WMTRenderCommandDrawIndexedSmall:
+          if (!add({reinterpret_cast<const wmtcmd_render_draw_indexed_small *>(node)->index_count})) return UINT64_MAX;
+          break;
+        case WMTRenderCommandDrawIndexedCompact:
+          if (!add({reinterpret_cast<const wmtcmd_render_draw_indexed_compact *>(node)->index_count})) return UINT64_MAX;
+          break;
         case WMTRenderCommandDraw: {
           const auto *cmd = reinterpret_cast<const wmtcmd_render_draw *>(node);
           if (!add({cmd->vertex_count, cmd->instance_count})) return UINT64_MAX;
@@ -7424,27 +7385,6 @@ public:
         default: break;
         }
       }
-      if (capture) {
-        const auto &data = *capture->data;
-        for (const auto &command : capture->commands) {
-          if (selected != UINT32_MAX && command.slot != selected) continue;
-          if (data.geometry) {
-            const uint64_t vertices = uint64_t(command.vertex_count) * (data.strip_expand ? data.strip_vertices_per_primitive : 1);
-            const uint64_t warps = (vertices + data.warp_increment - 1) / data.warp_increment;
-            if (!add({warps, command.instances, data.vertex_per_warp}) ||
-                (!draw && !add({warps, command.instances, data.vertex_per_warp, render.atomic64_gs_instances}))) return UINT64_MAX;
-          } else if (render.capture_indirect_pass == 1) {
-            const uint32_t per_group = 32 / data.threads_per_patch;
-            const uint64_t groups = (uint64_t(command.patches) + per_group - 1) / per_group;
-            if (!add({groups, command.instances, data.threads_per_patch, per_group}) ||
-                (!draw && !add({groups, command.instances, per_group, data.layout.max_workloads, 32}))) return UINT64_MAX;
-          } else {
-            const uint64_t primitives = uint64_t(command.slots) * data.layout.max_primitives;
-            const uint64_t groups = (primitives + data.per_group - 1) / data.per_group;
-            if (!add({groups, 32}) || (!draw && !add({groups, 32, render.atomic64_gs_instances}))) return UINT64_MAX;
-          }
-        }
-      }
       // These are compiler-proven workload bounds, never assumed GPU residency.
       if (draw && !add({draw->mesh_control.total_slots, draw->mesh_layout.threads_per_group})) return UINT64_MAX;
       return participants;
@@ -7475,7 +7415,7 @@ public:
       // Only a scoped SC owner makes this additional snapshot useful. Normal
       // frames obtain their proof from the existing planner below, at no extra
       // descriptor-walk cost. This preflight records no native GPU commands.
-      if (!device_->gpu_execution_gate.WantsKnownAccess() || StandardSwizzleTablesMayMatter()) return {};
+      if ((!prior_wait && !device_->gpu_execution_gate.WantsKnownAccess()) || StandardSwizzleTablesMayMatter()) return {};
       if (atomic_envelope) return envelope_proof();
       auto proof = std::make_shared<PhysicalAdmissionProof>();
       SubmissionPlan snapshots;
@@ -7490,7 +7430,7 @@ public:
           auto append_buffers = [&](const auto &buffers, uint64_t stages) {
             for (const auto &use : buffers)
               if (!AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes,
-                                           use.stages ? use.stages : stages)) return false;
+                                           use.stages ? use.stages : stages, nullptr, use.stride, use.count)) return false;
             return true;
           };
           if (shape.record->type == EncoderType::Compute) {
@@ -7528,8 +7468,13 @@ public:
             }
           } else return {};
           if (node.helper_passes || node.sparse_resource_used) return {};
-          for (const auto &access : node.accesses)
+          for (const auto &access : node.accesses) {
+            // Device removal wakes native waits to drain the queue. Never expose a
+            // speculative write to mapped host memory in that terminal case.
+            if (prior_wait && access.writes && access.Key().domain == PhysicalDomain::Buffer &&
+                static_cast<const BufferAllocation *>(access.allocation)->mappedMemory(0)) return {};
             if (!AppendAdmissionAccess(*proof, access, node.allocation_pins, true)) return {};
+          }
         }
       }
       proof->resources = std::move(snapshots.descriptor_owners);
@@ -7540,6 +7485,25 @@ public:
     } catch (const std::bad_alloc &) {
       // Optional proof allocation failure preserves the original unknown gate.
       ordinary_accesses.reset();
+    }
+    if (prior_wait) {
+      const bool gpu_wait_eligible = ordinary_accesses && !atomic_envelope;
+      bool armed = gpu_wait_eligible && prior_wait->native_wait_armed;
+      if (gpu_wait_eligible && !armed && !prior_wait->ticket.latch->ready()) {
+        // Metal 4 queue wait, as in EncodeWaitMTL4. Signal a private one-shot
+        // event from the validated threshold callback: public fence values can rewind.
+        auto event = device_->GetMTLDevice().newSharedEvent();
+        if (event && prior_wait->ticket.latch->addWaiter([event]() mutable { event.signalValue(1); })) {
+          queue_.waitForEvent(event, 1);
+          owned_graphics::Trace("wait_native", ",\"queue\":", owned_id_, ",\"fence\":", prior_wait->fence_id,
+                                ",\"value\":", prior_wait->ticket.value);
+          prior_wait->native_wait_armed = armed = true;
+        }
+      }
+      if (!armed) {
+        ProcessWait(*prior_wait);
+        if (cancel_unsubmitted_ || device_->RemovedReason() != S_OK) return;
+      }
     }
     if (!start_segment())
       return;
@@ -7561,17 +7525,44 @@ public:
           const size_t limit = segment ? last : events.size();
           for (size_t index = segment ? first : 0; index < limit; ++index) {
             const auto &transition = events[index];
+            auto reject = [&](const char *reason, const BarrierResourceState &state) {
+              ERR("ExecuteCommandLists: rejected transition reason=", reason, " queue=", owned_id_,
+                  " queue_type=", UINT(desc_.Type), " submission=", scope->seq, " list=", list.list_id,
+                  " recording=", list.recording, " event=", index, "/", events.size(),
+                  " resource=", transition.resource->resource_id, " sub=", transition.subresource,
+                  " sub_count=", transition.resource->subresource_count, " broad=", transition.resource->broad_promotion,
+                  " implicit=", transition.implicit_use, " enhanced=", transition.enhanced, " flags=", UINT(transition.flags),
+                  " before=", UINT(transition.before), " after=", UINT(transition.after),
+                  " layout_before=", INT(transition.layout_before), " layout_after=", INT(transition.layout_after),
+                  " access_before=", UINT(transition.access_before), " access_after=", UINT(transition.access_after),
+                  " split_begin=", transition.split_begin, " split_end=", transition.split_end,
+                  " wait_fence=", prior_wait ? prior_wait->fence_id : 0, " wait_value=", prior_wait ? prior_wait->ticket.value : 0,
+                  " native_wait=", prior_wait && prior_wait->native_wait_armed);
+              auto describe = [](UINT sub, const BarrierSubresourceState &slot) {
+                ERR("  tracked sub=", sub, " state=", slot.current ? int64_t(*slot.current) : -1,
+                    " layout=", slot.layout ? int64_t(*slot.layout) : -1, " promoted=", slot.implicitly_promoted,
+                    " creation=", slot.creation_state, " pending_split=", slot.split.has_value(),
+                    " pending_layout_split=", slot.layout_split.has_value());
+              };
+              describe(D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, state.all);
+              if (transition.subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+                for (const auto &[sub, slot] : state.subresources) describe(sub, slot);
+              } else if (auto it = state.subresources.find(transition.subresource); it != state.subresources.end()) {
+                describe(it->first, it->second);
+              }
+              valid = false;
+            };
             // COPY_SOURCE/DEST on a copy engine belong to a different state
             // class from those on 3D/compute. A cross-engine handoff must
             // reach COMMON (and be fence-ordered) before any copy-list use.
             if (desc_.Type == D3D12_COMMAND_LIST_TYPE_COPY &&
                 !CopyQueueStartsCommon(transition.resource->state, transition)) {
-              valid = false;
+              reject("copy_queue_entry", transition.resource->state);
               break;
             }
             auto it = pending.try_emplace(transition.resource.get(), transition.resource->state).first;
             if (!ApplyRecordedStateEvent(it->second, transition, false, desc_.Type)) {
-              valid = false;
+              reject("state_event", it->second);
               break;
             }
           }
@@ -7657,7 +7648,8 @@ public:
           auto append_buffers = [&](const auto &buffers, uint64_t stages) {
             for (const auto &use : buffers) {
               if (!node.access_complete) break;
-              node.access_complete = AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes, use.stages ? use.stages : stages);
+              node.access_complete = AppendSubmissionBuffer(node, device_, use.address, use.length, use.writes,
+                  use.stages ? use.stages : stages, nullptr, use.stride, use.count);
             }
           };
           auto append_attachment = [&](const auto &attachment, uint8_t aspect, uint32_t samples, uint32_t layers) {
@@ -7801,6 +7793,7 @@ public:
               node.concurrent_dispatches = IndependentComputeDispatches(plan, node, device_, shape, dispatch_buffers, dispatch_tables);
           } else if (record->type == EncoderType::Blit) {
             const auto &blit = *static_cast<const BlitEncoderData *>(record);
+            node.has_immediate_marker = blit.has_immediate_marker;
             node.access_complete = !fenced && blit.submission_access_complete &&
                 blit.submission_buffers.size() == blit.submission_copy_count * 2;
             append_buffers(blit.submission_buffers, WMTMetal4StageBlit);
@@ -8140,12 +8133,9 @@ public:
       };
       for (size_t index = 0; index < plan.nodes.size(); ++index) {
         auto &node = plan.nodes[index];
-        // ponytail: 64-source-node planning partitions bound frontier scans.
-        // Establish them before clear promotion so no replay group or delayed
-        // clear can cross discarded history; original native fences remain.
         if (index && index % kSubmissionGroupBudget == 0 && !node.boundary_before)
           node.boundary_before = node.partition_before = true;
-        if (node.boundary_before || !node.access_complete) flush_clears(node.clears_before);
+        if (node.boundary_before || !node.access_complete || node.has_immediate_marker) flush_clears(node.clears_before);
         else if (!node.scopes_before.empty()) flush_clears(node.clears_before,&node.scopes_before);
         if (node.record->type == EncoderType::Clear && node.access_complete) {
           if (index) overwrite_clears.push_back(index);
@@ -8241,17 +8231,60 @@ public:
       // Reads never inspect readers; covered older writes/readers are retired.
       struct History { size_t node; SubmissionAccess access; };
       OwnedAccessFrontier<History> history;
+      // Color attachments can be unioned. Geometry and depth/stencil identity
+      // must already match, so only search live group tails in that family.
+      using RenderFamily = std::tuple<uint32_t, uint32_t, uint32_t, uintptr_t, uintptr_t>;
+      std::map<RenderFamily, uint64_t> render_tails;
+      // Index long groups on demand. Node access storage is immutable during planning.
+      struct FeedbackIndex {
+        size_t indexed = 0;
+        std::unordered_map<PhysicalIdentity, std::array<std::vector<const SubmissionAccess *>, 2>,
+                           PhysicalIdentityHash> by_role;
+      };
+      std::unordered_map<size_t, FeedbackIndex> feedback_indices;
+      static_assert(kSubmissionGroupBudget <= 64);
       size_t partition = 0;
+      // Only adjacent, contiguous members cross a frontier reset. Retain their
+      // exact physical access set, bounded independently of the replay length.
+      std::vector<SubmissionAccess> carry_accesses;
+      size_t carry_leader = SIZE_MAX, carry_end = 0;
+      auto extend_carry = [&](size_t member, size_t leader) {
+        const auto &n = plan.nodes[member];
+        if (!n.merge_eligible || n.has_immediate_marker || n.helper_passes || n.sparse_resource_used ||
+            n.external_backing || !n.scopes_after.empty() || n.boundary_after ||
+            (member != leader && (n.force_fence_before || !n.scopes_before.empty() || !n.clears_before.empty() ||
+                                  (n.boundary_before && !n.partition_before)))) return false;
+        for (const auto &a : n.accesses) {
+          bool seen = false;
+          for (const auto &b : carry_accesses) {
+            ++plan.feedback_checks;
+            if (a.Key() != b.Key()) continue;
+            if (AccessOverlaps(a, b) && (a.attachment != b.attachment ||
+                ((a.writes || b.writes) && !AttachmentDependencyOrdered(a, b)))) return false;
+            seen |= a.SamePattern(b) && a.allocation == b.allocation && a.begin == b.begin && a.end == b.end &&
+                a.mip_begin == b.mip_begin && a.mip_end == b.mip_end && a.slice_begin == b.slice_begin &&
+                a.slice_end == b.slice_end && a.aspects == b.aspects && a.attachment == b.attachment && a.writes == b.writes;
+          }
+          if (!seen) {
+            if (carry_accesses.size() == kSubmissionGroupBudget) return false;
+            carry_accesses.push_back(a);
+          }
+        }
+        return true;
+      };
       for (size_t index = 0; index < plan.nodes.size(); ++index) {
         auto &node = plan.nodes[index];
+        node.explicit_refit_boundary = node.boundary_before && !node.partition_before;
         if (index && (!plan.nodes[index - 1].access_complete || plan.nodes[index - 1].boundary_after))
           node.boundary_before = true, node.partition_before = false;
-        if (node.boundary_before || !node.access_complete) { history.Clear(); partition = index; }
+        if (node.boundary_before || !node.access_complete) {
+          history.Clear(); render_tails.clear(); feedback_indices.clear(); partition = index;
+        }
         std::unordered_map<size_t, size_t> edge_slots;
         for (const auto &access : node.accesses) {
           history.Visit(access,[&](const History &prior) {
               ++plan.history_checks;
-              if (prior.node == index || !AccessOverlaps(access, prior.access)) return;
+              if (prior.node == index) return;
               const auto [slot, inserted] = edge_slots.try_emplace(prior.node, node.dependencies.size());
               const bool heap_alias = access.Key().domain == PhysicalDomain::Heap;
               const bool attachment_only = AttachmentDependencyOrdered(access, prior.access);
@@ -8275,34 +8308,53 @@ public:
           // by an external dependency. Keep them all until a later node covers them.
           history.PublishPreserving(access,History{index,access},[&](const History& prior){return prior.node==index;});
         }
-        if (node.record->type == EncoderType::Render && node.merge_eligible &&
-            !node.boundary_before && node.clears_before.empty() && node.group == SIZE_MAX) {
-          size_t attempts = 0;
-          // ponytail: bounded candidates/source span and 64-member groups; a
-          // range-indexed group summary can replace this if larger groups pay.
-          const size_t lower = std::max(partition, index > kSubmissionGroupBudget ? index - kSubmissionGroupBudget : 0);
-          for (size_t candidate = index; candidate-- > lower;) {
+        if (node.record->type == EncoderType::Render && node.merge_eligible && node.access_complete) {
+          const auto &render = *static_cast<const RenderEncoderData *>(node.record);
+          auto &tails = render_tails[{render.render_target_width, render.render_target_height,
+              render.render_target_array_length, reinterpret_cast<uintptr_t>(render.depth.attachment.ptr()),
+              reinterpret_cast<uintptr_t>(render.stencil.attachment.ptr())}];
+          const size_t base = partition;
+          auto candidates = !node.boundary_before && node.clears_before.empty() && node.group == SIZE_MAX ? tails : 0;
+          bool seam = node.partition_before && node.group == SIZE_MAX && node.clears_before.empty() && index &&
+              plan.nodes[index - 1].merge_eligible && plan.nodes[index - 1].record->type == EncoderType::Render;
+          while (seam || candidates) {
+            const uint64_t bit = candidates ? std::bit_floor(candidates) : 0;
+            const size_t candidate = seam ? index - 1 : base + std::countr_zero(bit);
+            seam = false;
+            candidates ^= bit;
             auto &prior = plan.nodes[candidate];
-            if (prior.boundary_after || !prior.access_complete) break;
-            if (prior.record->type != EncoderType::Render || !prior.merge_eligible) continue;
-            if (attempts++ == kSubmissionCandidateBudget) break;
-            ++plan.candidate_checks;
             const auto *existing = prior.group == SIZE_MAX ? nullptr : &plan.groups[prior.group];
+            ++plan.candidate_checks;
             const size_t leader = existing ? existing->members.front() : candidate;
-            if (leader < partition) continue;
+            const bool carried = leader < partition;
+            if (carried && (candidate + 1 != index ||
+                index - leader != (existing ? existing->members.size() : 1))) continue;
             // A later list may require sparse publication (or invalidate its
-            // negative proof) at replay. Never move a placed attachment before
-            // that list's original publication point; non-heap groups retain
+            // negative proof) at replay. Keep every incoming placed resource at
+            // or after its list's original publication point. Non-heap groups retain
             // their existing cross-list family.
-            if ((node.placed_attachments || prior.placed_attachments || (existing && existing->placed_attachments)) &&
-                plan.nodes[leader].list_ordinal != node.list_ordinal) {
+            if (plan.nodes[leader].list_ordinal != node.list_ordinal &&
+                (prior.placed_attachments || (existing && existing->placed_attachments) ||
+                 std::any_of(node.accesses.begin(), node.accesses.end(), [](const auto &a) {
+                   return a.Key().domain == PhysicalDomain::Heap;
+                 }))) {
               owned_graphics::Trace("submission_render_rejected", ",\"submission\":", scope->seq,
                   ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
                   ",\"reason\":\"placed_cross_list\"");
               continue;
             }
-            if (index - leader > kSubmissionGroupBudget || (existing && existing->members.size() == kSubmissionGroupBudget)) continue;
             bool commute = true;
+            if (carried) {
+              if (leader != carry_leader || carry_end != index) {
+                carry_accesses.clear();
+                // A newly encountered candidate belongs to the preceding bounded window.
+                if (index - leader > kSubmissionGroupBudget) continue;
+                for (size_t member = leader; member < index && commute; ++member)
+                  commute = extend_carry(member, leader);
+              }
+              carry_leader = SIZE_MAX;
+              if (!commute || !extend_carry(index, leader)) continue;
+            }
             for (const auto &dependency : node.dependencies) {
               const bool internal = dependency.source == leader ||
                   (prior.group != SIZE_MAX && plan.nodes[dependency.source].group == prior.group);
@@ -8312,12 +8364,12 @@ public:
               // other nonattachment dependencies retain store/load + fences.
               if (internal && !InlineRenderDependencySafe(dependency)) commute = false;
             }
-            for (size_t crossed = leader + 1; commute && crossed < index; ++crossed)
+            for (size_t crossed = leader + 1; !carried && commute && crossed < index; ++crossed)
               if (plan.nodes[crossed].boundary_before || plan.nodes[crossed].boundary_after ||
-                  !plan.nodes[crossed].access_complete || !plan.nodes[crossed].clears_before.empty() ||
+                  !plan.nodes[crossed].access_complete || plan.nodes[crossed].has_immediate_marker || !plan.nodes[crossed].clears_before.empty() ||
                   plan.nodes[crossed].record->type == EncoderType::Clear) commute = false;
             bool scope_blocked = false;
-            for (size_t crossed = leader; commute && crossed <= index; ++crossed) {
+            for (size_t crossed = leader; !carried && commute && crossed <= index; ++crossed) {
               auto conflicts = [&](const auto &observations) {
                 for (const auto &observation : observations)
                   for (const auto &access : node.accesses) {
@@ -8345,15 +8397,38 @@ public:
               trial.stages = existing->stages; ++plan.metadata_copies;
             } else if (AppendRenderMember(trial, *static_cast<const RenderEncoderData *>(prior.record), true, first_map)) continue;
             const char *reason = AppendRenderMember(trial, *static_cast<const RenderEncoderData *>(node.record), false, map);
-            auto feedback = [&](size_t member) {
+            auto has_feedback = [&](size_t member) {
               for (const auto &a : plan.nodes[member].accesses)
                 for (const auto &b : node.accesses) {
                   ++plan.feedback_checks;
-                  if (a.attachment != b.attachment && AccessOverlaps(a, b)) reason = "cross_member_attachment_feedback";
+                  if (a.attachment != b.attachment && AccessOverlaps(a, b)) return true;
                 }
+              return false;
             };
-            if (existing) for (const auto member : existing->members) feedback(member);
-            else feedback(candidate);
+            if (!reason && !carried) {
+              bool feedback = false;
+              if (existing && existing->members.size() >= 4) {
+                auto &index = feedback_indices[prior.group];
+                for (; index.indexed < existing->members.size(); ++index.indexed) {
+                  for (const auto &access : plan.nodes[existing->members[index.indexed]].accesses)
+                    index.by_role[access.Key()][access.attachment].push_back(&access);
+                }
+                for (const auto &access : node.accesses) {
+                  const auto found = index.by_role.find(access.Key());
+                  if (found == index.by_role.end()) continue;
+                  const auto &opposite = found->second[!access.attachment];
+                  feedback = std::any_of(opposite.begin(), opposite.end(), [&](const SubmissionAccess *other) {
+                    ++plan.feedback_checks;
+                    return AccessOverlaps(*other, access);
+                  });
+                  if (feedback) break;
+                }
+              } else {
+                feedback = existing ? std::any_of(existing->members.begin(), existing->members.end(), has_feedback)
+                                    : has_feedback(candidate);
+              }
+              if (feedback) reason = "cross_member_attachment_feedback";
+            }
             if (reason) {
               owned_graphics::Trace("submission_render_rejected", ",\"submission\":", scope->seq,
                   ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
@@ -8378,11 +8453,14 @@ public:
             group.members.push_back(index); group.color_maps.push_back(map);
             group.force_fence_before |= node.force_fence_before;
             node.group = prior.group;
+            tails &= ~bit;
+            if (carried) { carry_leader = leader; carry_end = index + 1; }
             owned_graphics::Trace("submission_render_merged", ",\"submission\":", scope->seq, ",\"group\":", node.group,
                 ",\"before_list\":", prior.list_ordinal, ",\"after_list\":", node.list_ordinal,
                 ",\"members\":", group.members.size(), ",\"nonconsecutive\":", candidate + 1 != index);
             break;
           }
+          tails |= uint64_t(1) << (index - base);
         }
         if (!node.access_complete || node.boundary_after) { history.Clear(); partition = index + 1; }
       }
@@ -8400,47 +8478,37 @@ public:
       // residency declarations and CPU planning preceded this guard. A
       // preflight mismatch therefore drops its narrow ticket and reacquires
       // the original exclusion before any work can reach another queue.
-      GPUExecutionGate::Accesses completed_accesses;
-      try {
-        auto proof = std::make_shared<PhysicalAdmissionProof>();
-        bool complete = !fenced;
-        // Cached descriptor summaries retain their pins in the immutable cache,
-        // not in each node. Index those exact owners once; never infer ownership
-        // from a native handle or rescan all caches for every access. The plan
-        // retains each cache until the selected owners have entered the proof.
+      auto plan_proof = [&]() -> GPUExecutionGate::Accesses {
+        if (fenced) return {};
+        // Cache-owned buffers can outlive descriptor replacement. Pin the exact owners from the sealed plan.
         AdmissionBufferOwners cached_buffers;
         size_t owner_checks = 0;
         for (const auto &cache : plan.descriptor_caches) {
-          if (!complete || ++owner_checks > 4096) { complete = false; break; }
+          if (++owner_checks > 4096) return {};
           for (const auto &buffer : cache->buffers) {
-            if (++owner_checks > 4096) { complete = false; break; }
+            if (++owner_checks > 4096) return {};
             cached_buffers.try_emplace(buffer.allocation.ptr(), &buffer.allocation);
-            if (cached_buffers.size() > 256) { complete = false; break; }
+            if (cached_buffers.size() > 256) return {};
           }
         }
+        auto proof = std::make_shared<PhysicalAdmissionProof>();
         for (const auto &node : plan.nodes) {
-          if (!complete) break;
-          complete = node.access_complete && !node.helper_passes && !node.sparse_resource_used &&
-              (node.record->type == EncoderType::Render || node.record->type == EncoderType::Compute ||
-               node.record->type == EncoderType::Blit || node.record->type == EncoderType::Clear);
-          if (!complete) break;
+          const auto type = node.record->type;
+          if (!node.access_complete || node.helper_passes || node.sparse_resource_used ||
+              (type != EncoderType::Render && type != EncoderType::Compute &&
+               type != EncoderType::Blit && type != EncoderType::Clear)) return {};
           for (const auto &access : node.accesses)
-            if (!AppendAdmissionAccess(*proof, access, node.allocation_pins, false, &cached_buffers)) {
-              complete = false; break;
-            }
+            if (!AppendAdmissionAccess(*proof, access, node.allocation_pins, false, &cached_buffers)) return {};
         }
-        if (complete) {
-          proof->resources = plan.descriptor_owners;
-          completed_accesses = ShareAdmissionProof(std::move(proof));
-        }
+        proof->resources = plan.descriptor_owners;
+        return ShareAdmissionProof(std::move(proof));
+      };
+      GPUExecutionGate::Accesses completed_accesses;
+      try {
+        // A preflighted Atomic dispatch re-resolves its bindings after obtaining the prologue ticket.
+        completed_accesses = ordinary_accesses && atomic_envelope ? envelope_proof() : plan_proof();
       } catch (const std::bad_alloc &) {
-        // This optional summary changes exclusion only, never GPU results.
-      }
-      if (ordinary_accesses && atomic_envelope) {
-        // Re-resolve the actual inputs after obtaining the prologue ticket.
-        // Keep the replay planner's Atomic node opaque for fence/merge purposes.
-        try { completed_accesses = envelope_proof(); }
-        catch (const std::bad_alloc &) { completed_accesses.reset(); }
+        // Allocation failure leaves the gate on its shared fallback.
       }
       if (ordinary_accesses && (!completed_accesses ||
           !std::all_of(completed_accesses->begin(), completed_accesses->end(),
@@ -8526,6 +8594,98 @@ public:
     };
     size_t replay_node = 0;
     size_t replay_list = 0;
+    struct QueuedRefit {
+      const RTASEncoderData *as;
+      WMT::Reference<WMT::MTL4AccelerationStructureDescriptor> descriptor;
+      WMT::Reference<WMT::Buffer> scratch;
+      uint64_t offset;
+      raytracing::ShadowParams shadow;
+      WMT::Buffer tables;
+      uint64_t jobs_offset, geometries_offset;
+      uint32_t threads, rows;
+    };
+    std::vector<QueuedRefit> refits;
+    std::vector<WMTMetal4RefitEntry> native_refits;
+    OwnedAccessFrontier<bool> refit_accesses;
+    std::unordered_set<obj_handle_t> refit_destinations;
+    std::vector<SubmissionAccess> next_refit_accesses;
+    auto flush_refits = [&] {
+      if (refits.empty()) return true;
+      const bool concurrent = refits.size() > 1;
+      if (concurrent) {
+        native_refits.clear();
+        native_refits.reserve(refits.size());
+        for (const auto &r : refits)
+          native_refits.push_back({r.descriptor.handle, r.as->destination.handle, r.scratch.handle, r.offset});
+      }
+      auto &cmdbuf = scope->inflight.cmdbuf;
+      auto encoder = cmdbuf.accelerationStructureCommandEncoder(concurrent);
+      if (!encoder) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return false; }
+      encoder.waitForFence(fence_);
+      bool ok = true;
+      // The same checked footprints cover the shadow writers and native refits.
+      // Each member has its own live-mirror slot and submission-owned metadata slice.
+      unsigned shadow_dispatches = 0;
+      for (size_t first = 0; first < refits.size();) {
+        const auto &r = refits[first];
+        size_t end = first + 1;
+        while (end < refits.size() && refits[end].tables == r.tables &&
+               refits[end].as->liveMirror == r.as->liveMirror && refits[end].threads == r.threads &&
+               refits[end].rows == r.rows && end - first < 65535)
+          ++end;
+        const size_t count = end - first;
+        if (count == 1) {
+          ok &= EncodeASHelper(cmdbuf, r.as->pipelines->shadow, &r.shadow, sizeof(r.shadow), r.threads,
+              r.tables, r.tables, r.jobs_offset, r.geometries_offset, r.rows, r.as->liveMirror, encoder);
+        } else {
+          struct Entry { raytracing::ShadowParams params; uint64_t jobs, geometries; };
+          static_assert(sizeof(Entry) == 104);
+          auto block = scope->inflight.AllocateASMetadata(device_->GetMTLDevice(), count * sizeof(Entry));
+          if (!block.buffer) { encoder.endEncoding(); device_->ReportRemoval(E_OUTOFMEMORY); return false; }
+          auto *entries = reinterpret_cast<Entry *>(block.memory);
+          for (size_t i = 0; i < count; ++i) {
+            const auto &member = refits[first + i];
+            entries[i] = {member.shadow, member.jobs_offset, member.geometries_offset};
+          }
+          wmtcmd_compute_setpso pso{};
+          pso.type = WMTComputeCommandSetPSO; pso.pso = r.as->pipelines->shadowBatch;
+          const unsigned width = std::min(r.threads, raytracing::kHelperThreadgroup);
+          pso.threadgroup_size = {width, 1, std::min<size_t>(count, std::max(1u, 32u / width))};
+          wmtcmd_compute_setbuffer buffers[3]{};
+          wmtcmd_compute_dispatch dispatch{};
+          pso.next.set(buffers);
+          for (unsigned i = 0; i < 3; ++i) {
+            buffers[i].type = WMTComputeCommandSetBuffer; buffers[i].index = i;
+            if (i < 2) buffers[i].next.set(&buffers[i + 1]);
+          }
+          buffers[0].buffer = block.buffer; buffers[0].offset = block.offset;
+          buffers[1].buffer = r.tables; buffers[2].buffer = r.as->liveMirror;
+          buffers[2].next.set(&dispatch);
+          dispatch.type = WMTComputeCommandDispatchThreads; dispatch.size = {r.threads, r.rows, count};
+          encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&pso));
+        }
+        ++shadow_dispatches;
+        first = end;
+      }
+      if (concurrent)
+        encoder.barrierAfterEncoderStages(WMTMetal4StageDispatch,
+            WMTMetal4StageAccelerationStructure, WMTMetal4VisibilityDevice);
+      if (concurrent)
+        ok &= encoder.refitBatch(native_refits.data(), native_refits.size());
+      else {
+        const auto &r = refits.front();
+        ok &= encoder.refit(r.descriptor, r.as->source, r.as->destination, r.scratch, r.offset);
+      }
+      encoder.updateFence(fence_);
+      encoder.endEncoding();
+      owned_graphics::Trace("rtas_refit_batch", ",\"submission\":", scope->seq, ",\"count\":", refits.size(),
+          ",\"shadow_dispatches\":", shadow_dispatches);
+      refits.clear();
+      refit_accesses.Clear();
+      refit_destinations.clear();
+      if (!ok) device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+      return ok;
+    };
     for (auto &list : task.lists) {
       if (device_->RemovedReason() != S_OK)
         return;
@@ -8533,6 +8693,10 @@ public:
                             ",\"list\":", list.list_id,
                             ",\"recording\":", list.recording);
       EncoderData *current = list.entry;
+      const RTASEncoderData *previous_shadow_refit = nullptr;
+      const EncoderData *scaler_with_producer = nullptr;
+      const EncoderData *scaler_consumer = nullptr;
+      uint64_t scaler_producer_submission = 0;
       size_t fence_operation = 0;
       size_t state_event = 0;
       auto validate_segment = [&](EncoderData *start) {
@@ -8545,8 +8709,6 @@ public:
         state_event = end; return true;
       };
       if (fenced && !validate_segment(current)) return;
-      // Capture-sized ExecuteIndirect: prepared at its pass-1 render pass, consumed by its last render pass.
-      std::optional<MeshCaptureExecution> capture_execution;
       const auto &publication = plan.sparse_publication[replay_list++];
       // A mapping update may have run after planning on another queue. Never
       // reuse a negative proof across epochs or while native remapping is live.
@@ -8559,6 +8721,7 @@ public:
             ",\"heap_ranges\":", publication.heap_ranges, ",\"required\":", sparse_publication,
             ",\"current\":", proof_current);
       if (ReservedResource::AnyLive() && sparse_publication) {
+        if (!flush_refits()) return;
         /* Command lists see each other's writes; for sparse tiles sharing a heap page that needs a
            shared event signal/wait, not only the pass boundary (ReservedResource::AnyLive). */
         owned_graphics::Trace("sparse_publication_required", ",\"queue\":", owned_id_, ",\"list\":", list.list_id,
@@ -8580,6 +8743,16 @@ public:
           return;
         const RenderReplayGroup *replay_group = nullptr;
         const SubmissionNode *replay_current_node = current->type == EncoderType::Null ? nullptr : &plan.nodes[replay_node];
+        const auto *as_member = current->type == EncoderType::Raytracing ? static_cast<RTASEncoderData *>(current) : nullptr;
+        const auto *prior_shadow = std::exchange(previous_shadow_refit, nullptr);
+        bool batch_refit = as_member && as_member->deferredUpdate && as_member->metadata.type == 1 &&
+            !as_member->metadata.reserved0 && as_member->postbuild.empty() && !reserved_volume_publish_pending_;
+        if (!refits.empty() && current->type != EncoderType::Null &&
+            (!batch_refit || replay_current_node->explicit_refit_boundary ||
+            replay_current_node->force_fence_before ||
+            !replay_current_node->clears_before.empty() || !replay_current_node->scopes_before.empty() ||
+            plan.nodes[replay_node - 1].boundary_after || !plan.nodes[replay_node - 1].scopes_after.empty()))
+          if (!flush_refits()) return;
         PrepareSwizzleValidity(scope->inflight, current, scope->seq, replay_current_node);
         bool native_fence_required = true;
         uint64_t consumer_barrier_after = 0;
@@ -8587,8 +8760,7 @@ public:
         if (current->type != EncoderType::Null) {
           const auto index = replay_node++;
           const auto &node = plan.nodes[index];
-          for(const auto &access:node.accesses)if(access.Key().domain==PhysicalDomain::Heap)
-            consumer_visibility |= WMTMetal4VisibilityResourceAlias;
+
           assert(node.record == current);
           if (node.resolve_folded_into_previous) {
             // Encoded by the preceding pass's resolve store.
@@ -8597,8 +8769,7 @@ public:
             continue;
           }
           if (node.group != SIZE_MAX) replay_group = &plan.groups[node.group];
-          if (replay_group && replay_group->placed_attachments)
-            consumer_visibility |= WMTMetal4VisibilityResourceAlias;
+
           // Skip the queue fence only when no tracked in-flight access (this
           // or an earlier submission) overlaps and no untracked work may still
           // run. Grouped members replay inside the leader's encoder. A boundary
@@ -8617,7 +8788,11 @@ public:
             // a same-submission dependency is one of these hazards. A
             // resource-scoped barrier orders the same way as a write to its
             // resource; it is checked but never recorded as GPU work.
-            const auto check = [&](std::span<const SubmissionAccess> accesses) { inflight_stages |= InflightHazard(accesses); };
+            const auto check = [&](std::span<const SubmissionAccess> accesses) {
+              inflight_stages |= InflightHazard(accesses);
+              if (std::any_of(accesses.begin(), accesses.end(), [](const auto &a) { return a.Key().domain == PhysicalDomain::Heap; }))
+                consumer_visibility |= WMTMetal4VisibilityResourceAlias;
+            };
             inflight_stages = 0;
             if (replay_group) {
               for (const auto member : replay_group->members) check(plan.nodes[member].accesses);
@@ -8648,6 +8823,10 @@ public:
           if (!native_fence_required) consumer_barrier_after = inflight_stages;
           if (native_fence_required) DrainSkippedWork(scope->inflight.cmdbuf, scope->seq);
           else BreakFenceChain();
+          // Group followers and deferred clears do not create an encoder here.
+          if (!native_fence_required && !node.skip_clear &&
+              (!replay_group || replay_group->members.front() == index))
+            HUDState::addStatistic(HUDStatistic::SkippedFenceWaits);
           if (!native_fence_required)
             owned_graphics::Trace("native_fence_wait_skipped", ",\"submission\":", scope->seq,
                 ",\"encoder\":", current->id, ",\"reason\":\"", consumer_barrier_after ? "queue_barrier" : "no_known_hazard",
@@ -8973,7 +9152,6 @@ public:
             return;
         }
 
-        std::optional<SOIndirectExecution> indirect_execution;
         if (current->type == EncoderType::Render) {
           const auto &render = *static_cast<const RenderEncoderData *>(current);
           // Indirect capture templates are detached into CaptureFrontier at
@@ -8992,7 +9170,6 @@ public:
         if (current->type == EncoderType::Render) {
           auto *render = static_cast<RenderEncoderData *>(current);
           if (render->msaa_draw) {
-            const auto *mesh_capture_execution = render->capture_indirect_pass ? &*capture_execution : nullptr;
             // Vertex capture is a shader pass submitted before the raster pass.
             // Import its descriptor-table textures into this producer segment,
             // not only into the later render segment.
@@ -9061,13 +9238,10 @@ public:
               if (!finish_mesh_preflight()) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
               scope->inflight.msaa_buffers.push_back(object_records);
             }
-            const auto &so_draws = indirect_execution ? indirect_execution->draws :
-                mesh_capture_execution ? mesh_capture_execution->so_draws : render->so_draws;
+            const auto &so_draws = render->so_draws;
             if (render->msaa_draw->needs_stream_assembly && !so_draws.empty())
               EncodeStreamOutputSetup(scope->inflight.cmdbuf, scope->inflight, so_draws);
-            const uint32_t count = indirect_execution ? indirect_execution->count :
-                mesh_capture_execution ? uint32_t(mesh_capture_execution->commands.size()) :
-                object_records ? mesh_draw.mesh_control.total_slots : 1;
+            const uint32_t count = object_records ? mesh_draw.mesh_control.total_slots : 1;
             msaa_executions.reserve(count);
             msaa_draws.reserve(count);
             for (uint32_t i = 0; i < count; i++) {
@@ -9080,90 +9254,6 @@ public:
                 draw.object_records = object_records;
                 draw.object_record_offset = word * 4;
               }
-              if (mesh_capture_execution) {
-                const auto &capture = *mesh_capture_execution;
-                const auto &command = capture.commands[i];
-                const auto &data = *capture.data;
-                if (data.root_stride) {
-                  draw.root_buffer = data.root_heap;
-                  draw.root_offset = data.root_offset + uint64_t(command.slot) * data.root_stride;
-                }
-                if (data.vertex_stride) {
-                  draw.vertex_buffer_table = data.vertex_heap;
-                  draw.vertex_buffer_offset = data.vertex_offset + uint64_t(command.slot) * data.vertex_stride;
-                }
-                const uint64_t primitives = data.geometry
-                    ? data.strip_expand ? command.vertex_count : MeshCaptureInputPrimitives(data.topology, command.vertex_count)
-                    : data.domain_only ? command.patches : command.slots * data.layout.max_primitives;
-                const uint32_t instances = data.geometry || data.domain_only ? command.instances : 1;
-                uint64_t slots = 0, records = 0;
-                if (!resource_contract::CheckedMul(primitives, instances, slots) ||
-                    !resource_contract::CheckedMul(slots, draw.mesh_layout.max_workloads, slots) ||
-                    slots > UINT32_MAX ||
-                    !resource_contract::CheckedMul(slots, draw.mesh_layout.max_primitives, records) ||
-                    !resource_contract::CheckedMul(records, draw.mesh_layout.vertices_per_primitive, records) ||
-                    records > UINT32_MAX) {
-                  device_->ReportRemoval(E_OUTOFMEMORY); return;
-                }
-                draw.mesh_control = {uint32_t(primitives), instances, 0, uint32_t(slots)};
-                draw.assembly.vertex_count = uint32_t(records);
-                draw.assembly.instance_count = 1;
-                draw.assembly.max_primitives = uint32_t(records / draw.mesh_layout.vertices_per_primitive);
-                draw.stream_output = command.so;
-                draw.statistics_claim = data.statistics_claim;
-                draw.statistics_claim_offset = data.statistics_claim_offset +
-                    uint64_t(command.slot) * sizeof(SM50_STATISTICS_CLAIM_HEADER);
-              }
-              if (indirect_execution) {
-                const auto &record = indirect_execution->bindings[i].arguments;
-                const auto &prepared = indirect_execution->draws[i];
-                draw.stream_output = prepared;
-                draw.assembly.vertex_count = record.vertex_count;
-                draw.assembly.instance_count = record.instance_count;
-                draw.assembly.positions_per_instance = record.vertex_count;
-                const uint32_t vpp = draw.assembly.topology == 0 ? 1 : draw.assembly.topology <= 2 ? 2 : 3;
-                const bool strip = draw.assembly.topology == 2 || draw.assembly.topology == 4 || draw.assembly.topology == 5;
-                const uint64_t per_instance = strip ? record.vertex_count >= vpp
-                    ? record.vertex_count - vpp + 1 : 0 : record.vertex_count / vpp;
-                const uint64_t primitives = per_instance * record.instance_count;
-                const uint32_t index_stride = MSAAIndexStride(draw.line_mode, draw.conservative);
-                if (primitives > UINT32_MAX / index_stride ||
-                    primitives * index_stride * sizeof(uint32_t) >
-                        device_->GetMTLDevice().maxBufferLength()) {
-                  ERR("MSAA indirect primitive count exceeds GPU addressability");
-                  device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
-                  return;
-                }
-                draw.assembly.max_primitives = uint32_t(primitives);
-                const uint32_t index_size = record.index_format == DXGI_FORMAT_R32_UINT ? 4 : 2;
-                draw.indexed = render->so_indirect->preflight.indexed;
-                const bool dynamic_index = draw.indexed && render->so_indirect->index_view_heap;
-                draw.assembly.index_size = dynamic_index ? 8 : index_size;
-                const auto cut = render->so_indirect->strip_cut;
-                draw.assembly.cut_enabled = draw.indexed && strip &&
-                    ((index_size == 2 && cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF) ||
-                     (index_size == 4 && cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF));
-                draw.assembly.cut_value = index_size == 4 ? 0xffffffffu : 0xffffu;
-                draw.index_buffer = prepared->index_buffer;
-                const uint64_t first = dynamic_index ? 0
-                    : record.index_address + uint64_t(record.start_location) * index_size;
-                draw.assembly.index_skip = first & 3;
-                if (dynamic_index) draw.assembly.first_index = 0; // the GPU view already holds StartIndexLocation
-                draw.index_offset = prepared->index_offset + draw.assembly.index_skip;
-                draw.base_vertex = record.base_vertex;
-                draw.start_instance = record.start_instance;
-                draw.start_vertex = record.start_location;
-                draw.predicate_buffer = {};
-                draw.assembly.predicate_enabled = 0;
-                draw.root_buffer = indirect_execution->storage;
-                draw.root_offset = indirect_execution->root_offset +
-                    uint64_t(i) * indirect_execution->command->rootsig_qwords_stride * 8;
-                draw.vertex_buffer_table = indirect_execution->storage;
-                draw.vertex_buffer_offset = indirect_execution->vertex_offset +
-                    uint64_t(i) * indirect_execution->command->vertex_argbuf_stride;
-                draw.static_sampler_buffer = render->so_indirect->static_sampler_buffer;
-                draw.static_sampler_offset = render->so_indirect->static_sampler_offset;
-              }
               draw.bounds.max_primitives = draw.assembly.max_primitives;
               if (draw.atomic64_phase) {
                 msaa_atomic_roots.emplace_back(); msaa_atomic_tables.emplace_back();
@@ -9174,13 +9264,11 @@ public:
               msaa_draws.push_back(draw);
               msaa_executions.emplace_back();
               const bool atomic_producer = draw.atomic64_phase && draw.assembly.vertex_count && draw.assembly.instance_count;
-              if (atomic_producer && !begin_atomic(producer_participants(*render, &draw, mesh_capture_execution,
-                  mesh_capture_execution ? mesh_capture_execution->commands[i].slot : UINT32_MAX),
+              if (atomic_producer && !begin_atomic(producer_participants(*render, &draw),
                   msaa_atomic_tables[i], msaa_atomic_roots[i], &producer_swizzle_uses)) return;
               if (draw.assembly.vertex_count && draw.assembly.instance_count &&
                   !EncodeMSAAProducer(scope->inflight.cmdbuf, scope->inflight, *render, draw,
-                                      msaa_executions.back(), mesh_capture_execution,
-                                      mesh_capture_execution ? mesh_capture_execution->commands[i].slot : UINT32_MAX)) {
+                                      msaa_executions.back())) {
                 ERR("MSAA vertex capture/assembly resource allocation failed");
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
                 return;
@@ -9208,12 +9296,50 @@ public:
         raytracing::AccelerationStructureHeader as_source_header{};
         raytracing::NativeDescriptor as_native;
         WMT::Reference<WMT::Buffer> as_scratch;
+        WMT::Reference<WMT::Allocation> as_observed_native;
         bool as_rebuild_update = false;
         bool as_fast_refit = false;
         bool as_preserve_index_shadow = false;
+        bool reuse_shadow_payload = false;
         bool as_plain_deserialize = false;
+        std::vector<WMT::Reference<WMT::Allocation>> query_native_sizes;
         if (current->type == EncoderType::Raytracing) {
           auto *as = static_cast<RTASEncoderData *>(current);
+          auto compatible_refit = [&](const raytracing::StructureInfo &source, bool reuse_index_shadow) {
+            const bool same_storage = reuse_index_shadow && as->sourceLocation.buffer == as->destinationLocation.buffer &&
+                as->sourceLocation.offset == as->destinationLocation.offset;
+            return raytracing::IsCompatibleUpdate(source, as->deferredInputs, as->shadowPlan,
+                same_storage ? &as_preserve_index_shadow : nullptr);
+          };
+          if (as->operation == RTASOperation::Emit && !as->postbuild.empty() &&
+              as->postbuild.front().type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE) {
+            query_native_sizes.resize(as->postbuild.size());
+            AtomicReadbackBatch unknown_headers;
+            std::vector<size_t> unknown_entries;
+            for (size_t i = 0; i < as->postbuild.size(); ++i) {
+              const auto &src = as->postbuild[i].source;
+              RTASState state;
+              if (HasUnaliasedRTASStorage(src) &&
+                  device_->FindRTASExecution({src.allocationIdentity, src.offset}, owned_id_, state) &&
+                  state.sidecar.resourceID() == state.execution.resourceID) {
+                query_native_sizes[i] = state.sidecar.accelerationStructure();
+              } else {
+                if (append_atomic_buffer(unknown_headers, src.buffer, src.offset, raytracing::kHeaderSize) == SIZE_MAX) return;
+                unknown_entries.push_back(i);
+              }
+            }
+            if (!read_atomic_batch(unknown_headers, "rtas_compacted_size_sources", as->id)) return;
+            for (size_t j = 0; j < unknown_entries.size(); ++j) {
+              raytracing::AccelerationStructureHeader header{};
+              memcpy(&header, unknown_headers[j].result.bytes, sizeof(header));
+              if (header.type > 1 || header.reserved0 || header.nativeCompactedSize) continue;
+              const size_t i = unknown_entries[j];
+              const auto &src = as->postbuild[i].source;
+              query_native_sizes[i] = device_->FindNativeRTAS({src.allocationIdentity, src.offset}, header.resourceID);
+              if (!query_native_sizes[i]) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+            }
+          }
+          uint64_t proven_refit_size = 0;
           const char *refit_reason = "not_refit";
           if (as->deferredUpdate) {
             // ProcessWait gates this FIFO worker on validated producer retirement.
@@ -9222,41 +9348,73 @@ public:
             // provenance only, not a substitute for GPU mirror observations.
             auto resolve_refit = [&]() -> const char * {
               const raytracing::ArenaKey sourceKey{as->sourceLocation.allocationIdentity, as->sourceLocation.offset};
-              if (sourceKey != as->destinationKey || as->source != as->destination)
-                return "out_of_place";
-              if (!HasUnaliasedRTASStorage(as->sourceLocation))
+              const bool in_place = sourceKey == as->destinationKey;
+              if (in_place != (as->source == as->destination))
+                return "native_generation";
+              if (!HasUnaliasedRTASStorage(as->sourceLocation) ||
+                  (!in_place && !HasUnaliasedRTASStorage(as->destinationLocation)))
                 return "aliased_or_sparse_storage";
               if (as->metadata.type > 1 || as->metadata.reserved0)
                 return "omm";
               RTASState source;
-              if (!device_->FindRTASExecution(sourceKey, owned_id_, source))
+              WMT::ASGenerationInfo generation;
+              if (!device_->FindRTASExecution(sourceKey, owned_id_, source, &generation))
                 return "unproven_execution";
               const auto &proof = source.execution;
-              if (source.sidecar != as->source || as->source.resourceID() != proof.resourceID ||
-                  as->source.size() != proof.nativeSize || as->source.instanceCount() != proof.instanceCount)
+              if (source.sidecar != as->source || generation.resourceID != proof.resourceID ||
+                  generation.nativeSize != proof.nativeSize || generation.instanceCount != proof.instanceCount)
                 return "native_generation";
-              if (as->nativeCapacity > proof.nativeSize || as->instanceCount != proof.instanceCount)
+              if (as->nativeSizes.accelerationStructureSize > proof.nativeSize || as->instanceCount != proof.instanceCount)
                 return "native_capacity";
               const auto &metadata = proof.metadata;
               if (metadata.magic != raytracing::kHeaderMagic || metadata.type > 1 || metadata.reserved0 ||
                   metadata.shadowSize > as->sourceLocation.available - raytracing::kHeaderSize ||
+                  metadata.currentSize > as->sourceLocation.available ||
                   metadata.currentSize > as->destinationLocation.available ||
-                  !raytracing::IsCompatibleUpdate(*source.info, as->deferredInputs, as->shadowPlan))
+                  !compatible_refit(*source.info, in_place))
                 return "source_shape_or_bounds";
+              if (!in_place && as->sourceLocation.buffer == as->destinationLocation.buffer) {
+                const auto a = as->sourceLocation.offset, b = as->destinationLocation.offset;
+                if (std::max(a, b) - std::min(a, b) < metadata.currentSize) return "overlapping_update";
+              }
               as_source_header.currentSize = metadata.currentSize;
               as_source_header.deserializedSize = metadata.deserializedSize;
-              // D3D12 ordinary updates may change positions/transforms, but not
-              // index contents. Keep the existing index shadow only when the
-              // executed source owns this exact in-place byte layout as well.
-              as_preserve_index_shadow = metadata.type == 1 && source.info->shadowSize == as->shadowPlan.size &&
-                  std::equal(source.info->geometries.begin(), source.info->geometries.end(),
-                      as->shadowPlan.geometries.begin(), [](const auto &a, const auto &b) {
-                        return !memcmp(&a, &b, sizeof(raytracing::ShadowGeometry));
-                      });
+              proven_refit_size = proof.nativeSize;
               return nullptr;
             };
             refit_reason = resolve_refit();
             as_fast_refit = !refit_reason;
+            batch_refit = batch_refit && as_fast_refit && as->source == as->destination;
+            next_refit_accesses.clear();
+            if (batch_refit)
+              batch_refit = CollectBLASRefitAccess(*as, as_source_header.currentSize, next_refit_accesses);
+            // Consecutive in-place refits in this list see the same private input
+            // bytes when their jobs match and neither destination nor scratch
+            // writes overlap those bytes. A copy, dispatch, fence or another AS
+            // operation between them removes the preceding producer.
+            if (batch_refit && prior_shadow && as_preserve_index_shadow &&
+                prior_shadow->destinationKey == as->destinationKey &&
+                prior_shadow->scratch == as->scratch && prior_shadow->scratchOffset == as->scratchOffset &&
+                prior_shadow->nativeSizes.refitScratchSize == as->nativeSizes.refitScratchSize &&
+                replay_current_node->clears_before.empty() && prior_shadow->shadowPlan.jobs == as->shadowPlan.jobs) {
+              const auto first_read = std::find_if(next_refit_accesses.begin(), next_refit_accesses.end(),
+                  [](const auto &access) { return !access.writes; });
+              reuse_shadow_payload = std::all_of(first_read, next_refit_accesses.end(), [&](const auto &read) {
+                const auto *allocation = static_cast<const BufferAllocation *>(read.allocation);
+                return allocation->d3d12_gpu_only &&
+                    !std::any_of(next_refit_accesses.begin(), first_read,
+                        [&](const auto &write) { return AccessOverlaps(write, read); });
+              });
+            }
+            bool conflict = false;
+            if (batch_refit && !refits.empty()) {
+              conflict = refit_destinations.contains(as->destination.handle);
+              for (const auto &next : next_refit_accesses) {
+                if (conflict) break;
+                refit_accesses.Visit(next, [&](bool) { conflict = true; });
+              }
+            }
+            if ((!batch_refit || conflict) && !flush_refits()) return;
           }
           const bool ommBuild = as->operation == RTASOperation::Build && as->metadata.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY;
           if (ommBuild || as->operation == RTASOperation::Deserialize || as->operation == RTASOperation::Clone ||
@@ -9281,11 +9439,41 @@ public:
             constexpr uint64_t packet_geom = packet_header + raytracing::kHeaderSize;
             constexpr uint64_t geom_capacity = 8 * sizeof(raytracing::ShadowGeometry);
             const bool gather = as->operation == RTASOperation::Deserialize && !(readLocation.offset & 7);
+            // Clone, serialize and visualize need the ordinary AS layout on the
+            // CPU, but copy the current shadow bytes on the GPU. A proven writer
+            // already supplied that layout. Compaction still needs its native size.
+            uint64_t proven_native_size = 0;
+            if ((as->operation == RTASOperation::Clone || as->operation == RTASOperation::Serialize ||
+                 as->operation == RTASOperation::Visualize) && HasUnaliasedRTASStorage(readLocation)) {
+              RTASState state;
+              if (device_->FindRTASExecution({readLocation.allocationIdentity, readLocation.offset}, owned_id_, state) &&
+                  state.sidecar == as->source) {
+                WMT::Reference<WMT::Allocation> native = state.sidecar.accelerationStructure();
+                if (native && MTLResource_gpuResourceID(native.handle) == state.execution.resourceID) {
+                  const auto &m = state.execution.metadata;
+                  as_source_header = {state.execution.resourceID, 0, m.magic, m.type, m.flags, m.descCount,
+                      m.shadowSize, m.currentSize, 0, m.reserved0, m.deserializedSize};
+                  as_observed_native = std::move(native);
+                  proven_native_size = state.execution.nativeSize;
+                }
+              }
+            }
+            // Compact already needs the GPU header to size the application destination.
+            // When the writer is known, measure the native object in that same submission.
+            bool measure_with_header = false;
+            if (as->operation == RTASOperation::Compact && HasUnaliasedRTASStorage(readLocation)) {
+              RTASState state;
+              if (device_->FindRTASExecution({readLocation.allocationIdentity, readLocation.offset}, owned_id_, state) &&
+                  state.sidecar.resourceID() == state.execution.resourceID) {
+                as_observed_native = state.sidecar.accelerationStructure();
+                measure_with_header = true;
+              }
+            }
             auto read_source = [&](uint64_t offset, uint64_t length, bool packet = false) {
               if (offset > readLocation.available || length > readLocation.available - offset) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return false;
               }
-              const uint64_t capacity = packet ? packet_geom + geom_capacity : length;
+              const uint64_t capacity = packet ? packet_geom + geom_capacity : length + (measure_with_header ? 8 : 0);
               if (capacity > readbackCapacity) {
                 WMTBufferInfo info{};
                 info.length = std::max<uint64_t>(capacity, raytracing::kHeaderSize);
@@ -9331,6 +9519,13 @@ public:
                 blit.updateFence(fence_);
                 blit.endEncoding();
               }
+              if (measure_with_header) {
+                auto encoder = scope->inflight.cmdbuf.accelerationStructureCommandEncoder();
+                if (!encoder) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return false; }
+                encoder.waitForFence(fence_);
+                encoder.compactedSizeOfNative(as_observed_native, readback, length);
+                encoder.updateFence(fence_); encoder.endEncoding();
+              }
               const auto producer = scope->seq;
               scope.reset();
               owned_graphics::Trace("rtas_metadata_readback", ",\"queue\":", owned_id_,
@@ -9341,7 +9536,7 @@ public:
               if (device_->RemovedReason() != S_OK) return false;
               return start_segment();
             };
-            if (bytes && !read_source(0, bytes, gather)) return;
+            if (!proven_native_size && bytes && !read_source(0, bytes, gather)) return;
             if (ommBuild) {
               if (!raytracing::PlanOmmShadow(as->deferredInputs, mapped, bytes, as->shadowPlan)) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
@@ -9394,12 +9589,42 @@ public:
               if (!as_scratch) { device_->ReportRemoval(E_OUTOFMEMORY); return; }
               scope->inflight.msaa_buffers.push_back(as_scratch);
             } else {
-              memcpy(&as_source_header, mapped, sizeof(as_source_header));
+              if (!proven_native_size)
+                memcpy(&as_source_header, mapped, sizeof(as_source_header));
               if (as_source_header.magic != raytracing::kHeaderMagic || as_source_header.type > 2 ||
                   as_source_header.shadowSize > as->sourceLocation.available - raytracing::kHeaderSize) {
                 device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
               }
               const uint64_t overhead = raytracing::kHeaderSize + as_source_header.shadowSize;
+              if (measure_with_header && MTLResource_gpuResourceID(as_observed_native.handle) != as_source_header.resourceID) {
+                measure_with_header = false;
+                as_observed_native = nullptr;
+              }
+              if (as_source_header.type <= 1 && (as->operation == RTASOperation::Compact ||
+                  as->operation == RTASOperation::Clone ||
+                  (as->operation == RTASOperation::Serialize && !as_source_header.nativeCompactedSize))) {
+                if (!as_observed_native)
+                  as_observed_native = device_->FindNativeRTAS({readLocation.allocationIdentity, readLocation.offset},
+                                                              as_source_header.resourceID);
+                if (!as_observed_native) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+                if (as->operation == RTASOperation::Compact && !as_source_header.nativeCompactedSize) {
+                  if (!measure_with_header) {
+                    // Aliased or unproven writer. Its resource ID is only authoritative after reading the header.
+                    auto encoder = scope->inflight.cmdbuf.accelerationStructureCommandEncoder();
+                    if (!encoder) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+                    encoder.waitForFence(fence_);
+                    encoder.compactedSizeOfNative(as_observed_native, readback, 0);
+                    encoder.updateFence(fence_); encoder.endEncoding();
+                    const auto producer = scope->seq;
+                    scope.reset(); submission_ring_.waitUntilRetired(producer);
+                    if (device_->RemovedReason() != S_OK || !start_segment()) return;
+                  }
+                  uint64_t native_size;
+                  memcpy(&native_size, mapped + (measure_with_header ? bytes : 0), sizeof(native_size));
+                  if (native_size > UINT32_MAX) { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return; }
+                  as_source_header.nativeCompactedSize = uint32_t(native_size);
+                }
+              }
               if (as->deferredUpdate) {
                 raytracing::StructureInfo sourceInfo{D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE(as_source_header.type),
                     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(as_source_header.flags), as_source_header.descCount,
@@ -9418,7 +9643,7 @@ public:
                     as->sourceLocation.offset < as->destinationLocation.offset + as_source_header.currentSize &&
                     as->destinationLocation.offset < as->sourceLocation.offset + as_source_header.currentSize;
                 if (overlaps || as_source_header.currentSize > as->destinationLocation.available ||
-                    !raytracing::IsCompatibleUpdate(sourceInfo, as->deferredInputs, as->shadowPlan)) {
+                    !compatible_refit(sourceInfo, !as_source_header.reserved0)) {
                   device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
                 }
               } else if (as->operation == RTASOperation::Serialize || as->operation == RTASOperation::Visualize) {
@@ -9433,8 +9658,13 @@ public:
                   device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
                 }
               } else {
+                if (as_source_header.currentSize < overhead || as_source_header.currentSize > readLocation.available) {
+                  device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
+                }
                 const uint64_t nativeSize = as->operation == RTASOperation::Compact
-                    ? as_source_header.nativeCompactedSize : as->source.size();
+                    ? as_source_header.nativeCompactedSize : proven_native_size ? proven_native_size :
+                    as->source.resourceID() == as_source_header.resourceID
+                    ? as->source.size() : as_source_header.currentSize - overhead;
                 if ((as->operation == RTASOperation::Compact && !(as_source_header.flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION)) ||
                     overhead > as->destinationLocation.available || nativeSize > as->destinationLocation.available - overhead ||
                     (as_source_header.type != 2 && !device_->AllocateRTAS(as->destination, nativeSize,
@@ -9445,13 +9675,24 @@ public:
             }
           }
           if (as->deferredUpdate) {
-            const uint64_t nativeSize = std::max(as->source.size(), as->nativeCapacity);
-            as_rebuild_update = as->source == as->destination && nativeSize > as->source.size();
-            raytracing::NativeSizes update_sizes;
-            if (FAILED(device_->QueryRTASSizes(as->deferredInputs, update_sizes)) ||
-                (!as_fast_refit && !device_->AllocateRTAS(as->destination, nativeSize, as->instanceCount)) ||
-                FAILED(raytracing::CreateNativeDescriptor(device_->GetMTLDevice(), as->deferredInputs,
-                    as->destination.instanceBuffer(), as_native, &update_sizes))) {
+            const uint64_t source_size = as_fast_refit ? proven_refit_size : as->source.size();
+            const uint64_t nativeSize = std::max(source_size, as->nativeSizes.accelerationStructureSize);
+            // The source captured while recording can belong to a build that was never submitted.
+            // The slow path already validated the GPU header and the full update shape. Plain BLAS/TLAS
+            // can be rebuilt from these inputs instead of refitting unrelated native contents.
+            const bool mismatched_plain_source = !as_fast_refit && as->metadata.type <= 1 &&
+                !as->metadata.reserved0 && !as_source_header.reserved0 &&
+                as_source_header.resourceID != as->source.resourceID();
+            as_rebuild_update = mismatched_plain_source ||
+                (as->source == as->destination && nativeSize > source_size);
+            if ((!as_fast_refit || as->source != as->destination) &&
+                !device_->AllocateRTAS(as->destination, nativeSize, as->instanceCount)) {
+              device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
+            }
+            if (as->descriptor) {
+              as_native = {as->descriptor, as->nativeSizes};
+            } else if (FAILED(raytracing::CreateNativeDescriptor(device_->GetMTLDevice(), as->deferredInputs,
+                           as->destination.instanceBuffer(), as_native, &as->nativeSizes))) {
               device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); return;
             }
             if (as_rebuild_update || !as->scratch) {
@@ -9467,10 +9708,32 @@ public:
                 ",\"list\":", list.list_id, ",\"recording\":", list.recording, ",\"encoder\":", as->id,
                 ",\"fast_path\":", as_fast_refit, ",\"readback_count\":", as_fast_refit ? 0 : 1,
                 ",\"cpu_wait_count\":", as_fast_refit ? 0 : 1,
-                ",\"reason\":\"", as_fast_refit ? "ordered_in_place" : refit_reason, "\"");
+                ",\"reason\":\"", mismatched_plain_source ? "native_source_mismatch_rebuild" : !as_fast_refit ? refit_reason :
+                    as->source == as->destination ? "ordered_in_place" : "ordered_out_of_place", "\"");
           }
         }
         WMT::MTL4CommandBuffer cmdbuf = scope->inflight.cmdbuf;
+        // Only an immediately adjacent ordinary pass can borrow the scaler fence.
+        // Deferred clears or swizzle/atomic helpers would be separate GPU encoders.
+        const auto next_without_helpers = [&] {
+          return current->next && replay_node < plan.nodes.size() && plan.nodes[replay_node].record == current->next &&
+              plan.nodes[replay_node].clears_before.empty() && !reserved_volume_publish_pending_;
+        };
+        const auto publish_scaler_inputs = [&](WMT::MTL4ComputeCommandEncoder encoder, uint64_t stage) {
+          if (!next_without_helpers() || current->next->type != EncoderType::Temporal ||
+              !static_cast<TemporalEncoderData *>(current->next)->frame) return;
+          encoder.barrierAfterQueueStages(WMTMetal4StageAll, stage, WMTMetal4VisibilityDevice);
+          // The caller now updates fence_ on this encoder, covering older skipped work too.
+          fence_chain_broken_ = false;
+          scaler_with_producer = current->next;
+          scaler_producer_submission = scope->seq;
+        };
+        const auto acquire_scaler_output = [&](WMT::MTL4ComputeCommandEncoder encoder, uint64_t stage) {
+          if (scaler_consumer != current) return;
+          if (!native_fence_required) encoder.waitForFence(fence_);
+          encoder.barrierAfterStages(stage, WMTMetal4StageAll, WMTMetal4VisibilityDevice);
+          scaler_consumer = nullptr;
+        };
         if (current->type != EncoderType::Null &&
             (current->type != EncoderType::Clear || !static_cast<ClearEncoderData *>(current)->folded_into_render))
           owned_graphics::Trace("encode", ",\"queue\":", owned_id_, ",\"submission\":", scope->seq,
@@ -9560,12 +9823,7 @@ public:
           std::vector<Atomic64RootBinding> atomic_render_roots;
           std::unique_ptr<std::vector<StandardSwizzleTableUse>> atomic_render_tables;
           if (atomic_render) {
-            if (data->capture_indirect_pass && data->capture_indirect->root_stride) {
-              const auto &indirect = *data->capture_indirect;
-              for (const auto &command : capture_execution->commands)
-                if (!read_render_atomic_arguments(*data, indirect.root_heap,
-                    indirect.root_offset + uint64_t(command.slot) * indirect.root_stride, atomic_render_roots, atomic_render_tables)) return;
-            } else if (!read_render_atomic_arguments(*data, {}, 0, atomic_render_roots, atomic_render_tables)) return;
+            if (!read_render_atomic_arguments(*data, {}, 0, atomic_render_roots, atomic_render_tables)) return;
             swizzle_uses = CollectStandardSwizzleTables(atomic_render_tables);
           }
           auto append_attachments = [&]() {
@@ -9589,8 +9847,7 @@ public:
                                 ",\"capture_indirect\":", bool(data->capture_indirect),
                                 ",\"depth\":", bool(data->depth.attachment));
           if (atomic_render) {
-            const uint64_t participants = producer_participants(*data, nullptr,
-                data->capture_indirect_pass ? &*capture_execution : nullptr);
+            const uint64_t participants = producer_participants(*data, nullptr);
             if (!begin_atomic(participants, atomic_render_tables, atomic_render_roots, &swizzle_uses)) return;
             cmdbuf = scope->inflight.cmdbuf;
           }
@@ -9598,12 +9855,7 @@ public:
             device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
             return;
           }
-          const auto &so_draws = indirect_execution ? indirect_execution->draws
-                                 : data->capture_indirect_pass &&
-                                           (data->capture_indirect->geometry || data->capture_indirect->domain_only ||
-                                            data->capture_indirect_pass == 2)
-                                       ? capture_execution->so_draws
-                                                                 : data->so_draws;
+          const auto &so_draws = data->so_draws;
           if (data->msaa_draw) {
             for (uint32_t i = 0; i < msaa_executions.size(); i++) {
               if (!msaa_executions[i].max_primitives) continue;
@@ -9648,14 +9900,12 @@ public:
             break;
           }
           if (!so_draws.empty()) {
-            if (!indirect_execution) {
-              try {
-                scope->inflight.so_draws.reserve(scope->inflight.so_draws.size() + so_draws.size());
-              } catch (const std::bad_alloc &) {
-                ERR("Draw capture: failed to retain capture until GPU completion");
-                device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
-                return;
-              }
+            try {
+              scope->inflight.so_draws.reserve(scope->inflight.so_draws.size() + so_draws.size());
+            } catch (const std::bad_alloc &) {
+              ERR("Draw capture: failed to retain capture until GPU completion");
+              device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
+              return;
             }
             EncodeStreamOutputSetup(cmdbuf, scope->inflight, so_draws);
           }
@@ -9946,78 +10196,6 @@ public:
                   ",\"node_ordinal\":", node.node_ordinal);
             }
           }
-          if (data->capture_indirect_pass)
-            EncodeMeshCaptureDraws(encoder, *capture_execution, data->capture_indirect_pass);
-          if (indirect_execution && indirect_execution->count) {
-            auto &execution = *indirect_execution;
-            wmtcmd_render_nop head{};
-            head.type = WMTRenderCommandNop;
-            wmtcmd_render_useresource use_icb{};
-            use_icb.type = WMTRenderCommandUseResource;
-            use_icb.resource = execution.icb;
-            use_icb.usage = WMTResourceUsageRead | WMTResourceUsageWrite;
-            use_icb.stages = WMTRenderStageVertex;
-            wmtcmd_render_setpso resolver{};
-            resolver.type = WMTRenderCommandSetPSO;
-            resolver.pso = data->so_indirect->resolver_pipeline;
-            wmtcmd_render_setbuffer argument{};
-            argument.type = WMTRenderCommandSetVertexBuffer;
-            argument.buffer = execution.storage;
-            argument.offset = execution.command_offset;
-            argument.index = 30;
-            wmtcmd_render_draw dispatch{};
-            dispatch.type = WMTRenderCommandDraw;
-            dispatch.primitive_type = WMTPrimitiveTypePoint;
-            dispatch.vertex_count = execution.count;
-            dispatch.instance_count = 1;
-            // The resolver writes the ICB and its root/VB arguments in the vertex
-            // stage. Metal 4 requires device visibility before the ICB consumes them.
-            wmtcmd_render_memory_barrier resolved{};
-            resolved.type = WMTRenderCommandMemoryBarrier;
-            resolved.scope = WMTBarrierScopeBuffers;
-            resolved.stages_after = WMTRenderStageVertex;
-            resolved.stages_before = WMTRenderStageVertex;
-            wmtcmd_render_setpso drawing{};
-            drawing.type = WMTRenderCommandSetPSO;
-            drawing.pso = data->so_indirect->draw_pipeline;
-            wmtcmd_render_set_vertex_amplification mapping{};
-            mapping.type = WMTRenderCommandSetVertexAmplification;
-            // An ICB view variant owns both offsets in its shader epilogue.
-            mapping.viewport_offset = 0;
-            mapping.render_target_array_offset = 0;
-            wmtcmd_render_executecommands execute{};
-            execute.type = WMTRenderCommandExecuteCommandsInBuffer;
-            execute.indirect_command_buffer = execution.icb;
-            execute.location = 0;
-            execute.length = execution.count;
-            head.next.set(&use_icb);
-            use_icb.next.set(&resolver);
-            resolver.next.set(&argument);
-            argument.next.set(&dispatch);
-            dispatch.next.set(&resolved);
-            resolved.next.set(&drawing);
-            drawing.next.set(data->so_indirect->shader_view_locations ? static_cast<void *>(&mapping)
-                                                                    : static_cast<void *>(&execute));
-            mapping.next.set(&execute);
-            execute.next.set(nullptr);
-            encoder.useResource(execution.storage, WMTResourceUsageRead | WMTResourceUsageWrite,
-                                WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment));
-            if (data->so_indirect->static_sampler_buffer)
-              encoder.useResource(data->so_indirect->static_sampler_buffer, WMTResourceUsageRead,
-                                  WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment));
-            if (execution.draws.front()->statistics_heap)
-              encoder.useResource(execution.draws.front()->statistics_heap,
-                                  WMTResourceUsageRead | WMTResourceUsageWrite,
-                                  WMTRenderStages(WMTRenderStageVertex | WMTRenderStageFragment));
-            for (const auto &draw : execution.draws) {
-              encoder.useResource(draw->scratch, WMTResourceUsageWrite, WMTRenderStageVertex);
-              if (draw->positions)
-                encoder.useResource(draw->positions, WMTResourceUsageRead, WMTRenderStageVertex);
-              if (draw->indexed && draw->index_buffer)
-                encoder.useResource(draw->index_buffer, WMTResourceUsageRead, WMTRenderStageVertex);
-            }
-            encoder.encodeCommands(&head);
-          }
           // Capture writes happen in the vertex stage; a rasterization-disabled pass has no
           // fragment work, so the assembly after it must wait for the vertex stage too.
           const WMTRenderStages update_stages = replay_current_node && replay_current_node->access_complete ? wait_stages :
@@ -10119,7 +10297,7 @@ public:
                 for (size_t i = 0; i < count; ++i) {
                   const auto &item = data->visibility_targets[entry + i];
                   indices[i][0] = item.source_offset / sizeof(uint64_t);
-                  indices[i][1] = item.index;
+                  indices[i][1] = uint64_t(item.index) | (uint64_t(item.binary) << 32);
                 }
                 pairs.type = WMTComputeCommandSetBytes; pairs.index = 2;
                 pairs.length = count * sizeof(indices[0]); pairs.bytes.set(indices);
@@ -10157,17 +10335,28 @@ public:
                   const bool copy = operation == RTASOperation::Clone || operation == RTASOperation::Compact;
                   const bool deserialize = operation == RTASOperation::Deserialize;
                   const bool fused_tlas_shadow = build && data->metadata.type == 0;
+                  const bool fused_blas_shadow = build && data->metadata.type == 1;
                   auto fail = [&] { device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR); };
                   if (operation == RTASOperation::Serialize) {
                     raytracing::SerializeParams params{data->sourceLocation.address, data->destinationLocation.address,
                         raytracing::DriverMatchingIdentifier(device_->GetMTLDevice().registryID())};
-                    if (!EncodeASHelper(cmdbuf, data->pipelines.serialize, &params, sizeof(params))) fail();
+                    if (!EncodeASHelper(cmdbuf, data->pipelines->serialize, &params, sizeof(params))) { fail(); break; }
+                    if (as_observed_native && !as_source_header.nativeCompactedSize && !as_source_header.reserved0) {
+                      // Preserve the serialized header while keeping an ordinary source AS read-only.
+                      const uint64_t pointers = as_source_header.type == 0 ? as_source_header.descCount : 0;
+                      auto encoder = cmdbuf.accelerationStructureCommandEncoder();
+                      if (!encoder) { fail(); break; }
+                      encoder.waitForFence(fence_);
+                      encoder.compactedSizeOfNative(as_observed_native, data->destinationLocation.buffer,
+                          data->destinationLocation.offset + raytracing::kSerializedHeaderSize + pointers * 8 + 48);
+                      encoder.updateFence(fence_); encoder.endEncoding();
+                    }
                     break;
                   }
                   if (operation == RTASOperation::Visualize) {
                     const uint64_t params[] = {data->sourceLocation.address, data->destinationLocation.address};
-                    if (!EncodeASHelper(cmdbuf, data->pipelines.visualize, params, sizeof(params)) ||
-                        !EncodeASHelper(cmdbuf, data->pipelines.visualizeDescriptors, params, sizeof(params))) fail();
+                    if (!EncodeASHelper(cmdbuf, data->pipelines->visualize, params, sizeof(params)) ||
+                        !EncodeASHelper(cmdbuf, data->pipelines->visualizeDescriptors, params, sizeof(params))) fail();
                     break;
                   }
                   if (as_plain_deserialize) {
@@ -10188,12 +10377,17 @@ public:
                   } else if (deserialize) {
                     raytracing::DeserializeParams params{data->sourceLocation.address, data->destinationLocation.address,
                         as_deserialized.deserializedSize};
-                    if (!EncodeASHelper(cmdbuf, data->pipelines.deserialize, &params, sizeof(params))) { fail(); break; }
+                    if (!EncodeASHelper(cmdbuf, data->pipelines->deserialize, &params, sizeof(params))) { fail(); break; }
                   }
                   if ((build && !fused_tlas_shadow) || copy) {
                     raytracing::ShadowParams params{data->destinationLocation.address, data->sourceLocation.address,
                         uint32_t(data->shadowPlan.jobs.size()), copy ? raytracing::kShadowMetadataCopy : raytracing::kShadowMetadataParams,
                         data->metadata};
+                    if (fused_blas_shadow) {
+                      params.resourceID = data->destination.resourceID();
+                      params.versionToken = data->versionToken;
+                      params.mirrorSlot = uint32_t(data->liveMirrorOffset / sizeof(uint32_t));
+                    }
             if (operation == RTASOperation::Refit) {
               params.metadata.currentSize = as_source_header.currentSize;
               params.metadata.deserializedSize = as_source_header.deserializedSize;
@@ -10201,15 +10395,19 @@ public:
                     if (copy) {
                       // Copy mode does not consume geometry/job tables; bind an existing buffer
                       // of the required reflected size instead of allocating empty tables.
-                      if (!EncodeASHelper(cmdbuf, data->pipelines.shadow, &params, sizeof(params),
+                      if (!EncodeASHelper(cmdbuf, data->pipelines->shadow, &params, sizeof(params),
                               raytracing::kHelperThreads, data->sourceLocation.buffer,
-                              data->sourceLocation.buffer)) { fail(); break; }
+                              data->sourceLocation.buffer, 0, 0, 1, data->liveMirror)) { fail(); break; }
                     } else {
-                      const uint64_t geometryBytes = data->shadowPlan.geometries.size() * sizeof(raytracing::ShadowGeometry);
+                      if (as_preserve_index_shadow)
+                        params.metadataMode = raytracing::kShadowMetadataReuseGeometry;
+                      const uint64_t geometryBytes = as_preserve_index_shadow ? 0 :
+                          data->shadowPlan.geometries.size() * sizeof(raytracing::ShadowGeometry);
                       params.jobCount = 0;
                       uint64_t maxWork = 1;
                       uint64_t sourceBytes = 0, destinationBytes = 0, preservedIndexBytes = 0;
                       for (const auto &job : data->shadowPlan.jobs) {
+                        if (reuse_shadow_payload) break;
                         if (as_preserve_index_shadow && (job.flags & raytracing::kShadowJobIndex)) {
                           preservedIndexBytes += uint64_t(job.count) * job.destinationStride;
                           continue;
@@ -10227,32 +10425,42 @@ public:
                         destinationBytes += uint64_t(job.count) * job.destinationStride;
                       }
                       const uint64_t jobsBytes = uint64_t(params.jobCount) * sizeof(raytracing::ShadowJob);
-                      const uint64_t jobsOffset = std::max<uint64_t>(geometryBytes, sizeof(raytracing::ShadowGeometry));
+                      const uint64_t jobsOffset = as_preserve_index_shadow ? 0 :
+                          std::max<uint64_t>(geometryBytes, sizeof(raytracing::ShadowGeometry));
                       const uint64_t jobsCapacity = std::max<uint64_t>(jobsBytes, sizeof(raytracing::ShadowJob));
                       if (jobsOffset > SIZE_MAX || jobsCapacity > SIZE_MAX - jobsOffset) {
                         device_->ReportRemoval(E_OUTOFMEMORY); break;
                       }
-                      const auto tables = scope->inflight.AllocateASMetadata(device_->GetMTLDevice(), jobsOffset + jobsCapacity);
+                      const auto tables = scope->inflight.AllocateASMetadata(device_->GetMTLDevice(),
+                          std::max<uint64_t>(sizeof(raytracing::ShadowGeometry), jobsOffset + jobsCapacity));
                       if (!tables.buffer || !tables.memory) { fail(); break; }
                       if (geometryBytes) memcpy(tables.memory, data->shadowPlan.geometries.data(), geometryBytes);
                       auto *jobs = reinterpret_cast<raytracing::ShadowJob *>(tables.memory + jobsOffset);
-                      for (const auto &job : data->shadowPlan.jobs)
-                        if (!as_preserve_index_shadow || !(job.flags & raytracing::kShadowJobIndex)) *jobs++ = job;
+                      if (!reuse_shadow_payload)
+                        for (const auto &job : data->shadowPlan.jobs)
+                          if (!as_preserve_index_shadow || !(job.flags & raytracing::kShadowJobIndex)) *jobs++ = job;
                       owned_graphics::Trace("rtas_metadata_upload", ",\"submission\":", scope->seq,
                           ",\"block\":", tables.block_id, ",\"offset\":", tables.offset,
                           ",\"geometry_bytes\":", geometryBytes, ",\"job_bytes\":", jobsBytes);
                       owned_graphics::Trace("rtas_shadow_work", ",\"submission\":", scope->seq,
                           ",\"jobs\":", params.jobCount, ",\"source_bytes\":", sourceBytes,
-                          ",\"destination_bytes\":", destinationBytes, ",\"preserved_index_bytes\":", preservedIndexBytes);
+                          ",\"destination_bytes\":", destinationBytes, ",\"preserved_index_bytes\":", preservedIndexBytes,
+                          ",\"reused_payload\":", reuse_shadow_payload);
                       uint32_t rows = std::clamp(params.jobCount, 1u, 64u);
-                      maxWork = std::max(maxWork, (uint64_t(params.metadata.descCount) + rows - 1) / rows);
+                      if (!as_preserve_index_shadow)
+                        maxWork = std::max(maxWork, (uint64_t(params.metadata.descCount) + rows - 1) / rows);
                       uint32_t threads = uint32_t(std::min<uint64_t>(maxWork, raytracing::kHelperThreads));
-                      if (!EncodeASHelper(cmdbuf, data->pipelines.shadow, &params, sizeof(params),
+                      if (batch_refit) {
+                        refits.push_back({data, as_native.descriptor, as_scratch ? as_scratch : data->scratch,
+                            as_scratch ? 0 : data->scratchOffset, params, tables.buffer, tables.offset + jobsOffset,
+                            tables.offset, threads, rows});
+                      } else if (!EncodeASHelper(cmdbuf, data->pipelines->shadow, &params, sizeof(params),
                               threads, tables.buffer, tables.buffer, tables.offset + jobsOffset, tables.offset,
-                              rows)) { fail(); break; }
+                              rows, data->liveMirror)) { fail(); break; }
                     }
                   }
                   if (build || copy || deserialize) {
+                    if (!fused_blas_shadow) {
                     const uint32_t instanceCount = build ? data->instanceCount : uint32_t(data->destination.instanceCount());
                     const auto instances = build ? WMT::Buffer(data->sourceInstances)
                         : deserialize ? data->destinationLocation.buffer : data->sourceLocation.buffer;
@@ -10276,23 +10484,34 @@ public:
                       owned_graphics::Trace("rtas_tlas_fused_shadow", ",\"submission\":", scope->seq,
                           ",\"instances\":", instanceCount, ",\"source_bytes\":", uint64_t(instanceCount) * 64);
                     }
-                    const bool prepass = compute.encodeASPrepass(data->pipelines.prepass, instances, instanceOffset,
+                    const bool prepass = compute.encodeASPrepass(data->pipelines->prepass, instances, instanceOffset,
                         data->destination.instanceBuffer(), 0, data->header, data->destinationOffset,
                         data->destination.contributionBuffer(), 0, data->liveMirror, 0, info);
                     compute.updateFence(fence_);
                     compute.endEncoding();
                     if (!prepass) { fail(); break; }
+                    }
                     scope->inflight.rtas_observations.push_back({data->destinationKey, data->versionToken});
                     auto execution_metadata = data->metadata;
                     if (operation == RTASOperation::Refit) {
                       execution_metadata.currentSize = as_source_header.currentSize;
                       execution_metadata.deserializedSize = as_source_header.deserializedSize;
                     }
-                    const bool ordinary_execution = as_fast_refit || (operation == RTASOperation::Build &&
+                    // A completed slow-path header/shape validation also establishes the destination
+                    // generation. The next in-place update can resume the ordered path on this queue.
+                    const bool ordinary_execution = build &&
                         data->metadata.type <= 1 && !data->metadata.reserved0 &&
-                        HasUnaliasedRTASStorage(data->destinationLocation));
-                    device_->RecordRTASExecution(data->destinationKey, data->versionToken, owned_id_,
+                        (operation != RTASOperation::Refit || !as_source_header.reserved0) &&
+                        HasUnaliasedRTASStorage(data->destinationLocation);
+                    device_->RecordRTASExecution(data->destinationKey, data->versionToken, owned_id_, scope->inflight.rtas_submission,
                         ordinary_execution ? &execution_metadata : nullptr);
+                    if (batch_refit) {
+                      previous_shadow_refit = data;
+                      refit_destinations.insert(data->destination.handle);
+                      for (const auto &access : next_refit_accesses)
+                        refit_accesses.Publish(access, true);
+                      break;
+                    }
                     auto encoder = cmdbuf.accelerationStructureCommandEncoder();
                     encoder.waitForFence(fence_);
                     const bool ommArray = build ? data->metadata.type == 2 : as_source_header.type == 2;
@@ -10300,10 +10519,14 @@ public:
                         : operation == RTASOperation::Build ? encoder.build(data->descriptor, data->destination, data->scratch, data->scratchOffset)
                         : operation == RTASOperation::Refit ? encoder.refit(data->deferredUpdate ? WMT::MTL4AccelerationStructureDescriptor(as_native.descriptor) : WMT::MTL4AccelerationStructureDescriptor(data->descriptor),
                           data->source, data->destination, as_scratch ? WMT::Buffer(as_scratch) : WMT::Buffer(data->scratch), as_scratch ? 0 : data->scratchOffset)
-                        : encoder.copy(data->source, data->destination, operation == RTASOperation::Compact ? 1 : 0);
-                    // Every header carries the native compacted size, so standalone postbuild and compact
-                    // copies read exactly the same GPU-produced value as inline postbuild queries.
-                    if (!ommArray) encoder.compactedSize(data->destination, data->header, data->destinationOffset + 48);
+                        : encoder.copyNativeAS(as_observed_native, data->destination, operation == RTASOperation::Compact ? 1 : 0);
+                    // Ordinary builds/refits publish their size only for an inline request;
+                    // later Emit, Compact and Serialize measure the executed native generation.
+                    const bool write_size = !ommArray && (!build || data->metadata.reserved0 ||
+                        std::any_of(data->postbuild.begin(), data->postbuild.end(), [](const auto &e) {
+                          return e.type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+                        }));
+                    if (write_size) encoder.compactedSize(data->destination, data->header, data->destinationOffset + 48);
                     encoder.updateFence(fence_);
                     encoder.endEncoding();
                     if (!encoded) { fail(); break; }
@@ -10316,7 +10539,7 @@ public:
                     if (fixup) {
                       raytracing::PostbuildParams params{.asAddress = data->destinationLocation.address,
                           .ommMarker = deserialize ? 0u : marker, .operation = fixup, .batchCount = 0};
-                      if (!EncodeASHelper(cmdbuf, data->pipelines.postbuild, &params, sizeof(params), 1)) { fail(); break; }
+                      if (!EncodeASHelper(cmdbuf, data->pipelines->postbuild, &params, sizeof(params), 1)) { fail(); break; }
                     }
                   }
                   for (size_t first = 0; first < data->postbuild.size();) {
@@ -10343,8 +10566,21 @@ public:
                       batch[count++] = p;
                       if (!independent) break;
                     }
+                    WMT::Reference<WMT::MTL4ComputeCommandEncoder> size_encoder;
+                    for (uint32_t j = 0; !query_native_sizes.empty() && j < count; ++j) {
+                      if (!query_native_sizes[first + j]) continue;
+                      if (!size_encoder) {
+                        size_encoder = cmdbuf.accelerationStructureCommandEncoder();
+                        if (!size_encoder) { fail(); return; }
+                        size_encoder.waitForFence(fence_);
+                      }
+                      const auto &out = data->postbuild[first + j].destination;
+                      size_encoder.compactedSizeOfNative(query_native_sizes[first + j], out.buffer, out.offset);
+                      batch[j].operation = raytracing::kPostbuildMeasuredCompactedSize;
+                    }
+                    if (size_encoder) { size_encoder.updateFence(fence_); size_encoder.endEncoding(); }
                     batch[0].batchCount = count;
-                    if (!EncodeASHelper(cmdbuf, data->pipelines.postbuild, batch.data(), count * sizeof(batch[0]), count)) {
+                    if (!EncodeASHelper(cmdbuf, data->pipelines->postbuild, batch.data(), count * sizeof(batch[0]), count)) {
                       fail(); break;
                     }
                     first += count;
@@ -10363,11 +10599,13 @@ public:
             owned_graphics::Trace("native_blit_queue_barrier", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
                 ",\"after\":", consumer_barrier_after, ",\"before\":", uint64_t(WMTMetal4StageBlit), ",\"barrier_count\":1");
           }
+          acquire_scaler_output(encoder, WMTMetal4StageBlit);
           encoder.encodeCommands(&data->cmd_head);
           owned_graphics::Trace("native_blit_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
           if (replay_current_node->writes_external_backing)
             encoder.barrierAfterStages(WMTMetal4StageBlit, WMTMetal4StageAll,
                                        WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
+          publish_scaler_inputs(encoder, WMTMetal4StageBlit);
           encoder.updateFence(fence_);
           owned_graphics::Trace("native_blit_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
@@ -10416,6 +10654,16 @@ public:
                                                                : std::vector<SwizzlePassResource>{};
           for (const auto &use : data->cast_textures)
             AppendStandardTexture(swizzle_uses, use.texture.ptr(), use.writes, use.view, use.allocation.ptr());
+          if (scaler_consumer == current && !swizzle_uses.empty()) {
+            // A volatile table can acquire a helper binding after lookahead.
+            // Publish before that helper touches any of the scaler's resources.
+            auto boundary = cmdbuf.computeCommandEncoder();
+            boundary.waitForFence(fence_);
+            boundary.barrierAfterStages(WMTMetal4StageDispatch, WMTMetal4StageAll, WMTMetal4VisibilityDevice);
+            boundary.updateFence(fence_);
+            boundary.endEncoding();
+            scaler_consumer = nullptr;
+          }
           if (data->atomic64_phase) {
             uint64_t participants = 0;
             WMTSize threads{1, 1, 1};
@@ -10438,7 +10686,10 @@ public:
                  cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null())) {
               if (cmd->type == WMTComputeCommandSetPSO)
                 threads = reinterpret_cast<const wmtcmd_compute_setpso *>(cmd)->threadgroup_size;
-              else if (cmd->type == WMTComputeCommandDispatch) {
+              else if (cmd->type == WMTComputeCommandDispatchCompact) {
+                const auto *compact = reinterpret_cast<const wmtcmd_compute_dispatch_compact *>(cmd);
+                if (!add_grid({compact->x, compact->y, compact->z}, threads)) return;
+              } else if (cmd->type == WMTComputeCommandDispatch) {
                 if (!add_grid(reinterpret_cast<const wmtcmd_compute_dispatch *>(cmd)->size, threads)) return;
               } else if (cmd->type == WMTComputeCommandDispatchThreads) {
                 auto size = reinterpret_cast<const wmtcmd_compute_dispatch *>(cmd)->size;
@@ -10492,6 +10743,12 @@ public:
               memcpy(&groups, metadata[grid.request].result.bytes, sizeof(groups));
               if (!add_grid({groups.ThreadGroupCountX, groups.ThreadGroupCountY, groups.ThreadGroupCountZ}, grid.threads))
                 return;
+            }
+            // A traversal pass owns exactly one ray dispatch. A predicated or
+            // count-culled grid cannot dereference the SBT or issue atomics.
+            if (data->atomic64_ray && !participants) {
+              owned_graphics::Trace("atomic_ray_culled", ",\"encoder\":", data->id);
+              break;
             }
             struct IndirectRecords { const Atomic64IndirectComputeUse *use; uint32_t count; size_t request; };
             std::vector<IndirectRecords> indirect_records;
@@ -10606,7 +10863,7 @@ public:
               bool direct = true;
               for (auto *command = static_cast<const wmtcmd_base *>(data->cmd_head.next.get_accessible_or_null());
                    command; command = static_cast<const wmtcmd_base *>(command->next.get_accessible_or_null()))
-                if (command->type == WMTComputeCommandDispatchIndirect) direct = false;
+                if (command->type == WMTComputeCommandDispatchIndirect || command->type == WMTComputeCommandDispatchIndirectRange) direct = false;
               if (direct) private_constants = data->atomic64_constants;
             }
             const auto &head = *static_cast<const RecordingHead *>(list.entry);
@@ -10620,8 +10877,8 @@ public:
           }
           const bool concurrent_dispatches = replay_current_node && replay_current_node->concurrent_dispatches &&
               swizzle_uses.empty() && !data->atomic64_phase;
-          const uint64_t independent = replay_current_node && swizzle_uses.empty() && !data->atomic64_phase
-              ? replay_current_node->independent_dispatch_mask : 0;
+          const bool use_masks = replay_current_node && swizzle_uses.empty() && !data->atomic64_phase &&
+              !replay_current_node->independent_dispatch_masks.empty();
           auto encoder = cmdbuf.computeCommandEncoder(concurrent_dispatches, replay_current_node->external_backing);
           owned_graphics::Trace("native_compute_begin", ",\"submission\":", scope->seq, ",\"encoder\":", data->id,
               ",\"begin_count\":1,\"concurrent\":", concurrent_dispatches,
@@ -10666,13 +10923,18 @@ public:
             constants.index = SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS;
             encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&constants));
           }
-          encoder.encodeCommands(&data->cmd_head, independent);
+          acquire_scaler_output(encoder, WMTMetal4StageDispatch);
+          if (use_masks) {
+            const auto &masks = replay_current_node->independent_dispatch_masks;
+            encoder.encodeCommands(&data->cmd_head, masks[0], masks.data() + 1, masks.size() - 1);
+          } else encoder.encodeCommands(&data->cmd_head);
           owned_graphics::Trace("native_compute_encode", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"encode_count\":1");
           // Publish through the alias coherence point before a later command
           // reads these host pages through a different native virtual address.
           if (replay_current_node->writes_external_backing)
             encoder.barrierAfterStages(WMTMetal4StageDispatch, WMTMetal4StageAll,
                                        WMTMetal4VisibilityDevice | WMTMetal4VisibilityResourceAlias);
+          if (!data->atomic64_phase && swizzle_uses.empty()) publish_scaler_inputs(encoder, WMTMetal4StageDispatch);
           encoder.updateFence(fence_);
           owned_graphics::Trace("native_compute_update", ",\"submission\":", scope->seq, ",\"encoder\":", data->id, ",\"update_count\":1");
           encoder.endEncoding();
@@ -10708,7 +10970,7 @@ public:
           // timeline at queue level. That wait must precede only this feature
           // commit, not application work already encoded into the prior segment.
           // A same-queue predecessor needs neither the wait nor its own command
-          // buffer: a consumer queue barrier below orders this encode after it.
+          // buffer: the queue barrier below orders this encode after it.
           // Only this feature is reserved; unrelated features on other queues
           // may encode concurrently. Re-read history after a prefix split since
           // that split releases all reservations before reserving ring capacity.
@@ -10756,13 +11018,15 @@ public:
           }
           // Recording the timeline signal must not fail after the native encode.
           scope->signals.reserve(scope->signals.size() + 1);
-          if (history_queue == owned_id_) {
+          // Temporal SR, NGX RR and spatial acquire prior queue stages in
+          // their first native encoder. Other providers still need this edge.
+          if (history_queue == owned_id_ && !data->frame) {
             // The skipped timeline wait ordered this encode after all earlier queue
             // work, including internal MetalFX encoders of the previous evaluation
-            // that fence_ does not cover. A consumer queue barrier keeps that order
-            // on the GPU without a commit or event.
+            // that fence_ does not cover. MetalFX creates its own subsequent
+            // encoders, so publish the prior stages to those queue stages.
             auto order = temporal_cmdbuf.computeCommandEncoder();
-            order.barrierAfterQueueStages(WMTMetal4StageAll,
+            order.barrierAfterStages(WMTMetal4StageAll,
                 WMTMetal4StageDispatch | WMTMetal4StageBlit | WMTMetal4StageAccelerationStructure,
                 WMTMetal4VisibilityDevice);
             order.endEncoding();
@@ -10782,7 +11046,27 @@ public:
             EncodeOwnedFrameGenerationFrame(data->fg_frame, temporal_cmdbuf, fence_, owned_id_, wait, signal);
           else if (data->rr_frame)
             EncodeOwnedRayRegenerationFrame(data->rr_frame, temporal_cmdbuf, fence_, owned_id_, wait, signal);
-          else EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, scope->seq, current->id, wait, signal);
+          else {
+            uint32_t offered = 0;
+            const auto submission = scope->seq;
+            if (!cross_queue_history && swizzle_uses.empty()) {
+              if (scaler_with_producer == current && scaler_producer_submission == submission)
+                offered |= WMTMetal4FXProducer;
+              if (next_without_helpers()) {
+                auto *next = current->next;
+                if (next->type == EncoderType::Blit || (next->type == EncoderType::Compute &&
+                    !static_cast<ComputeEncoderData *>(next)->atomic64_phase &&
+                    static_cast<ComputeEncoderData *>(next)->cast_textures.empty() && !StandardSwizzleTablesMayMatter()))
+                  offered |= WMTMetal4FXConsumer;
+              }
+            }
+            const auto used = EncodeOwnedTemporalFrame(data->frame, temporal_cmdbuf, fence_, owned_id_, submission,
+                                                      current->id, wait, signal, offered);
+            if (used & WMTMetal4FXConsumer) scaler_consumer = current->next;
+            owned_graphics::Trace("temporal_encoder_handoff", ",\"submission\":", submission, ",\"encoder\":", current->id,
+                ",\"offered\":", offered, ",\"producer\":", unsigned(bool(used & WMTMetal4FXProducer)),
+                ",\"consumer\":", unsigned(bool(used & WMTMetal4FXConsumer)));
+          }
           // Start the next segment only after the encode mutex is released. No
           // feature reservation is held during the ring's capacity wait.
           if (cross_queue_history && !start_segment())
@@ -10936,6 +11220,7 @@ public:
             }
             WMT::writeTimestamp(cmdbuf, data->timestamp_samples, data->start_index);
             break;
+          case QueryEncoderOp::ResolveBinaryOcclusion:
           case QueryEncoderOp::ResolveOcclusion: {
             auto encoder = cmdbuf.blitCommandEncoder();
             encoder.waitForFence(fence_);
@@ -10952,98 +11237,9 @@ public:
             encoder.endEncoding();
             break;
           }
-          case QueryEncoderOp::ResolveBinaryOcclusion: {
-            auto encoder = cmdbuf.computeCommandEncoder(false);
-            encoder.waitForFence(fence_);
-            wmtcmd_compute_nop head{};
-            head.type = WMTComputeCommandNop;
-            wmtcmd_compute_setpso set_pso{};
-            set_pso.type = WMTComputeCommandSetPSO;
-            set_pso.pso = data->compute_pipeline;
-            set_pso.threadgroup_size = {64, 1, 1};
-            wmtcmd_compute_setbuffer set_source{};
-            set_source.type = WMTComputeCommandSetBuffer;
-            set_source.buffer = data->source;
-            set_source.offset = uint64_t(data->start_index) * sizeof(uint64_t);
-            set_source.index = 0;
-            wmtcmd_compute_setbuffer set_destination{};
-            set_destination.type = WMTComputeCommandSetBuffer;
-            set_destination.buffer = data->destination;
-            set_destination.offset = data->destination_offset;
-            set_destination.index = 1;
-            wmtcmd_compute_dispatch dispatch{};
-            dispatch.type = WMTComputeCommandDispatchThreads;
-            dispatch.size = {data->query_count, 1, 1};
-            head.next.set(&set_pso);
-            set_pso.next.set(&set_source);
-            set_source.next.set(&set_destination);
-            set_destination.next.set(&dispatch);
-            dispatch.next.set(nullptr);
-            encoder.encodeCommands(&head);
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
-            break;
-          }
-          case QueryEncoderOp::BeginSOStatistics:
-          case QueryEncoderOp::ResolveSOStatistics: {
-            const bool begin = data->op == QueryEncoderOp::BeginSOStatistics;
-            auto encoder = cmdbuf.blitCommandEncoder();
-            encoder.waitForFence(fence_);
-            wmtcmd_blit_copy_from_buffer_to_buffer copy{};
-            copy.type = WMTBlitCommandCopyFromBufferToBuffer;
-            copy.next.set(nullptr);
-            copy.src = begin ? data->counters : data->source;
-            copy.src_offset = begin ? data->counters_offset
-                                    : uint64_t(data->start_index) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
-            copy.dst = begin ? data->source : data->destination;
-            copy.dst_offset = begin ? data->snapshot_offset : data->destination_offset;
-            copy.copy_length = uint64_t(data->query_count) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
-            encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&copy));
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
-            break;
-          }
-          case QueryEncoderOp::EndSOStatistics: {
-            auto encoder = cmdbuf.computeCommandEncoder(false);
-            encoder.waitForFence(fence_);
-            wmtcmd_compute_nop head{};
-            head.type = WMTComputeCommandNop;
-            wmtcmd_compute_setpso set_pso{};
-            set_pso.type = WMTComputeCommandSetPSO;
-            set_pso.pso = data->compute_pipeline;
-            set_pso.threadgroup_size = {1, 1, 1};
-            wmtcmd_compute_setbuffer set_counter{};
-            set_counter.type = WMTComputeCommandSetBuffer;
-            set_counter.buffer = data->counters;
-            set_counter.offset = data->counters_offset;
-            set_counter.index = 0;
-            wmtcmd_compute_setbuffer set_begin{};
-            set_begin.type = WMTComputeCommandSetBuffer;
-            set_begin.buffer = data->source;
-            set_begin.offset = data->snapshot_offset;
-            set_begin.index = 1;
-            wmtcmd_compute_setbuffer set_result{};
-            set_result.type = WMTComputeCommandSetBuffer;
-            set_result.buffer = data->source;
-            set_result.offset = uint64_t(data->start_index) * sizeof(D3D12_QUERY_DATA_SO_STATISTICS);
-            set_result.index = 2;
-            wmtcmd_compute_dispatch dispatch{};
-            dispatch.type = WMTComputeCommandDispatchThreads;
-            dispatch.size = {1, 1, 1};
-            head.next.set(&set_pso);
-            set_pso.next.set(&set_counter);
-            set_counter.next.set(&set_begin);
-            set_begin.next.set(&set_result);
-            set_result.next.set(&dispatch);
-            dispatch.next.set(nullptr);
-            encoder.encodeCommands(&head);
-            encoder.updateFence(fence_);
-            encoder.endEncoding();
-            break;
-          }
-          case QueryEncoderOp::BeginPipelineStatistics:
-          case QueryEncoderOp::ResolvePipelineStatistics: {
-            const bool begin = data->op == QueryEncoderOp::BeginPipelineStatistics;
+          case QueryEncoderOp::BeginStatistics:
+          case QueryEncoderOp::ResolveStatistics: {
+            const bool begin = data->op == QueryEncoderOp::BeginStatistics;
             auto encoder = cmdbuf.blitCommandEncoder();
             encoder.waitForFence(fence_);
             wmtcmd_blit_copy_from_buffer_to_buffer copy{};
@@ -11060,7 +11256,7 @@ public:
             encoder.endEncoding();
             break;
           }
-          case QueryEncoderOp::EndPipelineStatistics: {
+          case QueryEncoderOp::EndStatistics: {
             auto encoder = cmdbuf.computeCommandEncoder(false);
             encoder.waitForFence(fence_);
             wmtcmd_compute_nop head{};
@@ -11113,8 +11309,10 @@ public:
         }
         current = current->next;
       }
+      if (fenced && !flush_refits()) return;
       scope->inflight.breadcrumbs.push_back(list.breadcrumb);
     }
+    if (!flush_refits()) return;
     emit_clear_batches(plan.tail_clears);
     // A skipped fence wait stays outstanding across this Execute: the next
     // fence waiter (a later replay node or Present) drains it first.
@@ -11235,9 +11433,20 @@ public:
                 std::optional<D3D12_AUTO_BREADCRUMB_OP> op;
                 if (encoder->type == EncoderType::Render) {
                   switch (command->type) {
+                  case WMTRenderCommandDrawRun:
+                    history.insert(history.end(), reinterpret_cast<const wmtcmd_render_draw_run *>(command)->count, D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED);
+                    break;
+                  case WMTRenderCommandDrawIndexedRun:
+                    history.insert(history.end(), reinterpret_cast<const wmtcmd_render_draw_run *>(command)->count, D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED);
+                    break;
+                  case WMTRenderCommandDrawCompact:
                   case WMTRenderCommandDraw: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED; break;
+                  case WMTRenderCommandDrawIndexedSmall:
+                  case WMTRenderCommandDrawIndexedCompact:
                   case WMTRenderCommandDrawIndexed: op = D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED; break;
                   case WMTRenderCommandDrawIndirect:
+                  case WMTRenderCommandDrawIndirectRange:
+                  case WMTRenderCommandDrawIndexedIndirectRange:
                   case WMTRenderCommandDrawIndexedIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
                   case WMTRenderCommandDrawMeshThreadgroups:
                   case WMTRenderCommandDrawMeshThreadgroupsIndirect: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH; break;
@@ -11245,13 +11454,16 @@ public:
                   }
                 } else if (encoder->type == EncoderType::Compute) {
                   switch (command->type) {
+                  case WMTComputeCommandDispatchCompact:
                   case WMTComputeCommandDispatch:
                   case WMTComputeCommandDispatchThreads: op = D3D12_AUTO_BREADCRUMB_OP_DISPATCH; break;
+                  case WMTComputeCommandDispatchIndirectRange:
                   case WMTComputeCommandDispatchIndirect: op = D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT; break;
                   default: break;
                   }
                 } else {
                   switch (command->type) {
+                  case WMTBlitCommandSnapshotPredicate:
                   case WMTBlitCommandCopyFromBufferToBuffer: op = D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION; break;
                   case WMTBlitCommandCopyFromBufferToTexture:
                   case WMTBlitCommandCopyFromBufferToTextureWithBlitOption:
@@ -11325,6 +11537,7 @@ public:
   }
 
   void EnqueueAnnotation(UINT action, UINT metadata, const void *data, UINT size) {
+    if (!device_->capture_annotations) return;
     try {
       auto annotation = CaptureAnnotation(action, metadata, data, size);
       std::lock_guard<d3dalloy::mutex> lock(mutex_enqueue_);
@@ -11725,10 +11938,6 @@ public:
       folded_signals->clear();
     }
     auto &cmdbuf = scope.inflight.cmdbuf;
-    // Present reads the backbuffer outside planner tracking.
-    MarkUntracked(scope.seq);
-    // Its encoders wait on the queue fence; skipped work of earlier Executes drains first.
-    DrainSkippedWork(cmdbuf, scope.seq);
     scope.inflight.reflex_work = task.reflex_work;
     if (task.reflex_work) scope.inflight.reflex_driver_start = ReflexState::NowUs();
     scope.inflight.latency = std::move(task.latency);
@@ -11757,28 +11966,63 @@ public:
     std::array<RECT, 4> complement;
     unsigned complement_count = 0;
     uint64_t complement_area = 0;
-    const bool use_complement = largest_dirty && composition.has_previous && dirty_area < frame_area &&
-        PresentDirtyComplement(composition, complement, complement_count, complement_area) &&
+    const bool have_complement = largest_dirty && composition.has_previous && dirty_area < frame_area &&
+        PresentDirtyComplement(composition, complement, complement_count, complement_area);
+    const bool use_complement = have_complement &&
         complement_area <= frame_area / 2 && complement_area < frame_area - dirty_area;
     const bool full_image_dirty = (largest_dirty && dirty_area == frame_area) || (use_complement && !complement_count);
     const bool full_history = composition.full || !composition.has_previous || full_image_dirty;
-    uint64_t history_copies = 0, history_texels = 0, backbuffer_copies = 0, backbuffer_texels = 0;
-    if (task.composition.history) {
+    const bool obsolete_history = composition.history && full_history &&
+        composition.history->superseded_present.load(std::memory_order_acquire) == task.present_id;
+    // The presenter owns its drawable and orders private history through order_event.
+    // Only the public source (also written by a partial-history restore) escapes.
+    bool drain = true;
+    if (g->texture->directViewOfAllocation(view.key) &&
+        !view.allocation->flags().test(TextureAllocationFlag::Shared) &&
+        !view.allocation->mappedMemory && !device_->LookupStandardSwizzleTexture(g->texture.ptr())) {
+      const auto access = TextureAccess(view.allocation, view.key, 4, composition.history && !full_history,
+          false, WMTMetal4StageFragment | WMTMetal4StageBlit);
+      const std::span<const SubmissionAccess> accesses{&access, 1};
+      drain = composition.history || InflightHazard(accesses) != 0;
+      try {
+        RecordInflightAccesses(accesses, 0, WMTMetal4StageAll);
+        SealInflightAccesses(scope.seq);
+      } catch (const std::bad_alloc &) {
+        MarkUntracked(scope.seq);
+        drain = true;
+      }
+    } else {
+      MarkUntracked(scope.seq);
+    }
+    if (drain) DrainSkippedWork(cmdbuf, scope.seq);
+    uint64_t history_copies = 0, history_batches = 0, history_texels = 0, backbuffer_copies = 0, backbuffer_texels = 0;
+    if (composition.history && !obsolete_history) {
       auto &current = composition.history->textures[0];
       auto &scroll_snapshot = composition.history->textures[1];
       auto encoder = cmdbuf.blitCommandEncoder();
       encoder.waitForFence(fence_);
+      std::array<wmtcmd_blit_copy_from_texture_to_texture, 4> batch;
+      unsigned count = 0;
+      auto flush = [&] {
+        if (!count) return;
+        batch[count - 1].next.set(nullptr);
+        encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(batch.data()));
+        ++history_batches;
+        count = 0;
+      };
       auto copy = [&](WMT::Texture source, WMT::Texture destination, int64_t source_x, int64_t source_y,
                       int64_t width, int64_t height, int64_t destination_x, int64_t destination_y) {
-        wmtcmd_blit_copy_from_texture_to_texture command{};
+        auto &command = batch[count];
+        command = {};
+        if (count) batch[count - 1].next.set(&command);
+        ++count;
         command.type = WMTBlitCommandCopyFromTextureToTexture;
-        command.next.set(nullptr);
         command.src = source;
         command.src_origin = {uint32_t(source_x), uint32_t(source_y), 0};
         command.src_size = {uint32_t(width), uint32_t(height), 1};
         command.dst = destination;
         command.dst_origin = {uint32_t(destination_x), uint32_t(destination_y), 0};
-        encoder.encodeCommands(reinterpret_cast<const wmtcmd_blit_nop *>(&command));
+        if (count == batch.size()) flush();
         ++history_copies;
         history_texels += uint64_t(width) * uint64_t(height);
       };
@@ -11800,9 +12044,14 @@ public:
           const int64_t bottom = std::min<int64_t>(rect.bottom, int64_t(composition.height) - offset_y);
           // Only the clipped destination matters. Dirty pixels overwrite it
           // after scroll, even when their source texels were also scrolled.
-          const bool overwritten = largest_dirty && largest_dirty->left <= left + offset_x &&
+          bool overwritten = largest_dirty && largest_dirty->left <= left + offset_x &&
               largest_dirty->top <= top + offset_y && largest_dirty->right >= right + offset_x &&
               largest_dirty->bottom >= bottom + offset_y;
+          if (!overwritten && have_complement)
+            overwritten = std::none_of(complement.begin(), complement.begin() + complement_count, [&](const RECT &r) {
+              return r.left < right + offset_x && left + offset_x < r.right &&
+                     r.top < bottom + offset_y && top + offset_y < r.bottom;
+            });
           if (right > left && bottom > top && !overwritten) {
             copy(current, scroll_snapshot, left, top, right - left, bottom - top, 0, 0);
             copy(scroll_snapshot, current, 0, 0, right - left, bottom - top, left + offset_x, top + offset_y);
@@ -11812,6 +12061,7 @@ public:
           copy(view.texture, current, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                rect.left, rect.top);
       }
+      flush();
       encoder.updateFence(fence_);
       encoder.endEncoding();
       present_source = current;
@@ -11872,12 +12122,14 @@ public:
     if (composition.history)
       owned_graphics::Trace("present_history_work", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
           ",\"frame\":", frame_id, ",\"full_image_dirty\":", full_image_dirty,
-          ",\"history_copies\":", history_copies, ",\"history_texels\":", history_texels,
+          ",\"superseded_full\":", obsolete_history,
+          ",\"history_copies\":", history_copies, ",\"history_batches\":", history_batches,
+          ",\"history_texels\":", history_texels,
           ",\"backbuffer_copies\":", backbuffer_copies,
           ",\"backbuffer_texels\":", backbuffer_texels);
-    queue_.waitForDrawable(drawable);
+    if (drawable) queue_.waitForDrawable(drawable);
     scope.signals.emplace_back(order_event, frame_id);
-    if (task.observer && !drawable.observePresentation(task.observer, task.present_id)) {
+    if (!present_work.pipeline_failed && task.observer && !drawable.observePresentation(task.observer, task.present_id)) {
       task.observer.cancel(task.present_id);
       task.observer_fault->store(true, std::memory_order_release);
     }
@@ -11891,11 +12143,13 @@ public:
         frame_id, task.restart_epoch, task.present_id, task.after, task.composition.sync_interval,
         task.composition.allow_tearing});
     scope.inflight.native_present->native_present_attempted = true;
-    scope.inflight.native_present->native_present_reserved = WMT4::ReserveMetal4Present(
-        cmdbuf, drawable, task.after,
-        scope.inflight.native_present->surface ? &scope.inflight.native_present->frame : nullptr,
-        task.composition.sync_interval, scope.inflight.native_present->surface ? task.composition.allow_tearing : false);
-    if (!scope.inflight.native_present->native_present_reserved)
+    if (!present_work.pipeline_failed)
+      scope.inflight.native_present->native_present_reserved = WMT4::ReserveMetal4Present(
+          cmdbuf, drawable, task.after,
+          scope.inflight.native_present->surface ? &scope.inflight.native_present->frame : nullptr,
+          task.composition.sync_interval, scope.inflight.native_present->surface ? task.composition.allow_tearing : false);
+    // Retire this failed frame in order and retry the missing shader variant on next use.
+    if (!present_work.pipeline_failed && !scope.inflight.native_present->native_present_reserved)
       device_->ReportRemoval(DXGI_ERROR_DRIVER_INTERNAL_ERROR);
     owned_graphics::Trace("present_encode", ",\"queue\":", owned_id_, ",\"submission\":", scope.seq,
                           ",\"resource\":", g->owned_id);

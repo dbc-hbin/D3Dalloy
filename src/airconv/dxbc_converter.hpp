@@ -97,6 +97,11 @@ public:
     indexableTempRegisterCounts;
   air::ArgumentBufferBuilder binding_table_cbuffer;
   air::ArgumentBufferBuilder binding_table;
+  bool has_implicit_root_access = false;
+  bool RootArgumentsUnused() const {
+    return !has_implicit_root_access && cbufferMap.empty() && srvMap.empty() &&
+           uavMap.empty() && samplerMap.empty();
+  }
   bool skipOptimization = false;
   bool refactoringAllowed = false;
   bool no_control_point_phase_passthrough = false;
@@ -275,9 +280,14 @@ pop_output_reg_fix_unorm(uint32_t from_reg, uint32_t mask, uint32_t to_element);
 std::function<IRValue(pvalue)>
 pop_output_reg_sanitize_pos(uint32_t from_reg, uint32_t mask, uint32_t to_element);
 
-IREffect pull_vertex_input(
-  air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask, bool dense_vertex_table
+struct VertexPull {
+  SM50_IA_INPUT_ELEMENT element;
+  uint32_t mask;
+};
+
+IREffect pull_vertex_slot(
+  air::FunctionSignatureBuilder &func_signature, std::vector<VertexPull> pulls,
+  uint32_t slot_mask, bool dense_vertex_table
 );
 
 IREffect pop_mesh_output_render_target_array_index(uint32_t from_reg, uint32_t mask, pvalue primitive_id);
@@ -771,6 +781,14 @@ args_get_data(const struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *data, data_t *
   }
   *out = NULL;
   return false;
+}
+
+// Native ICB view routing injects a root view-id read after the ordinary stage is lowered.
+inline uint32_t ordinary_root_slot(const ShaderInfo &shader, const SM50_SHADER_COMPILATION_ARGUMENT_DATA *args) {
+  SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA *views = nullptr;
+  return !shader.RootArgumentsUnused() ||
+         args_get_data<SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS, SM50_SHADER_D3D12_INDIRECT_VIEW_LOCATIONS_DATA>(
+             args, &views) ? SM50_BINDING_INDEX_ROOT_ARGUMENTS : ~0u;
 }
 
 } // namespace d3dalloy::dxbc

@@ -765,11 +765,19 @@ HRESULT MTLD3D12WorkGraph::BuildGraph(const D3D12_WORK_GRAPH_DESC &desc, Graph &
       !resource_contract::CheckedMul(graph.level_bytes, graph.depth, backing_bytes))
     return Reject("record backing memory size overflow");
   graph.memory = {backing_bytes, backing_bytes, 8};
-  for (auto &node : graph.nodes) { HRESULT hr = Compile(node, graph.dispatch_root.ptr()); if (FAILED(hr)) return hr; }
+  for (uint32_t i = 0; i < n; ++i) {
+    auto &node = graph.nodes[i];
+    const bool use_icb = incoming[i] || node.info.HasShareInputOf || !graph.sharing_nodes[i].empty() ||
+        std::any_of(node.targets.begin(), node.targets.end(), [i](uint32_t target) {
+          return target != i && target != SM50_WG_NONE;
+        });
+    HRESULT hr = Compile(node, graph.dispatch_root.ptr(), false, use_icb);
+    if (FAILED(hr)) return hr;
+  }
   return S_OK;
 }
 
-HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool validate_only) {
+HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool validate_only, bool use_icb) {
   Com<MTLD3D12RootSignature> validation_root;
   if (validate_only && node.local_root && node.local_root->NumStaticSamplers) {
     std::vector<D3D12_STATIC_SAMPLER_DESC> samplers; UINT appended = 0;
@@ -822,13 +830,29 @@ HRESULT MTLD3D12WorkGraph::Compile(Node &node, MTLD3D12RootSignature *root, bool
   }
   if (validate_only) { if (bitcode) SM50DestroyBitcode(bitcode); return S_OK; }
   node.compiled_artifact = artifact;
+  // An extension recompiles inherited nodes against its resolved root and exports.
+  node.pipeline = nullptr;
+  node.icb_pipeline_id = 0;
   WMT::Reference<WMT::Error> metal_error;
   HRESULT constant_result = node.constants.Initialize(device_, metallib, bitcode);
   if (FAILED(constant_result)) { SM50DestroyBitcode(bitcode); return constant_result; }
   auto metal_library = device_->GetMetal4Compiler().newLibrary(WMT::MakeDispatchData(metallib.Data, metallib.Size), metal_error);
   if (metal_library) {
     auto function = metal_library.newFunction(desc.FunctionName);
-    if (function) node.pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, metal_error);
+    if (function) {
+      if (use_icb && !info.HasAtomic64) {
+        WMTComputePipelineInfo descriptor{};
+        WMT::InitializeComputePipelineInfo(descriptor);
+        descriptor.compute_function = function;
+        descriptor.support_indirect_command_buffers = true;
+        node.pipeline = device_->GetMetal4Compiler().newComputePipelineState(descriptor, metal_error);
+        if (node.pipeline) node.icb_pipeline_id = MTLResource_gpuResourceID(node.pipeline);
+      }
+      if (!node.pipeline) {
+        metal_error = nullptr;
+        node.pipeline = device_->GetMetal4Compiler().newComputePipelineState(function, metal_error);
+      }
+    }
   }
   if (bitcode) SM50DestroyBitcode(bitcode);
   if (!node.pipeline) {
@@ -984,7 +1008,7 @@ struct GraphExecution {
     command.buffer = buffer; command.offset = offset; command.index = index;
     encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&command));
   }
-  void Use(WMT::MTL4ComputeCommandEncoder encoder, WMT::Resource resource) {
+  void Use(WMT::MTL4ComputeCommandEncoder encoder, WMT::Object resource) {
     wmtcmd_compute_useresource command{}; command.type = WMTComputeCommandUseResource;
     command.resource = resource; command.usage = WMTResourceUsage(WMTResourceUsageRead | WMTResourceUsageWrite);
     encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&command));
@@ -1096,6 +1120,10 @@ struct GraphExecution {
       const auto &source = graph.nodes[index];
       auto &node = nodes[index];
       const auto &input = source.info.Input;
+      node.Pipeline = source.icb_pipeline_id;
+      node.Constants = source.constants.gpu_address;
+      node.Threads[0] = source.threads.width; node.Threads[1] = source.threads.height;
+      node.Threads[2] = source.threads.depth;
       const bool terminal = std::all_of(source.targets.begin(), source.targets.end(),
           [](uint32_t target) { return target == SM50_WG_NONE; });
       use_frontier |= !terminal || !graph.sharing_nodes[index].empty();
@@ -1223,6 +1251,10 @@ struct GraphExecution {
     params.Indirect = address + indirect_offset; params.Backing = dispatch.program.BackingMemory.StartAddress;
     params.LevelBytes = graph.level_bytes; params.LevelStride = control_stride;
     params.NodeCount = count; params.Depth = graph.depth;
+    if (dispatch.arguments) {
+      params.Roots = dispatch.arguments_address + dispatch.roots;
+      params.Samplers = dispatch.arguments_address + dispatch.samplers;
+    }
     params.BatchOffset = batch_offset; params.SharingOffset = sharing_offset;
     std::memcpy(bytes + nodes_offset, nodes.data(), nodes.size() * sizeof(nodes[0]));
     std::memcpy(bytes + queues_offset, queues.data(), queues.size() * sizeof(queues[0]));
@@ -1283,6 +1315,20 @@ struct GraphExecution {
     }
     std::erase_if(reachable, [&](uint32_t node) { return node_bindings[node].host; });
     const bool group_indirect = reachable.size() > 1;
+    WMT::Reference<WMT::IndirectCommandBuffer> icb;
+    auto &params = *reinterpret_cast<WorkGraphSchedulerParams *>(bytes + params_offset);
+    params.Indirect = frontier_info.gpu_address + indirect_offset;
+    if (group_indirect && std::all_of(reachable.begin(), reachable.end(),
+          [&](uint32_t node) { return graph.nodes[node].icb_pipeline_id != 0; })) {
+      WMTIndirectCommandBufferInfo info{};
+      info.type = WMTIndirectCommandTypeConcurrentDispatch;
+      info.max_kernel_buffer_binding = 30;
+      icb = device->GetMTLDevice().newIndirectCommandBuffer(info, 1, WMTResourceStorageModePrivate);
+      if (icb) {
+        params.Commands = info.gpu_resource_id;
+        params.Indirect = 0;
+      }
+    }
     uint64_t quantum = 0;
     while (state.Status == kWorkGraphSchedulerRunning) {
       const uint64_t nodes_before = state.NodeSteps, nonterminal_before = state.NonterminalSteps, host_before = state.HostSteps;
@@ -1295,6 +1341,17 @@ struct GraphExecution {
       Use(encoder, frontier); Use(encoder, control); Use(encoder, backing_owner->buffer());
       if (seed_resource) Use(encoder, seed_resource);
       if (input_owner) Use(encoder, input_owner->buffer());
+      if (icb) {
+        static_assert(SM50_BINDING_INDEX_WORK_GRAPH_CONTEXT == 18 && SM50_BINDING_INDEX_ROOT_ARGUMENTS == 0 &&
+                      SM50_BINDING_INDEX_STATIC_SAMPLERS == 1 && SM50_BINDING_INDEX_IMMUTABLE_CONSTANTS == 29);
+        Use(encoder, icb);
+        if (dispatch.arguments) Use(encoder, dispatch.arguments);
+        for (uint32_t index : reachable) {
+          const auto &node = graph.nodes[index];
+          Use(encoder, node.pipeline);
+          if (node.constants.buffer) Use(encoder, node.constants.buffer);
+        }
+      }
       for (uint32_t slot = 0; slot < kWorkGraphSchedulerQuantum; ++slot) {
         if (slot && group_indirect)
           encoder.barrierAfterEncoderStages(WMTMetal4StageDispatch, WMTMetal4StageDispatch, WMTMetal4VisibilityDevice);
@@ -1308,6 +1365,13 @@ struct GraphExecution {
         // Other indirect calls read zero grids and cannot touch node data.
         if (group_indirect)
           encoder.barrierAfterEncoderStages(WMTMetal4StageDispatch, WMTMetal4StageDispatch, WMTMetal4VisibilityDevice);
+        if (icb) {
+          wmtcmd_compute_executecommands execute{};
+          execute.type = WMTComputeCommandExecuteCommandsInBuffer;
+          execute.indirect_command_buffer = icb; execute.length = 1;
+          encoder.encodeCommands(reinterpret_cast<const wmtcmd_compute_nop *>(&execute));
+          continue;
+        }
         if (!reachable.empty()) {
           Bind(encoder, control, context_offset, SM50_BINDING_INDEX_WORK_GRAPH_CONTEXT);
           Bind(encoder, dispatch.arguments, dispatch.roots, SM50_BINDING_INDEX_ROOT_ARGUMENTS);
@@ -1336,7 +1400,7 @@ struct GraphExecution {
           ",\"peak_depth\":", state.PeakDepth, ",\"host_yield\":", state.HostYield,
           ",\"done\":", unsigned(state.Status == kWorkGraphSchedulerDone), ",\"error\":", state.Error,
           ",\"gpu_slots\":", kWorkGraphSchedulerQuantum, ",\"indirect_nodes\":", reachable.size(),
-          ",\"graph_nodes\":", graph.nodes.size(), ",\"admitted_groups\":", state.QuantumGroups);
+          ",\"graph_nodes\":", graph.nodes.size(), ",\"icb\":", bool(icb), ",\"admitted_groups\":", state.QuantumGroups);
       if (state.Status == kWorkGraphSchedulerError) {
         ERR("Work graph GPU frontier failed: ", state.Error, " node=", state.ErrorNode, " level=", state.ErrorLevel);
         return E_INVALIDARG;

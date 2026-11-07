@@ -104,7 +104,8 @@ public:
   }
 
   WMT::Reference<WMT::ComputePipelineState> newComputePipelineStateWithLinkedFunctions(
-      const WMTComputePipelineInfo &info, const obj_handle_t *functions, uint32_t count, WMT::Error &error) {
+      const WMTComputePipelineInfo &info, const obj_handle_t *functions, uint32_t count, WMT::Error &error,
+      bool &shader_validation) {
     struct WMTMetal4Call call{};
     call.operation = WMTMetal4PipelineLinkedCompute;
     call.args[0] = handle;
@@ -112,6 +113,7 @@ public:
     call.args[2] = functions ? WMTGetGuestWindowBase() + uint64_t(reinterpret_cast<uintptr_t>(functions)) : 0;
     call.args[3] = count;
     WMTMetal4Call(&call);
+    shader_validation = call.ret[2] != 0;
     error.handle = call.ret[1];
     return WMT::Reference<WMT::ComputePipelineState>(call.ret[0]);
   }

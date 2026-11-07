@@ -275,7 +275,12 @@ def check(args):
         expected.extend((frame, 1, index) for index in range(1, counts.get(frame, 0) + 1))
         if frame not in (8, 12):
             expected.append((frame, 0, 0))
-    require(int(finals[0]["submitted_present"]) == len(expected) and int(finals[1]["submitted_present"]) == 4,
+    ready = records(stdout, "OWNED_D3D12_FSR_FG_READY")
+    require(not ready or ([row["stream"] for row in ready] == ["callback", "builtin_ui"] and
+            all(1 <= int(row["actual"]) <= int(row["attempts"]) <= 64 and int(row["sync_qpc"]) > 0 for row in ready)),
+            "FSR visibility bootstrap lacks positive public statistics")
+    warm = [int(row["attempts"]) for row in ready] if ready else [0, 0]
+    require(int(finals[0]["submitted_present"]) == warm[0] + len(expected) and int(finals[1]["submitted_present"]) == warm[1] + 4,
             "FSR native submitted request count differs from validated outputs")
     require([(int(r["frame"]), int(r["generated"]), int(r["output_index"])) for r in callbacks] == expected,
             "public generated/real/OFF-ON/only-generated/callback-error sequence mismatch")
@@ -289,9 +294,31 @@ def check(args):
     require(not source_reuse or source_reuse == [
         {"frames": "8", "presents": "14", "ui": "mixed", "callback": "default", "overwrite": "next_backbuffer"}],
         "source reuse stream incomplete")
-    require(len(drawables) == len(expected) + 4 + (14 if source_reuse else 0),
+    require(len(drawables) == sum(warm) + len(expected) + 4 + (14 if source_reuse else 0),
             "native presentation count differs from validated outputs")
     require(len(events) == len(drawables), "native presented event count differs from captured requests")
+    bootstrap = {}
+    for row, start in zip(ready, (0, warm[0] + len(expected))):
+        stream = row["stream"]
+        samples = []
+        for attempt, record in enumerate(drawables[start:start + int(row["attempts"])], 1):
+            sequence = int(record["sequence"])
+            event = presented.get(sequence)
+            require(event and event["drawable"] == record["drawable"], "FSR bootstrap drawable/event mismatch")
+            t = float(event["time"])
+            require(math.isfinite(t) and t >= 0, "invalid FSR bootstrap display timestamp")
+            w, h = int(record["width"]), int(record["height"])
+            data = rgba((args.captures / Path(record["path"]).name).read_bytes(), w, h, int(record["format"]))
+            rgb = (16 + attempt, 80, 176)
+            for x, y in ((w // 4, h // 4), (w // 2, h // 2), (3 * w // 4, 3 * h // 4)):
+                require(all(abs(data[(w*y + x)*4+c] - v) <= 3 for c, v in enumerate(rgb)),
+                        "FSR visibility bootstrap presented unexpected pixels")
+            samples.append({"sequence": sequence, "presented_time": t})
+        require(any(sample["presented_time"] > 0 for sample in samples), "FSR bootstrap drawable never displayed")
+        bootstrap[stream] = samples
+    if ready:
+        start = warm[0] + len(expected)
+        drawables = drawables[warm[0]:start] + drawables[start + warm[1]:]
     images = []
     previous_time = 0
     previous_sequence = 0
@@ -343,8 +370,8 @@ def check(args):
             previous_time = time
         previous_sequence = sequence
     visible = {(image["frame"], image["generated"], image["output_index"]): image for image in images if image["presented_time"] > 0}
-    require(all((frame, 0, 0) in visible for frame in (2, 3, 4, 5, 6, 7, 9, 11)),
-            "real, disabled or generation-error output lacks actual displayed evidence")
+    missing_real = [frame for frame in (2, 3, 4, 5, 6, 7, 9, 11) if (frame, 0, 0) not in visible]
+    require(not missing_real, f"real, disabled or generation-error output lacks actual displayed evidence: frames={missing_real}")
     missing = [frame for frame in (2, 3, 4, 8) if (frame, 1, 1) not in visible]
     require(not missing, f"generated physical output proof incomplete: frame={missing}")
     pairs = []
@@ -395,7 +422,7 @@ def check(args):
         previous_sequence = sequence
     require(not args.native, "standalone native comparison is not configured; use native drawable content/order evidence")
     displayed = [image for image in images if image["presented_time"] > 0]
-    return {"pass": True, "native_drawable_content_and_order": images,
+    return {"pass": True, "native_drawable_content_and_order": images, "visibility_bootstrap": bootstrap,
             "attempted_drawables": len(images), "positively_displayed_drawables": len(displayed),
             "skipped_drawables": len(images) - len(displayed),
             "presentation_statistics_observations": observations,

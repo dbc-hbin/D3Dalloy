@@ -46,6 +46,7 @@ with tempfile.TemporaryDirectory(prefix="command-recording-cpu-", dir=root / "bu
         "RECORDING_METHODS": "\n".join(prefix + declaration(recording, marker) for prefix, marker in (
             ("bool ", "IsRecording() const"), ("void ", "RecordError(HRESULT"),
             ("HRESULT STDMETHODCALLTYPE ", "ValidateRecording()"),
+            ("void ", "RecordDispatchAccess(ComputeEncoderData"),
             ("void STDMETHODCALLTYPE ", "Dispatch(UINT"),
             ("HRESULT STDMETHODCALLTYPE ", "Close()"),
             ("HRESULT STDMETHODCALLTYPE ", "TemporalUpscale(IMTLD3D12TemporalUpscaleState"))),

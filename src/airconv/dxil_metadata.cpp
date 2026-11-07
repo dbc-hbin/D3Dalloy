@@ -1273,6 +1273,29 @@ ModuleInfo::Parse(
   return info;
 }
 
+bool HasRayQuery(const llvm::Function &entry) {
+  llvm::SmallVector<const llvm::Function *, 8> pending{&entry};
+  llvm::SmallPtrSet<const llvm::Function *, 8> visited;
+  while (!pending.empty()) {
+    const auto *function = pending.pop_back_val();
+    if (!visited.insert(function).second)
+      continue;
+    for (const auto &block : *function) {
+      for (const auto &instruction : block) {
+        const auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+        const auto *callee = call ? call->getCalledFunction() : nullptr;
+        if (!callee)
+          continue;
+        if (callee->getName().startswith("dx.op.rayQuery_TraceRayInline"))
+          return true;
+        if (!callee->isDeclaration() && !visited.contains(callee))
+          pending.push_back(callee);
+      }
+    }
+  }
+  return false;
+}
+
 llvm::Expected<ShaderMetadata>
 ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   auto info = ModuleInfo::Parse(bytecode, size, entry_name);
@@ -1323,6 +1346,21 @@ ParseMetadata(const void *bytecode, size_t size, const char *entry_name) {
   }
   metadata.force_early_depth_stencil = (*info)->force_early_depth_stencil;
   metadata.has_atomic64 = HasDeviceAtomic64(*(*info)->module);
+  metadata.has_ray_query = ((*info)->entry && HasRayQuery(*(*info)->entry)) ||
+      ((*info)->patch_constant_function && HasRayQuery(*(*info)->patch_constant_function));
+  // Heap handles and SV_ViewID can access the root without a dx.resources entry.
+  // Inspect the whole module so an access in a helper also retains the binding.
+  if ((*info)->resources.empty()) {
+    for (const auto &function : *(*info)->module) {
+      auto name = function.getName();
+      if (!function.use_empty() && (name.startswith("dx.op.createHandle") ||
+          name.startswith("dx.op.annotateHandle") || name.startswith("dx.op.viewID"))) {
+        metadata.has_implicit_root_access = true;
+        break;
+      }
+    }
+  }
+  metadata.has_implicit_root_access |= metadata.has_ray_query || metadata.has_atomic64;
   metadata.input_sig = std::move((*info)->input_sig);
   metadata.output_sig = std::move((*info)->output_sig);
   metadata.patch_constant_sig = std::move((*info)->patch_constant_sig);

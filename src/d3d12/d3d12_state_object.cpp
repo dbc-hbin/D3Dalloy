@@ -56,7 +56,6 @@ struct LibraryExport {
 
 struct Library {
   SharedShaderBytecode bytecode;
-  std::vector<LibraryExport> exports;
 };
 
 bool CopyName(const WCHAR *name, std::wstring &out) {
@@ -412,10 +411,6 @@ bool FindSubobjectIndex(const D3D12_STATE_OBJECT_DESC &desc, const D3D12_STATE_S
  */
 static_assert(offsetof(OwnedShaderIdentifier, export_index) == 12);
 
-uint32_t AlignUp(uint32_t value, uint32_t alignment) {
-  return (value + alignment - 1) & ~(alignment - 1);
-}
-
 class MTLD3D12StateObjectImpl final
     : public MTLD3D12DeviceChild<MTLD3D12StateObject, ID3D12StateObjectProperties> {
   std::vector<Library> libraries_;
@@ -439,20 +434,10 @@ class MTLD3D12StateObjectImpl final
   uint32_t max_attribute_size_ = 0;
   bool is_pipeline_ = false;
 
-  std::shared_ptr<const NativeRaytracingArtifact> native_executable_;
   std::shared_ptr<const RaytracingArtifact> compiled_artifact_;
-  WMT::Reference<WMT::ComputePipelineState> pipeline_state_;
-  uint32_t raygen_threadgroup_threads_ = 1;
-  WMT::Reference<WMT::IntersectionFunctionTable> intersection_table_;
-  WMT::Reference<WMT::VisibleFunctionTable> visible_function_table_;
-  /**
-   * What the state object's intersection function table is built from, kept so a
-   * dispatch can build its own table with the same functions but its own dispatch
-   * arguments block (see BindDispatchIntersectionFunctionTable). Hardware slots
-   * select triangle or bounding-box callbacks; GPU SBT records select hit groups.
-   */
-  uint32_t intersection_callback_slots_ = 0;
-  std::vector<std::pair<uint32_t, WMT::Reference<WMT::FunctionHandle>>> intersection_function_handles_;
+  std::once_flag indirect_once_;
+  bool icb_reads_tables_ = false;
+  std::unique_ptr<RayDispatchPipeline> indirect_;
 
   /** D3D12_STATE_OBJECT_CONFIG flags of this state object's own description. */
   D3D12_STATE_OBJECT_FLAGS state_flags_ = D3D12_STATE_OBJECT_FLAG_NONE;
@@ -545,10 +530,6 @@ class MTLD3D12StateObjectImpl final
     return S_OK;
   }
 
-  const Library *FindLibrary(const Export &entry) const {
-    return entry.library_index < libraries_.size() ? &libraries_[entry.library_index] : nullptr;
-  }
-
   /**
    * Build the root signature a DispatchRays of this pipeline binds from.
    *
@@ -616,6 +597,8 @@ class MTLD3D12StateObjectImpl final
       if (std::find(visited.begin(), visited.end(), entry.local_root_signature) != visited.end())
         continue;
       visited.push_back(entry.local_root_signature);
+      if (entry.local_root_signature->HasTextureDescriptorTables)
+        local_texture_tables = entry.local_root_signature;
       UINT appended = 0;
       HRESULT hr = AppendRootStaticSamplers(entry.local_root_signature, static_samplers, &appended);
       if (FAILED(hr))
@@ -656,8 +639,16 @@ class MTLD3D12StateObjectImpl final
     return S_OK;
   }
 
-  HRESULT CompilePipeline() {
+  HRESULT CompilePipeline(const MTLD3D12StateObjectImpl *parent) {
     SM50_RT_PIPELINE_DESC desc{};
+    SM50_RT_INCREMENTAL incremental{};
+    if (state_flags_ & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) {
+      if (parent && parent->compiled_artifact_) {
+        incremental.Parent = parent->compiled_artifact_->reusable_exports;
+        incremental.InheritedCount = first_local_export_;
+      }
+      desc.Incremental = &incremental;
+    }
     std::vector<SM50_RT_LIBRARY> libraries;
     std::vector<SM50_RT_EXPORT> compiler_exports;
     std::vector<SM50_WG_EXPORT> link_exports;
@@ -818,6 +809,8 @@ class MTLD3D12StateObjectImpl final
       return E_FAIL;
     }
     SM50FreeError(error);
+    if (incremental.Reused)
+      TRACE("RT addition reused ", incremental.Reused, " lowered export bodies");
     if (!metallib.Data || !metallib.Size || !function_count || function_count > functions.size()) {
       ERR("RT pipeline compilation returned an inconsistent result (functions=", function_count, ")");
       return E_FAIL;
@@ -837,6 +830,8 @@ class MTLD3D12StateObjectImpl final
     for (size_t i = 0; i < functions.size(); ++i) {
       const auto &function = functions[i];
       uses_atomic64 |= (function.Flags & SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE) != 0;
+      uses_ray_query |= (function.Flags & SM50_RT_FUNCTION_FLAG_RAY_QUERY) != 0;
+      icb_reads_tables_ |= (function.Flags & SM50_RT_FUNCTION_FLAG_ICB_READS_FUNCTION_TABLES) != 0;
       if (!function.Name || !*function.Name) {
         ERR("RT reflection returned an unnamed function");
         return E_FAIL;
@@ -897,20 +892,47 @@ class MTLD3D12StateObjectImpl final
       }
     }
 
-    native_executable_ = device_->GetShaderArtifactCache().NativeRaytracing(device_->GetMetal4Compiler(), library,
-        functions, std::max<uint32_t>(2, 2 * pipeline_config_.MaxTraceRecursionDepth + 2), metal_error);
-    pipeline_state_ = native_executable_ ? native_executable_->compute : WMT::Reference<WMT::ComputePipelineState>{};
-    if (!pipeline_state_) {
+    if (HRESULT hr = CreateDispatchPipeline(direct, library, functions, false); FAILED(hr))
+      return hr;
+
+    for (auto &entry : exports_) {
+      if (entry.stage == kOwnedRTStageLibrary)
+        continue;
+      OwnedShaderIdentifier identifier{};
+      identifier.magic = kOwnedShaderIdentifierMagic;
+      identifier.version = kOwnedShaderIdentifierVersion;
+      identifier.kind = kOwnedShaderIdentifierPipeline;
+      identifier.pipeline_token = pipeline_token_;
+      identifier.export_index = entry.identifier.export_index;
+      if (entry.hit_group) {
+        identifier.flags |= kOwnedShaderIdentifierHitGroup;
+        if (entry.hit_group_type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE)
+          identifier.flags |= kOwnedShaderIdentifierProcedural;
+      }
+      entry.identifier = identifier;
+    }
+    return S_OK;
+  }
+
+  HRESULT CreateDispatchPipeline(RayDispatchPipeline &out, WMT4::Library library,
+      const std::vector<SM50_RT_FUNCTION_INFO> &functions, bool indirect) {
+    WMT::Reference<WMT::Error> metal_error;
+    out.executable = device_->GetShaderArtifactCache().NativeRaytracing(device_->GetMetal4Compiler(), library,
+        functions, std::max<uint32_t>(2, 2 * pipeline_config_.MaxTraceRecursionDepth + 2), indirect, metal_error);
+    out.pipeline = out.executable ? out.executable->compute : WMT::Reference<WMT::ComputePipelineState>{};
+    if (indirect && out.executable && out.executable->shader_validation && icb_reads_tables_)
+      return DXGI_ERROR_UNSUPPORTED;
+    if (!out.pipeline) {
       ERR("RT pipeline creation failed: ",
           metal_error ? metal_error.description().getUTF8String() : "no Metal error");
       return E_FAIL;
     }
     /* Largest power of two within both the compiled max work group size and what the pipeline allows. */
     const uint64_t pipeline_threads =
-        std::min<uint64_t>(SM50_RT_RAYGEN_THREADGROUP_SIZE, pipeline_state_.maxTotalThreadsPerThreadgroup());
-    raygen_threadgroup_threads_ = 1;
-    while (raygen_threadgroup_threads_ * 2 <= pipeline_threads)
-      raygen_threadgroup_threads_ *= 2;
+        std::min<uint64_t>(SM50_RT_RAYGEN_THREADGROUP_SIZE, out.pipeline.maxTotalThreadsPerThreadgroup());
+    out.threads = 1;
+    while (out.threads * 2 <= pipeline_threads)
+      out.threads *= 2;
 
     /* Hardware IFT slots select geometry-kind callbacks only. Each callback
      * resolves the D3D12 hit group from the execution-time GPU shader table. */
@@ -928,9 +950,9 @@ class MTLD3D12StateObjectImpl final
     }
     if (!intersection_slots)
       return E_FAIL;
-    intersection_callback_slots_ = intersection_slots;
-    intersection_table_ = pipeline_state_.newIntersectionFunctionTable(intersection_slots);
-    if (!intersection_table_) {
+    out.callback_slots = intersection_slots;
+    out.intersection_table = out.pipeline.newIntersectionFunctionTable(intersection_slots);
+    if (!out.intersection_table) {
       ERR("RT intersection function table creation failed");
       return E_FAIL;
     }
@@ -938,13 +960,13 @@ class MTLD3D12StateObjectImpl final
       const auto &function = functions[i];
       if (function.Kind != SM50_RT_FUNCTION_DISPATCH || function.TableIndex == SM50_RT_INDEX_NONE)
         continue;
-      auto handle = native_executable_->handles[i];
+      auto handle = out.executable->handles[i];
       if (!handle) {
         ERR("RT intersection dispatch callback handle creation failed: ", function.Name);
         return E_FAIL;
       }
-      intersection_table_.setFunction(handle, function.TableIndex);
-      intersection_function_handles_.emplace_back(function.TableIndex, handle);
+      out.intersection_table.setFunction(handle, function.TableIndex);
+      out.callback_handles.emplace_back(function.TableIndex, handle);
     }
 
     /*
@@ -964,8 +986,8 @@ class MTLD3D12StateObjectImpl final
     for (const auto &function : functions)
       if (function.Kind == SM50_RT_FUNCTION_VISIBLE && function.TableIndex != SM50_RT_INDEX_NONE)
         visible_slots = std::max(visible_slots, function.TableIndex + 1);
-    visible_function_table_ = pipeline_state_.newVisibleFunctionTable(visible_slots);
-    if (!visible_function_table_) {
+    out.visible_table = out.pipeline.newVisibleFunctionTable(visible_slots);
+    if (!out.visible_table) {
       ERR("RT visible function table creation failed");
       return E_FAIL;
     }
@@ -977,32 +999,18 @@ class MTLD3D12StateObjectImpl final
         ERR("RT reflection returned an export index outside the export table: ", function.ExportIndex);
         return E_FAIL;
       }
-      auto handle = native_executable_->handles[i];
+      auto handle = out.executable->handles[i];
       if (!handle) {
         ERR("RT visible function handle creation failed: ", function.Name);
         return E_FAIL;
       }
       const uint32_t slot = function.TableIndex == SM50_RT_INDEX_NONE
         ? function.ExportIndex + 1 : function.TableIndex;
-      visible_function_table_.setFunction(handle, slot);
+      out.visible_table.setFunction(handle, slot);
     }
 
-    for (auto &entry : exports_) {
-      if (entry.stage == kOwnedRTStageLibrary)
-        continue;
-      OwnedShaderIdentifier identifier{};
-      identifier.magic = kOwnedShaderIdentifierMagic;
-      identifier.version = kOwnedShaderIdentifierVersion;
-      identifier.kind = kOwnedShaderIdentifierPipeline;
-      identifier.pipeline_token = pipeline_token_;
-      identifier.export_index = entry.identifier.export_index;
-      if (entry.hit_group) {
-        identifier.flags |= kOwnedShaderIdentifierHitGroup;
-        if (entry.hit_group_type == D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE)
-          identifier.flags |= kOwnedShaderIdentifierProcedural;
-      }
-      entry.identifier = identifier;
-    }
+    out.intersection_id = out.intersection_table.gpuResourceID();
+    out.visible_id = out.visible_table.gpuResourceID();
     return S_OK;
   }
 
@@ -1854,7 +1862,7 @@ private:
     HRESULT hr = BuildDispatchRootSignature();
     if (FAILED(hr))
       return hr;
-    return CompilePipeline();
+    return CompilePipeline(parent);
   }
 
   /**
@@ -1875,6 +1883,7 @@ private:
     HRESULT hr = EnumerateLibraryExports(library_desc.DXILLibrary, reflected);
     if (FAILED(hr))
       return hr;
+    std::vector<LibraryExport> selected_exports;
     if (!library_desc.NumExports) {
       /* Ordinary functions are legal exports but are never shader-table entries. */
       for (const auto &reflected_export : reflected) {
@@ -1884,7 +1893,7 @@ private:
           return E_INVALIDARG;
         }
       }
-      library.exports = std::move(reflected);
+      selected_exports = std::move(reflected);
     } else {
       std::vector<bool> listed(subobjects.size(), false);
       std::vector<std::wstring> published(subobjects.size());
@@ -1930,7 +1939,7 @@ private:
             auto overload = target;
             overload.entry_point = candidate.entry_point;
             overload.stage = candidate.stage;
-            library.exports.push_back(std::move(overload));
+            selected_exports.push_back(std::move(overload));
           }
           continue;
         }
@@ -1941,12 +1950,12 @@ private:
         }
         target.entry_point = match->entry_point;
         target.stage = match->stage;
-        library.exports.push_back(std::move(target));
+        selected_exports.push_back(std::move(target));
       }
       for (size_t k = 0; k < subobjects.size(); ++k)
         subobjects[k].second = listed[k] ? published[k] : std::wstring();
     }
-    for (const auto &target : library.exports) {
+    for (const auto &target : selected_exports) {
       Export entry;
       entry.name = target.name;
       entry.entry_point = target.entry_point;
@@ -2334,44 +2343,16 @@ public:
   uint32_t GetPipelineToken() const override { return pipeline_token_; }
   uint32_t GetMaxPayloadSize() const override { return max_payload_size_; }
   uint32_t GetMaxAttributeSize() const override { return max_attribute_size_; }
-  WMT::Reference<WMT::ComputePipelineState> GetPipelineState() const override { return pipeline_state_; }
-  uint32_t GetRayGenerationThreadgroupThreads() const override { return raygen_threadgroup_threads_; }
-  WMT::Reference<WMT::IntersectionFunctionTable> GetIntersectionFunctionTable() const override {
-    return intersection_table_;
-  }
-  /**
-   * A table for one dispatch, with the same functions as the state object's own but
-   * with the dispatch's argument block in its buffer argument table.
-   *
-   * The state object's table is shared and immutable, so a dispatch that needs the
-   * callback to see per-dispatch constants cannot bind them into it. This uses an
-   * equivalent table instead: the shared callbacks keep their fixed geometry slots,
-   * and the dispatch arguments block is bound at SM50_RT_BINDING_INDEX_DISPATCH
-   * together with the visible function table a hit shader reached from here calls
-   * through. A reused table already holds this pipeline's callbacks.
-   */
-  bool BindDispatchIntersectionFunctionTable(
-      WMT::Reference<WMT::IntersectionFunctionTable> &table, WMT::Buffer arguments, uint64_t arguments_offset,
-      WMT::Reference<WMT::VisibleFunctionTable> visible_function_table
-  ) override {
-    if (intersection_function_handles_.empty() || !intersection_callback_slots_)
-      return false;
-    if (!table) {
-      table = pipeline_state_.newIntersectionFunctionTable(intersection_callback_slots_);
-      if (!table) {
-        ERR("RT dispatch intersection function table creation failed");
-        return false;
-      }
-      for (const auto &[slot, handle] : intersection_function_handles_)
-        table.setFunction(handle, slot);
-    }
-    table.setBuffer(arguments, arguments_offset, SM50_RT_BINDING_INDEX_DISPATCH);
-    if (visible_function_table)
-      table.setVisibleFunctionTable(visible_function_table, SM50_RT_BINDING_INDEX_VISIBLE_FUNCTION_TABLE);
-    return true;
-  }
-  WMT::Reference<WMT::VisibleFunctionTable> GetVisibleFunctionTable() const override {
-    return visible_function_table_;
+  const RayDispatchPipeline *GetIndirectDispatchPipeline() override {
+    std::call_once(indirect_once_, [this] {
+      if (!compiled_artifact_ || !direct.executable) return;
+      // Instrumented ICB-capable RT PSOs fault on callback table access, even in an ordinary dispatch.
+      if (direct.executable->shader_validation && icb_reads_tables_) return;
+      auto candidate = std::make_unique<RayDispatchPipeline>();
+      if (SUCCEEDED(CreateDispatchPipeline(*candidate, direct.executable->library, compiled_artifact_->functions, true)))
+        indirect_ = std::move(candidate);
+    });
+    return indirect_.get();
   }
 };
 
@@ -2382,6 +2363,25 @@ uint32_t NextPipelineToken() {
 }
 
 } // namespace
+
+bool RayDispatchPipeline::BindIntersectionTable(WMT::Reference<WMT::IntersectionFunctionTable> &table,
+                                                WMT::Buffer arguments, uint64_t offset) const {
+  if (callback_handles.empty() || !callback_slots)
+    return false;
+  if (!table) {
+    table = WMT::ComputePipelineState{pipeline}.newIntersectionFunctionTable(callback_slots);
+    if (!table) {
+      ERR("RT dispatch intersection function table creation failed");
+      return false;
+    }
+    for (const auto &[slot, handle] : callback_handles)
+      table.setFunction(handle, slot);
+  }
+  table.setBuffer(arguments, offset, SM50_RT_BINDING_INDEX_DISPATCH);
+  if (visible_table)
+    table.setVisibleFunctionTable(visible_table, SM50_RT_BINDING_INDEX_VISIBLE_FUNCTION_TABLE);
+  return true;
+}
 
 HRESULT
 CreateStateObject(MTLD3D12Device *device, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **state_object) {

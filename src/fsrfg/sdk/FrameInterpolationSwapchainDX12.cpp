@@ -1401,8 +1401,6 @@ void FrameInterpolationSwapChainDX12::dispatchInterpolationCommands(FfxApiResour
     {
         pRegisteredCommandList->execute(true);
 
-        presentInfo.interpolationQueue->Signal(presentInfo.interpolationFence, ++interpolationFenceValue);
-
         *pInterpolatedFrame = interpolationOutput();
         frameInterpolationResetCondition = false;
     }
@@ -1427,21 +1425,21 @@ void FrameInterpolationSwapChainDX12::dispatchInterpolationCommands(FfxApiResour
         if (frameGenerationCallback(&desc, frameGenerationCallbackContext) == FFX_OK)
         {
             interpolationCommandList->execute(true);
-
-            presentInfo.interpolationQueue->Signal(presentInfo.interpolationFence, ++interpolationFenceValue);
+            if (desc.numGeneratedFrames > 0)
+            {
+                frameInterpolationResetCondition = false;
+                *pInterpolatedFrame = interpolationOutput();
+            }
         }
         else
         {
             interpolationCommandList->drop();
-        }
-
-        // reset condition if at least one frame was interpolated
-        if (desc.numGeneratedFrames > 0)
-        {
-            frameInterpolationResetCondition = false;
-            *pInterpolatedFrame = interpolationOutput();
+            frameInterpolationResetCondition = true;
         }
     }
+    // A rejected callback still hands the real frame to the presenter. Publish
+    // the interpolation queue's wait on the game queue for this entry as well.
+    presentInfo.interpolationQueue->Signal(presentInfo.interpolationFence, ++interpolationFenceValue);
 }
 
 void FrameInterpolationSwapChainDX12::presentInterpolated(UINT SyncInterval, UINT)

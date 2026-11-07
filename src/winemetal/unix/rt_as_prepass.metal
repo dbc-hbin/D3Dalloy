@@ -55,6 +55,8 @@ struct ShadowParams {
   ulong asAddress, metadataSource;
   uint jobCount, metadataMode;
   ShadowMetadata metadata;
+  ulong resourceID;
+  uint versionToken, mirrorSlot;
 };
 
 // All vector accesses are proved aligned and stay within the source payload.
@@ -116,10 +118,14 @@ inline void copy_shadow_element(device uchar *dst, device const uchar *src,
   for (; offset < stride; ++offset) dst[offset] = 0;
 }
 
-kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
-    device const ShadowGeometry *geometries [[buffer(1)]], device const ShadowJob *jobs [[buffer(2)]],
-    uint2 tid [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+inline void write_as_shadow(ShadowParams p, device const ShadowGeometry *geometries,
+    device const ShadowJob *jobs, device uint *liveMirror, uint2 tid, uint2 grid) {
   device ASHeader *dst = (device ASHeader *)p.asAddress;
+  if (p.versionToken && all(tid == 0)) {
+    dst->resourceID = p.resourceID;
+    dst->contributionsAddress = 0; // BLAS has no instance-contribution table.
+    liveMirror[p.mirrorSlot] = p.versionToken;
+  }
   if (p.metadataMode == 1) {
     device const ASHeader *src = (device const ASHeader *)p.metadataSource;
     // resourceID and contribution pointer belong to the destination sidecar.
@@ -128,9 +134,9 @@ kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
   } else {
     if (all(tid == 0))
       *((device ShadowMetadata *)((device uchar *)dst + 16)) = p.metadata;
-    for (ulong i = ulong(tid.y) * grid.x + tid.x; i < p.metadata.descCount && p.metadata.type != 0;
-         i += ulong(grid.x) * grid.y)
-      ((device ShadowGeometry *)((device uchar *)dst + 64))[i] = geometries[i];
+    if (p.metadataMode == 0 && p.metadata.type != 0)
+      for (ulong i = ulong(tid.y) * grid.x + tid.x; i < p.metadata.descCount; i += ulong(grid.x) * grid.y)
+        ((device ShadowGeometry *)((device uchar *)dst + 64))[i] = geometries[i];
     // Each row owns its jobs' disjoint shadow regions; x spans bytes or elements within that job.
     for (ulong j = tid.y; j < p.jobCount; j += grid.y) {
       const ShadowJob job = jobs[j];
@@ -151,6 +157,22 @@ kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
   }
 }
 
+kernel void d3dalloy_as_shadow(constant ShadowParams &p [[buffer(0)]],
+    device const ShadowGeometry *geometries [[buffer(1)]], device const ShadowJob *jobs [[buffer(2)]],
+    device uint *liveMirror [[buffer(3)]],
+    uint2 tid [[thread_position_in_grid]], uint2 grid [[threads_per_grid]]) {
+  write_as_shadow(p, geometries, jobs, liveMirror, tid, grid);
+}
+
+struct RefitShadowEntry { ShadowParams params; ulong jobs, geometries; };
+kernel void d3dalloy_as_shadow_batch(device const RefitShadowEntry *entries [[buffer(0)]],
+    device const uchar *tables [[buffer(1)]], device uint *liveMirror [[buffer(2)]],
+    uint3 tid [[thread_position_in_grid]], uint3 grid [[threads_per_grid]]) {
+  device const auto &e = entries[tid.z];
+  write_as_shadow(e.params, (device const ShadowGeometry *)(tables + e.geometries),
+      (device const ShadowJob *)(tables + e.jobs), liveMirror, tid.xy, grid.xy);
+}
+
 struct PostbuildParams { ulong asAddress, destinationOrMarker; uint operation, batchCount; };
 kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
   if (tid >= max(entries[0].batchCount, 1u)) return;
@@ -159,6 +181,7 @@ kernel void d3dalloy_as_postbuild(constant PostbuildParams *entries [[buffer(0)]
   device ulong *out = (device ulong *)p.destinationOrMarker;
   const ulong compacted = (ulong(h->nativeCompactedSize) + 64 + h->shadowSize + 255) & ~255ul;
   if (p.operation == 0) out[0] = h->type == 2 ? h->currentSize : compacted;
+  else if (p.operation == 4) out[0] = (out[0] + 64 + h->shadowSize + 255) & ~255ul;
   else if (p.operation == 1) out[0] = 8 + h->shadowSize + (h->type == 2 ? 352 + ulong(h->descCount) * 8
     : h->type == 1 && h->reserved0 ? ulong(h->descCount) * 80 : 0);
   else if (p.operation == 2) {

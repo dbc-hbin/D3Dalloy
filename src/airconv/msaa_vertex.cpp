@@ -316,22 +316,20 @@ Value *expandedLine(IRBuilder<> &b, Value *encoded, Value *records, Value *indic
   }
   unsigned n = native->getNumElements();
   result = b.CreateInsertValue(result, basePosition, n);
-  result = b.CreateInsertValue(result, b.CreateFDiv(ConstantFP::get(b.getFloatTy(), 1), baseW), n + 1);
-  result = b.CreateInsertValue(result, b.CreateFDiv(component(b, basePosition, 2), baseW), n + 2);
-  result = b.CreateInsertValue(result, xy0, n + 3);
-  result = b.CreateInsertValue(result, xy1, n + 4);
+  result = b.CreateInsertValue(result, xy0, n + 1);
+  result = b.CreateInsertValue(result, xy1, n + 2);
   Value *interval = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
   interval = b.CreateInsertElement(interval, lo, b.getInt32(0));
   interval = b.CreateInsertElement(interval, hi, b.getInt32(1));
-  result = b.CreateInsertValue(result, interval, n + 5);
+  result = b.CreateInsertValue(result, interval, n + 3);
   Value *depth = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
   depth = b.CreateInsertElement(depth, b.CreateFDiv(component(b, start, 2), startW), b.getInt32(0));
   depth = b.CreateInsertElement(depth, b.CreateFDiv(component(b, end, 2), endW), b.getInt32(1));
-  result = b.CreateInsertValue(result, depth, n + 6);
+  result = b.CreateInsertValue(result, depth, n + 4);
   Value *carrier = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
   carrier = b.CreateInsertElement(carrier, px, b.getInt32(0));
   carrier = b.CreateInsertElement(carrier, py, b.getInt32(1));
-  result = b.CreateInsertValue(result, carrier, n + 7);
+  result = b.CreateInsertValue(result, carrier, n + 5);
   return result;
 }
 
@@ -491,16 +489,13 @@ Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Valu
   }
   unsigned n = native->getNumElements();
   result = b.CreateInsertValue(result, position, n);
-  result = b.CreateInsertValue(result, b.CreateFDiv(ConstantFP::get(b.getFloatTy(), 1), component(b, position, 3)),
-                               n + 1);
-  result = b.CreateInsertValue(result, b.CreateFDiv(component(b, position, 2), component(b, position, 3)), n + 2);
-  for (unsigned v = 0; v < 3; ++v) result = b.CreateInsertValue(result, p[v], n + 3 + v);
+  for (unsigned v = 0; v < 3; ++v) result = b.CreateInsertValue(result, p[v], n + 1 + v);
   for (unsigned r = 0; r < kConservativeClipVectors; ++r) {
     Value *row = UndefValue::get(float4Type);
     for (unsigned c = 0; c < 4; ++c) row = b.CreateInsertElement(row, clip[r * 4 + c], b.getInt32(c));
-    result = b.CreateInsertValue(result, row, n + 6 + r);
+    result = b.CreateInsertValue(result, row, n + 4 + r);
   }
-  result = b.CreateInsertValue(result, b.getInt32(flags), n + 6 + kConservativeClipVectors);
+  result = b.CreateInsertValue(result, b.getInt32(flags), n + 4 + kConservativeClipVectors);
   Value *screen = UndefValue::get(FixedVectorType::get(b.getFloatTy(), 2));
   for (unsigned axis = 0; axis < 2; ++axis) {
     Value *ndc = b.CreateFDiv(component(b, position, axis), component(b, position, 3));
@@ -510,7 +505,7 @@ Value *expandedConservative(IRBuilder<> &b, Value *encoded, Value *records, Valu
       b.CreateFMul(b.CreateFMul(unit, component(b, viewportRect, axis + 2)),
         ConstantFP::get(b.getFloatTy(), .5))), b.getInt32(axis));
   }
-  return b.CreateInsertValue(result, screen, n + 7 + kConservativeClipVectors);
+  return b.CreateInsertValue(result, screen, n + 5 + kConservativeClipVectors);
 }
 
 MDNode *conservativeOutput(LLVMContext &context, StringRef name, StringRef type) {
@@ -649,11 +644,12 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       user.hash = userHash(name->getString());
       user.offset_dwords = uint32_t(offset / 4);
       user.size_bytes = uint32_t(size);
+      if (name->getString().startswith("user(semantic_sv_culldistance_"))
+        user.flags |= SM50_MSAA_CAPTURED_USER_CULL_DISTANCE;
     }
   }
-  // Native vertex/fragment linkage carries 124 user scalars. Replay also needs six
-  // scalar helpers (clip position, reciprocal W, depth); reserve eight for whole-row
-  // alignment and reconstruct only the rare excess fields from their exact records.
+  // Native vertex/fragment linkage carries 124 user scalars. Reserve room for
+  // replay helpers and reconstruct excess fields from their exact records.
   uint32_t user_scalars = 0;
   for (uint32_t i = 0; i < layout.user_count; ++i)
     user_scalars += (layout.users[i].size_bytes + 3) / 4;
@@ -748,8 +744,6 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
   SmallVector<Type *, 12> replayFields(nativeFields.begin(), nativeFields.end());
   if (!capture && !nativeTransport) {
     replayFields.push_back(nativeStruct->getElementType(positionField));
-    replayFields.push_back(Type::getFloatTy(context));
-    replayFields.push_back(Type::getFloatTy(context));
     if (line) {
       replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 2));
       replayFields.push_back(FixedVectorType::get(Type::getFloatTy(context), 2));
@@ -949,12 +943,6 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
         result = builder.CreateInsertValue(result, builder.CreateExtractValue(value, i), i);
       auto *clipPosition = builder.CreateExtractValue(value, positionField);
       result = builder.CreateInsertValue(result, clipPosition, nativeStruct->getNumElements());
-      auto *clipW = builder.CreateExtractElement(clipPosition, builder.getInt32(3));
-      auto *reciprocalW = builder.CreateFDiv(ConstantFP::get(builder.getFloatTy(), 1.0), clipW);
-      result = builder.CreateInsertValue(result, reciprocalW, nativeStruct->getNumElements() + 1);
-      auto *clipZ = builder.CreateExtractElement(clipPosition, builder.getInt32(2));
-      auto *ndcDepth = builder.CreateFDiv(clipZ, clipW);
-      result = builder.CreateInsertValue(result, ndcDepth, nativeStruct->getNumElements() + 2);
     }
     // The capture record retains raw IEEE distances, but no native rasterized
     // user varying may carry NaN or infinity into Metal interpolation.
@@ -986,17 +974,7 @@ Error transform(Module &module, const SM50_SHADER_D3D12_MSAA_VERTEX_DATA &option
       MDString::get(context, "air.arg_type_name"), MDString::get(context, "float4"),
       MDString::get(context, "air.arg_name"), MDString::get(context, "msaa_clip_position")
     });
-    auto *reciprocalOutput = MDTuple::get(context, {
-      MDString::get(context, "air.vertex_output"), MDString::get(context, "user(msaa_reciprocal_w)"),
-      MDString::get(context, "air.arg_type_name"), MDString::get(context, "float"),
-      MDString::get(context, "air.arg_name"), MDString::get(context, "msaa_reciprocal_w")
-    });
-    auto *depthOutput = MDTuple::get(context, {
-      MDString::get(context, "air.vertex_output"), MDString::get(context, "user(msaa_ndc_depth)"),
-      MDString::get(context, "air.arg_type_name"), MDString::get(context, "float"),
-      MDString::get(context, "air.arg_name"), MDString::get(context, "msaa_ndc_depth")
-    });
-    SmallVector<Metadata *, 8> extra{clipOutput, reciprocalOutput, depthOutput};
+    SmallVector<Metadata *, 8> extra{clipOutput};
     if (line) {
       extra.push_back(lineOutput(context, "msaa_line_start"));
       extra.push_back(lineOutput(context, "msaa_line_end"));

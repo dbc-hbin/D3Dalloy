@@ -732,7 +732,7 @@ int run() {
         createBuffer(device.Get(), 2 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
                      D3D12_RESOURCE_STATE_COPY_DEST);
     ComPtr<ID3D12Resource> visibilityReadback =
-        createBuffer(device.Get(), 6 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
+        createBuffer(device.Get(), 7 * sizeof(UINT64), D3D12_HEAP_TYPE_READBACK,
                      D3D12_RESOURCE_STATE_COPY_DEST);
 
     {
@@ -884,6 +884,13 @@ int run() {
                            0, 1, visibilityReadback.Get(), 3 * sizeof(UINT64));
     list->ResolveQueryData(visibilityHeapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION,
                            1, 2, visibilityReadback.Get(), 4 * sizeof(UINT64));
+    // Reuse the empty slot with no overlapping count query. This interval
+    // takes Metal's Boolean path and must publish exactly one.
+    list->BeginQuery(visibilityHeapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2);
+    recordVisibleDraw(list, pipeline, rtv);
+    list->EndQuery(visibilityHeapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION, 2);
+    list->ResolveQueryData(visibilityHeapB.Get(), D3D12_QUERY_TYPE_BINARY_OCCLUSION,
+                           2, 1, visibilityReadback.Get(), 6 * sizeof(UINT64));
     check(list->Close(), "query command list Close");
 
     // Query heap COM objects are no longer needed once the list owns the WMT
@@ -934,14 +941,14 @@ int run() {
     std::printf("OWNED_D3D12_QUERY_TIMESTAMP_VALUES t0=%llu t1=%llu\n",
                 static_cast<unsigned long long>(timestamp0), static_cast<unsigned long long>(timestamp1));
 
-    D3D12_RANGE visibilityRange{0, 6 * sizeof(UINT64)};
+    D3D12_RANGE visibilityRange{0, 7 * sizeof(UINT64)};
     UINT64* visibility = nullptr;
     check(visibilityReadback->Map(0, &visibilityRange,
                                   reinterpret_cast<void**>(&visibility)),
           "visibility readback Map");
-    const std::array<UINT64, 6> results{
+    const std::array<UINT64, 7> results{
         visibility[0], visibility[1], visibility[2],
-        visibility[3], visibility[4], visibility[5]};
+        visibility[3], visibility[4], visibility[5], visibility[6]};
     visibilityReadback->Unmap(0, nullptr);
     std::printf("OWNED_D3D12_QUERY_VISIBILITY_VALUES values=%llu,%llu,%llu,%llu,%llu,%llu\n",
                 static_cast<unsigned long long>(results[0]), static_cast<unsigned long long>(results[1]),
@@ -967,6 +974,8 @@ int run() {
         fail("nested binary occlusion visible draw did not normalize to one");
     if (results[5] != 0)
         fail("binary occlusion empty query returned nonzero");
+    if (results[6] != 1)
+        fail("standalone visible binary interval did not resolve to one");
 
     // A timestamp heap is an opaque GPU resource. Resolving it in a different
     // command buffer must not require a CPU producer-completion wait. Across

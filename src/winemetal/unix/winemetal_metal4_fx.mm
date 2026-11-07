@@ -129,6 +129,7 @@ static bool amdRRCall(struct WMTMetal4Call *call) {
   }
 }
 #include "metalfx_rr.inc"
+#include "metalfx_spatial.inc"
 extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
   if (call->operation >= 240 && call->operation < 256) return winemetal_metal4_fg_call(call);
   @autoreleasepool {
@@ -136,8 +137,15 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
       if (@available(macOS 26.0, *)) {
         if (d3dalloyRRCall(call) || amdRRCall(call)) return 0;
         switch (call->operation) {
+        case WMTMetal4FXCreateSpatial:
+        case WMTMetal4FXPrepareSpatial:
+        case WMTMetal4FXEncodeSpatial:
+          spatialCall(call);
+          return 0;
         case WMTMetal4FXSupportsTemporal:
-          if (call->args[1] & 256u)
+          if (call->args[1] == WMTMetal4FXSpatialFlag)
+            call->ret[0] = [MTLFXSpatialScalerDescriptor supportsDevice:(id<MTLDevice>)call->args[0]];
+          else if (call->args[1] & 256u)
             call->ret[0] = [MTLFXTemporalDenoisedScalerDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
           else if (call->args[1] & 512u)
             call->ret[0] = [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:(id<MTLDevice>)call->args[0]];
@@ -164,10 +172,6 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
         case WMTMetal4FXPrepareTemporal: {
           const auto &p = *reinterpret_cast<const WMTMetal4FXTemporalFrame *>(call->args[1]);
           fx::FrameInfo info;
-          info.color = reinterpret_cast<void *>(p.color); info.depth = reinterpret_cast<void *>(p.depth);
-          info.motionVectors = reinterpret_cast<void *>(p.motion); info.output = reinterpret_cast<void *>(p.output);
-          info.exposureTexture = reinterpret_cast<void *>(p.exposure); info.reactiveMask = reinterpret_cast<void *>(p.reactive);
-          info.compositionMask = reinterpret_cast<void *>(p.composition);
           info.inputContent = {p.input_width, p.input_height};
           info.colorRect = rect(p.color_rect); info.depthRect = rect(p.depth_rect); info.motionRect = rect(p.motion_rect);
           info.reactiveRect = rect(p.reactive_rect); info.compositionRect = rect(p.composition_rect); info.outputRect = rect(p.output_rect);
@@ -176,8 +180,9 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
           info.preExposure = p.pre_exposure; info.resetHistory = p.reset; info.exposureMode = fx::ExposureMode(p.exposure_mode);
           fx::FrameOperations operations{fx::ColorTransfer(p.color_transfer), bool(p.combine_composition),
               bool(p.sharpening), p.sharpness, bool(p.cap_output), bool(p.debug_view)};
-          fx::TextureSet textures{info.color, info.depth, info.motionVectors, info.output,
-              info.exposureTexture, info.reactiveMask, info.compositionMask};
+          fx::TextureSet textures{reinterpret_cast<void *>(p.color), reinterpret_cast<void *>(p.depth),
+              reinterpret_cast<void *>(p.motion), reinterpret_cast<void *>(p.output), reinterpret_cast<void *>(p.exposure),
+              reinterpret_cast<void *>(p.reactive), reinterpret_cast<void *>(p.composition)};
           fx::Error error;
           auto frame = ((D3DalloyTemporalFeature *)call->args[0])->feature->prepare(info, textures, &error, operations);
           call->ret[1] = resultFor(error);
@@ -196,9 +201,11 @@ extern "C" int32_t winemetal_metal4_fx_call(struct WMTMetal4Call *call) {
           [holder release];
           winemetal_metal4_retain_resource(call->args[0], (id)call->args[2]);
           fx::Error error;
+          uint32_t handoff = uint32_t(call->args[4]);
           const bool success = holder->frame->encode(winemetal_metal4_command_buffer(call->args[0]),
               reinterpret_cast<void *>(call->args[2]), holder->lease, &error, bool(call->args[3]),
-              reinterpret_cast<void *>(call->args[0]), winemetal_metal4_split_command_buffer);
+              reinterpret_cast<void *>(call->args[0]), winemetal_metal4_split_command_buffer, &handoff);
+          call->ret[3] = success ? handoff : 0;
           call->ret[1] = success ? 0 : (resultFor(error) ? resultFor(error) : 0x887a0020);
           return 0;
         }

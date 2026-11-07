@@ -4,8 +4,6 @@
 
 namespace yaagl::pso::metalfx {
 
-using Resource = void*;
-
 struct Extent {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -56,14 +54,6 @@ enum class ExposureMode : std::uint8_t {
 };
 
 struct FrameInfo {
-    Resource color = nullptr;
-    Resource depth = nullptr;
-    Resource motionVectors = nullptr;
-    Resource output = nullptr;
-    Resource exposureTexture = nullptr;
-    Resource reactiveMask = nullptr;
-    Resource compositionMask = nullptr;
-
     Extent inputContent{};
     Rect colorRect{};
     Rect depthRect{};

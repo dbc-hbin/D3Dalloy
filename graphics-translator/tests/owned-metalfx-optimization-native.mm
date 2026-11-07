@@ -5,6 +5,7 @@
 //   graphics-translator/tests/owned-metalfx-optimization-native.mm -o <output>
 // Includes the owned implementation to inspect native selection and generation IDs.
 #include "../../src/winemetal/unix/metalfx-backend.mm"
+#include "../../src/winemetal/unix/winemetal_metal4_hud.c"
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -15,6 +16,11 @@
 namespace probe {
 using namespace yaagl::pso::metalfx;
 namespace metalfx = yaagl::pso::metalfx;
+auto ensureScaler(Feature::Impl& feature, const FrameInfo& frame, const TextureSet& textures,
+                  const FrameOperations& operations, Error* error) {
+    return metalfx::ensureScaler(feature, frame, textures, operations,
+                                 temporalOutputLayout(feature, frame, operations), error);
+}
 using TextureCopy = void (*)(id, SEL, id<MTLTexture>, NSUInteger, NSUInteger, MTLOrigin, MTLSize,
                             id<MTLTexture>, NSUInteger, NSUInteger, MTLOrigin);
 Method copyMethod = nullptr;
@@ -225,8 +231,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     frame.depth = texture(gpu,depthFormat,128,generation->depthUsage);
     frame.motion = texture(gpu,MTLPixelFormatRG16Float,128,generation->motionUsage);
     frame.output = texture(gpu,MTLPixelFormatRGBA16Float,264,generation->outputUsage);
-    frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
-    p.color = frame.textures.color; p.depth = frame.textures.depth; p.motionVectors = frame.textures.motion; p.output = frame.textures.output;
+    const TextureSet textures{(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
     require(exactDescriptorInput(frame.color,p.colorRect,120,120,128,128,generation->colorUsage) &&
             exactDescriptorInput(frame.depth,p.depthRect,120,120,128,128,generation->depthUsage) &&
             exactDescriptorInput(frame.motion,p.motionRect,120,120,128,128,generation->motionUsage), "sr-offset-eligibility");
@@ -249,7 +254,7 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     frame.needsColorStaging = mask & 1; frame.needsDepthStaging = mask & 2; frame.needsMotionStaging = mask & 4;
     Error error; std::shared_ptr<ExecutionLease::Impl> lease;
     std::shared_ptr<const PreparedFrame> prepared; std::shared_ptr<const ExecutionLease> publicLease;
-    if (publicFeature) { prepared=publicFeature->prepare(p,frame.textures,&error); require(bool(prepared),error.message.c_str()); }
+    if (publicFeature) { prepared=publicFeature->prepare(p,textures,&error); require(bool(prepared),error.message.c_str()); }
     else { lease=makeLease(frame,&error); require(bool(lease),error.message.c_str()); }
     observedInputs[0]=frame.color; observedInputs[1]=frame.depth; observedInputs[2]=frame.motion;
     for (unsigned i=0; i<3; ++i) { inputCopies[i]=0; inputBytes[i]=0; }
@@ -265,7 +270,8 @@ std::vector<float> runSR(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     std::vector<id<MTL4CommandBuffer>> commands;
     auto begin = [&] { auto command=[gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
         [command useResidencySet:callerResidency];
-        if (lease) [command useResidencySet:(id<MTLResidencySet>)lease->residency]; commands.push_back(command); return command; };
+        if (lease && lease->residency) [command useResidencySet:(id<MTLResidencySet>)lease->residency];
+        commands.push_back(command); return command; };
     auto command = begin();
     if (prepared) {
         struct Segments { GPU* gpu; id<MTL4CommandAllocator> allocator; std::vector<id<MTL4CommandBuffer>>* commands; id<MTLResidencySet> residency; };
@@ -389,14 +395,14 @@ void fusedColorAlphaProof(GPU& gpu) {
         frame.depth = texture(gpu,MTLPixelFormatR32Float,128,MTLTextureUsageShaderRead);
         frame.motion = texture(gpu,MTLPixelFormatRG16Float,128,MTLTextureUsageShaderRead);
         frame.output = texture(gpu,MTLPixelFormatRGBA16Float,256,MTLTextureUsageShaderWrite);
-        frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
+        const TextureSet textures{(void*)frame.color,(void*)frame.depth,(void*)frame.motion,(void*)frame.output};
         frame.frame.inputContent = {128,128};
         frame.frame.colorRect = frame.frame.depthRect = frame.frame.motionRect = {0,0,128,128};
         frame.frame.outputRect = {0,0,256,256};
         frame.temporalOutputWidth = frame.temporalOutputHeight = 256;
         frame.needsOutputShadow = true; frame.operations.colorTransfer = transfer;
         Error error;
-        frame.generation = ensureScaler(*core,frame.frame,frame.textures,frame.operations,&error);
+        frame.generation = ensureScaler(*core,frame.frame,textures,frame.operations,&error);
         require(frame.generation && frame.generation->alphaScaler,"prepass-alpha-generation");
         FsrPipelineNeeds needs;
         needs.linearize = needs.alpha = needs.padding = needs.linearizeAlpha = true;
@@ -434,7 +440,8 @@ void fusedColorAlphaProof(GPU& gpu) {
                 if (!fused) core->linearizeAlphaPipeline = nil;
                 auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
                 auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
-                [command useResidencySet:(id<MTLResidencySet>)lease->residency]; [command useResidencySet:inputs];
+                if (lease->residency) [command useResidencySet:(id<MTLResidencySet>)lease->residency];
+                [command useResidencySet:inputs];
                 auto initial = [command computeCommandEncoder];
                 [initial updateFence:fence afterEncoderStages:MTLStageDispatch];
                 auto method = class_getInstanceMethod(object_getClass(initial),@selector(dispatchThreads:threadsPerThreadgroup:));
@@ -485,8 +492,6 @@ unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
     frame.reactive = filled(gpu, MTLPixelFormatR8Unorm, cap, 1, 4, reactives);
     frame.composition = transfer != ColorTransfer::Linear
         ? filled(gpu, MTLPixelFormatR8Unorm, cap, 1, 5, compositions) : nil;
-    frame.textures = {(void*)frame.color,(void*)frame.depth,(void*)frame.motion,nullptr,nullptr,
-                      (void*)frame.reactive,(void*)frame.composition};
     frame.needsColorStaging = transfer == ColorTransfer::Linear;
     frame.needsDepthStaging = frame.needsMotionStaging = true;
     frame.needsReactiveStaging = transfer == ColorTransfer::Linear;
@@ -499,7 +504,7 @@ unsigned paddingOracle(GPU& gpu, const std::shared_ptr<Feature::Impl>& core,
             "padded-scratch-not-gpu-optimized");
     auto allocator = [gpu.device newCommandAllocator]; auto fence = [gpu.device newFence];
     auto command = [gpu.device newCommandBuffer]; [command beginCommandBufferWithAllocator:allocator];
-    [command useResidencySet:(id<MTLResidencySet>)lease->residency];
+    if (lease->residency) [command useResidencySet:(id<MTLResidencySet>)lease->residency];
     auto callerDescriptor = [MTLResidencySetDescriptor new];
     auto callerResidency = [gpu.device newResidencySetWithDescriptor:callerDescriptor error:nil];
     [callerDescriptor release]; require(callerResidency != nil, "padding-caller-residency");
@@ -653,12 +658,12 @@ int main(int argc, char** argv) { @autoreleasepool {
     TextureSet textures{(void*)color,(void*)depth,(void*)motion,(void*)output};
     FrameInfo p{}; p.inputContent={128,128}; p.outputRect={0,0,256,256};
     Error error; const uint64_t start=ScalerGeneration::nextId.load();
-    auto a=ensureScaler(*core,p,textures,{},&error); require(bool(a),error.message.c_str()); const uint64_t activation=a->activation;
+    auto a=ensureScaler(*core,p,textures,{},&error); require(bool(a),error.message.c_str());
     p.outputRect={0,0,192,192}; auto b=ensureScaler(*core,p,textures,{},&error); require(bool(b),error.message.c_str());
     p.outputRect={0,0,256,256}; auto again=ensureScaler(*core,p,textures,{},&error);
-    require(again==a && a!=b && a->activation==activation,"A-B-A-preparation-reuses-without-activation");
+    require(again==a && a!=b && core->lastEncodedGeneration==0,"A-B-A-preparation-reuses-without-activation");
     again=ensureScaler(*core,p,textures,{},&error);
-    require(again==a && a->activation==activation,"unchanged-selection-keeps-activation");
+    require(again==a && core->lastEncodedGeneration==0,"unchanged-selection-keeps-activation");
     p.outputRect={0,0,128,128}; auto c=ensureScaler(*core,p,textures,{},&error); require(bool(c),error.message.c_str());
     require(c!=a && c!=b && ScalerGeneration::nextId.load()-start==3,"three-real-generation-creations");
     // Dynamic output keeps only the new and the previously current output extents.
@@ -680,24 +685,21 @@ int main(int argc, char** argv) { @autoreleasepool {
         q.inputContent={112,112}; auto small=ensureScaler(*exact,q,textures,{},&error); require(bool(small),error.message.c_str());
         q.inputContent={128,128}; auto large=ensureScaler(*exact,q,textures,{},&error); require(bool(large),error.message.c_str());
         require(large!=small && large->inputCapacityWidth==128,"exact-generation-growth");
-        const uint64_t smallActivation=small->activation;
         q.inputContent={112,112}; auto back=ensureScaler(*exact,q,textures,{},&error);
-        require(back==small && small->activation==smallActivation,"prefers-cached-exact-generation");
+        require(back==small && exact->lastEncodedGeneration==0,"prefers-cached-exact-generation");
         back=ensureScaler(*exact,q,textures,{},&error);
-        require(back==small && small->activation==smallActivation,"exact-reselection-keeps-activation");
+        require(back==small && exact->lastEncodedGeneration==0,"exact-reselection-keeps-activation");
         q.inputContent={120,120}; back=ensureScaler(*exact,q,textures,{},&error);
         require(back && back!=large && back!=small && back->inputCapacityWidth==120 &&
                 back->inputCapacityHeight==120,"uncached-transition-exact-generation");
-        const uint64_t exactActivation=back->activation;
-        require(ensureScaler(*exact,q,textures,{},&error)==back && back->activation==exactActivation,
+        require(ensureScaler(*exact,q,textures,{},&error)==back && exact->lastEncodedGeneration==0,
                 "steady-exact-generation-no-new-activation");
         std::printf("OWNED_METALFX_OPT_EXACT_EXTENT exact_preferred=1 uncached_transition_exact=1 prepare_only_no_activation=1\n");
     }
     auto publicFeature=Feature::create({(void*)gpu.device,(void*)core->compiler},core->create,&error);
     require(bool(publicFeature),error.message.c_str());
     p.inputContent={128,128}; p.colorRect=p.depthRect=p.motionRect={0,0,128,128};
-    p.outputRect={0,0,256,256}; p.color=(void*)color; p.depth=(void*)depth;
-    p.motionVectors=(void*)motion; p.output=(void*)output;
+    p.outputRect={0,0,256,256};
     auto prime=publicFeature->prepare(p,textures,&error); require(bool(prime),error.message.c_str());
     // Public prepare creates an exact descriptor for the 120x120 active input.
     // Its forced-staging reference must use the same native descriptor: a

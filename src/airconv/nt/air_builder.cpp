@@ -1,4 +1,5 @@
 #include "air_builder.hpp"
+#include "../airconv_context.hpp"
 #include "../dxil_converter.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -497,6 +498,9 @@ std::pair<Value *, Value *>
 AIRBuilder::CreateVolumeDispatch(const Texture &texture,
     function_ref<std::pair<Value *, Value *>()> atlas,
     function_ref<std::pair<Value *, Value *>()> native, Value *condition) {
+  if (!condition)
+    condition = builder.CreateICmpNE(builder.CreateAnd(texture.volume_layout,
+        builder.getInt64(uint64_t(1) << 62)), builder.getInt64(0));
   if (auto *known = dyn_cast_or_null<ConstantInt>(condition))
     return known->isZero() ? native() : atlas();
   auto *head = builder.GetInsertBlock();
@@ -508,9 +512,6 @@ AIRBuilder::CreateVolumeDispatch(const Texture &texture,
   auto *yes = BasicBlock::Create(getContext(), "volume.atlas", function, merge);
   auto *no = BasicBlock::Create(getContext(), "volume.native", function, merge);
   builder.SetInsertPoint(head);
-  if (!condition)
-    condition = builder.CreateICmpNE(builder.CreateAnd(texture.volume_layout,
-        builder.getInt64(uint64_t(1) << 62)), builder.getInt64(0));
   builder.CreateCondBr(condition, yes, no);
   builder.SetInsertPoint(yes);
   auto a = atlas();
@@ -566,13 +567,8 @@ AIRBuilder::VolumeInBounds(const Texture &texture, Value *position, Value *level
   return valid;
 }
 
-AIRBuilder::VolumeAtlasPosition
-AIRBuilder::VolumePosition(const Texture &texture, Value *position, Value *level) {
-  auto *mip_base = builder.CreateAdd(getInt(14), builder.CreateMul(VolumeMip(texture, level), getInt(4)));
-  auto word = [&](unsigned offset) { return LoadVolumeWord(texture, builder.CreateAdd(mip_base, getInt(offset))); };
-  auto *x = builder.CreateExtractElement(position, uint64_t(0));
-  auto *y = builder.CreateExtractElement(position, 1);
-  auto *z = builder.CreateExtractElement(position, 2);
+AIRBuilder::VolumeAtlasGeometry
+AIRBuilder::LoadVolumeGeometry(const Texture &texture) {
   auto *sw = LoadVolumeWord(texture, getInt(4));
   auto *sh = LoadVolumeWord(texture, getInt(5));
   auto *sd = LoadVolumeWord(texture, getInt(6));
@@ -582,20 +578,48 @@ AIRBuilder::VolumePosition(const Texture &texture, Value *position, Value *level
   auto *ph = LoadVolumeWord(texture, getInt(10));
   auto *cols = LoadVolumeWord(texture, getInt(11));
   auto *rows = LoadVolumeWord(texture, getInt(12));
-  auto *tile = builder.CreateAdd(word(0), builder.CreateAdd(builder.CreateUDiv(x, sw),
-      builder.CreateMul(word(1), builder.CreateAdd(builder.CreateUDiv(y, sh),
-          builder.CreateMul(word(2), builder.CreateUDiv(z, sd))))));
-  auto *unit = builder.CreateAdd(builder.CreateUDiv(builder.CreateURem(x, sw), bw),
-      builder.CreateMul(builder.CreateUDiv(sw, bw), builder.CreateAdd(builder.CreateUDiv(builder.CreateURem(y, sh), bh),
-          builder.CreateMul(builder.CreateUDiv(sh, bh), builder.CreateURem(z, sd)))));
-  auto *units_per_row = builder.CreateUDiv(pw, bw);
-  auto *px = builder.CreateAdd(builder.CreateMul(builder.CreateURem(tile, cols), pw),
-      builder.CreateAdd(builder.CreateMul(builder.CreateURem(unit, units_per_row), bw), builder.CreateURem(x, bw)));
-  auto *py = builder.CreateAdd(builder.CreateMul(builder.CreateURem(builder.CreateUDiv(tile, cols), rows), ph),
-      builder.CreateAdd(builder.CreateMul(builder.CreateUDiv(unit, units_per_row), bh), builder.CreateURem(y, bh)));
+  // CreateVolumeTiling caps each axis at a power of two. A shorter column
+  // count fits every tile in one row; a shorter row count fits them in one
+  // layer. Padding either radix to a power of two preserves every valid tile.
+  auto shift = [&](Value *count) {
+    return builder.CreateSub(getInt(32), CreateCountZero(builder.CreateSub(count, getInt(1)), false));
+  };
+  auto mask = [&](Value *bits) { return builder.CreateSub(builder.CreateShl(getInt(1), bits), getInt(1)); };
+  auto *column_shift = shift(cols), *row_shift = shift(rows);
+  return {sw, sh, sd, bw, bh, pw, ph, column_shift, row_shift, mask(column_shift), mask(row_shift)};
+}
+
+AIRBuilder::VolumeAtlasPosition
+AIRBuilder::VolumePosition(const Texture &texture, Value *position, Value *level, const VolumeAtlasGeometry *geometry) {
+  auto [sw, sh, sd, bw, bh, pw, ph, column_shift, row_shift, column_mask, row_mask] =
+      geometry ? *geometry : LoadVolumeGeometry(texture);
+  auto *mip_base = builder.CreateAdd(getInt(14), builder.CreateMul(VolumeMip(texture, level), getInt(4)));
+  auto word = [&](unsigned offset) { return LoadVolumeWord(texture, builder.CreateAdd(mip_base, getInt(offset))); };
+  auto *x = builder.CreateExtractElement(position, uint64_t(0));
+  auto *y = builder.CreateExtractElement(position, 1);
+  auto *z = builder.CreateExtractElement(position, 2);
+  auto within = [&](Value *value, Value *size) {
+    return builder.CreateAnd(value, builder.CreateSub(size, getInt(1)));
+  };
+  auto *block_x_shift = CreateCountZero(bw, true);
+  auto *block_y_shift = CreateCountZero(bh, true);
+  auto *tile = builder.CreateAdd(word(0), builder.CreateAdd(builder.CreateLShr(x, CreateCountZero(sw, true)),
+      builder.CreateMul(word(1), builder.CreateAdd(builder.CreateLShr(y, CreateCountZero(sh, true)),
+          builder.CreateMul(word(2), builder.CreateLShr(z, CreateCountZero(sd, true)))))));
+  auto *unit = builder.CreateAdd(builder.CreateLShr(within(x, sw), block_x_shift),
+      builder.CreateMul(builder.CreateLShr(sw, block_x_shift),
+          builder.CreateAdd(builder.CreateLShr(within(y, sh), block_y_shift),
+              builder.CreateMul(builder.CreateLShr(sh, block_y_shift), within(z, sd)))));
+  auto *units_per_row = builder.CreateLShr(pw, block_x_shift);
+  auto *row = builder.CreateLShr(tile, column_shift);
+  auto *px = builder.CreateAdd(builder.CreateMul(builder.CreateAnd(tile, column_mask), pw),
+      builder.CreateAdd(builder.CreateMul(within(unit, units_per_row), bw), within(x, bw)));
+  auto *py = builder.CreateAdd(builder.CreateMul(builder.CreateAnd(row, row_mask), ph),
+      builder.CreateAdd(builder.CreateMul(builder.CreateLShr(unit, CreateCountZero(units_per_row, true)), bh),
+                        within(y, bh)));
   auto *xy = builder.CreateInsertElement(UndefValue::get(getIntTy(2)), px, uint64_t(0));
   xy = builder.CreateInsertElement(xy, py, 1);
-  return {xy, builder.CreateUDiv(tile, builder.CreateMul(cols, rows)), tile};
+  return {xy, builder.CreateLShr(row, row_shift), tile};
 }
 
 Value *
@@ -616,11 +640,11 @@ AIRBuilder::VolumeMapped(const Texture &texture, Value *tile) {
 
 std::pair<Value *, Value *>
 AIRBuilder::CreateVolumeReadInBounds(const Texture &texture, Value *handle, Value *position, Value *level,
-                                    Value *defaults, bool coherent) {
+                                    Value *defaults, bool coherent, const VolumeAtlasGeometry *geometry) {
   auto physical = texture;
   physical.kind = Texture::texture2d_array;
   physical.volume_layout = nullptr;
-  auto [xy, slice, tile] = VolumePosition(texture, position, level);
+  auto [xy, slice, tile] = VolumePosition(texture, position, level, geometry);
   auto *mapped = VolumeMapped(texture, tile);
   auto *atlas = builder.CreateBitCast(handle, getTextureHandleType(physical));
   auto read = CreateRead(physical, atlas, xy, slice, nullptr, getInt(0), coherent);
@@ -709,6 +733,7 @@ AIRBuilder::CreateVolumeSample(const Texture &texture, Value *handle, Value *coo
 std::pair<Value *, Value *>
 AIRBuilder::CreateVolumeSampleBody(const Texture &texture, Value *handle, Value *coord,
     Value *offset, Value *lod, Value *minimum, Value *dx, Value *dy) {
+  const auto geometry = LoadVolumeGeometry(texture);
   IRBuilderBase::FastMathFlagGuard math_flags(builder);
   builder.clearFastMathFlags();
   auto *flags = builder.CreateTrunc(builder.CreateLShr(texture.sampler_metadata, 32), getIntTy());
@@ -876,7 +901,7 @@ AIRBuilder::CreateVolumeSampleBody(const Texture &texture, Value *handle, Value 
         auto read = CreateVolumeDispatch(texture, [&] {
           return CreateVolumeDispatch(texture, [&] { return std::pair<Value *, Value *>{border, builder.getInt8(0)}; },
               // Address modes have wrapped/clamped this tap. The outer view guard and LOD clamp cover its mip.
-              [&] { return CreateVolumeReadInBounds(texture, handle, position, mip, defaults, false); }, border_tap);
+              [&] { return CreateVolumeReadInBounds(texture, handle, position, mip, defaults, false, &geometry); }, border_tap);
         }, [&] { return std::pair<Value *, Value *>{zero, builder.getInt8(0)}; }, builder.CreateFCmpOGT(weight, getFloat(0)));
         status = builder.CreateOr(status, read.second);
         if (texture.sample_type != Texture::sample_float) color = read.first;
@@ -1469,6 +1494,8 @@ AIRBuilder::CreateCoordinateSample(
     return Normalized();
   auto *pixel = builder.CreateICmpNE(builder.CreateAnd(Metadata, builder.getInt64(uint64_t(1) << 47)),
                                      builder.getInt64(0));
+  if (auto *known = dyn_cast<ConstantInt>(pixel); known && known->isZero())
+    return Normalized();
   auto *head = builder.GetInsertBlock();
   auto *function = head->getParent();
   auto point = builder.GetInsertPoint();
@@ -1484,8 +1511,11 @@ AIRBuilder::CreateCoordinateSample(
   builder.SetInsertPoint(head);
   builder.CreateCondBr(pixel, pixel_block, normalized_block);
   builder.SetInsertPoint(pixel_block);
-  builder.CreateCondBr(builder.CreateICmpNE(TextureHandle, Constant::getNullValue(TextureHandle->getType())),
-                       pixel_view, merge);
+  // The native texture null query also guards the enclosing D3D12 access.
+  auto *present = getModule()->getModuleFlag("d3dalloy.d3d12.root-signature")
+      ? builder.CreateNot(d3dalloy::createTextureIsNull(builder, TextureHandle))
+      : builder.CreateIsNotNull(TextureHandle);
+  builder.CreateCondBr(present, pixel_view, merge);
   builder.SetInsertPoint(pixel_view);
   builder.CreateCondBr(builder.CreateFCmpOLE(ResourceMinLOD, getFloat(0)), pixel_access, pixel_empty);
   builder.SetInsertPoint(pixel_access);
@@ -1742,6 +1772,16 @@ AIRBuilder::CreateSampleGrad(
     auto *bias = builder.CreateBitCast(builder.CreateTrunc(Texture.sampler_metadata, getIntTy()), getFloatTy());
     return CreateVolumeDispatch(Texture, [&] { return CreateVolumeSample(Texture, Handle, Coord, Offset, bias, MinLOD, DerivX, DerivY); },
         [&] { return CreateSampleGrad(native, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, MinLOD, Offset, Reference); });
+  }
+  // Native gradient samples have no separate LOD bias operand. Scaling both
+  // derivatives shifts the mip level without changing the anisotropy ratio.
+  if (Texture.sampler_metadata) {
+    auto *bias = builder.CreateBitCast(builder.CreateTrunc(Texture.sampler_metadata, getIntTy()), getFloatTy());
+    Value *scale = CreateFPUnOp(exp2, bias);
+    if (auto *vec = dyn_cast<FixedVectorType>(DerivX->getType()))
+      scale = builder.CreateVectorSplat(vec->getNumElements(), scale);
+    DerivX = builder.CreateFMul(DerivX, scale);
+    DerivY = builder.CreateFMul(DerivY, scale);
   }
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
@@ -2368,7 +2408,11 @@ AIRBuilder::CreateTextureQuery(const Texture &Texture, Value *Handle, Texture::Q
 
   auto Fn = getModule()->getOrInsertFunction(FnName, FunctionType::get(getIntTy(), Tys, false), Attrs);
 
-  return builder.CreateSelect(builder.CreateIsNull(Handle), builder.getInt32(0), builder.CreateCall(Fn, Ops));
+  auto *size = builder.CreateCall(Fn, Ops);
+  // The D3D12 pass guards this native query and returns zero for a null texture.
+  if (getModule()->getModuleFlag("d3dalloy.d3d12.root-signature"))
+    return size;
+  return builder.CreateSelect(builder.CreateIsNull(Handle), builder.getInt32(0), size);
 }
 
 std::pair<Value *, Value *>

@@ -62,7 +62,7 @@ void scene(GPU& gpu,id<MTL4Compiler> compiler,const char* name,uint32_t iw,uint3
     const uint64_t frequency=[gpu.device queryTimestampFrequency];
     require(interval && frequency && [gpu.device sizeOfCounterHeapEntry:MTL4CounterHeapTypeTimestamp]==sizeof(MTL4TimestampHeapEntry),"timestamp counter support");
     for(unsigned k=0;k<frames;++k) @autoreleasepool {
-        FrameInfo p{};p.color=color;p.depth=depth;p.motionVectors=mv;p.output=out;
+        FrameInfo p{};
         p.inputContent={iw,ih};p.colorRect=p.depthRect=p.motionRect={dx,dy,iw,ih};p.outputRect={x0,y0,ow,oh};
         p.preExposure=1;p.exposureMode=ExposureMode::Automatic;p.resetHistory=k==0||k==3;
         p.jitterOffsetX=(k&1)?.25f:-.25f;p.jitterOffsetY=(k&1)?-.125f:.125f;

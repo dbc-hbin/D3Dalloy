@@ -202,12 +202,11 @@ struct D3DALLOYMSAAFullscreenLayerVertex {
 
 struct D3DALLOYMSAANoPixelInput {
   float4 position [[position]];
-  interpolant<float, interpolation::no_perspective> ndc_depth [[user(msaa_ndc_depth)]];
+  interpolant<float4, interpolation::perspective> clip_position [[user(msaa_clip_position)]];
 };
 
 struct D3DALLOYMSAALineInput {
   float4 position [[position]];
-  interpolant<float, interpolation::no_perspective> ndc_depth [[user(msaa_ndc_depth)]];
   float2 start [[user(msaa_line_start)]];
   float2 end [[user(msaa_line_end)]];
   float2 depth_pair [[user(msaa_line_depth_pair)]];
@@ -597,6 +596,10 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
   return {xy.x < 8 && xy.y < 8 ? 1u : 0u, coverage};
 }
 
+inline float msaa_ndc_depth(float4 clip_position) {
+  return clip_position.z / clip_position.w;
+}
+
 [[fragment]] D3DALLOYMSAAMarker msaa_gather_depth(
     D3DALLOYMSAANoPixelInput input [[stage_in]], uint native_coverage [[sample_mask]],
     constant D3DALLOYMSAATile &tile [[buffer(23)]],
@@ -604,8 +607,8 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
     device uint *records [[buffer(21)]]) {
   float depths[8];
   for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample)
-    depths[sample] = input.ndc_depth.interpolate_at_sample(sample);
-  return msaa_gather_depth_impl(input.position, input.ndc_depth.interpolate_at_center(), depths,
+    depths[sample] = msaa_ndc_depth(input.clip_position.interpolate_at_sample(sample));
+  return msaa_gather_depth_impl(input.position, msaa_ndc_depth(input.clip_position.interpolate_at_center()), depths,
                                 float2(0), float2(0),
                                 native_coverage, tile, layout, records);
 }
@@ -617,8 +620,8 @@ inline D3DALLOYMSAAMarker msaa_gather_depth_impl(
     device uint *records [[buffer(21)]]) {
   float depths[8];
   for (uint sample = 0; sample < min(tile.sample_count, 8u); ++sample)
-    depths[sample] = input.ndc_depth.interpolate_at_sample(sample);
-  return msaa_gather_depth_impl<true>(input.position, input.ndc_depth.interpolate_at_center(), depths,
+    depths[sample] = msaa_ndc_depth(input.clip_position.interpolate_at_sample(sample));
+  return msaa_gather_depth_impl<true>(input.position, msaa_ndc_depth(input.clip_position.interpolate_at_center()), depths,
                                       float2(0), float2(0), native_coverage, tile, layout, records);
 }
 
@@ -965,14 +968,6 @@ struct D3DalloyClearTextureBufferUInt {
   }
 }
 
-[[kernel]] void query_binary_normalize(
-    device const ulong* source [[buffer(0)]],
-    device ulong* destination [[buffer(1)]],
-    uint pos [[thread_position_in_grid]]
-) {
-  destination[pos] = source[pos] ? 1ul : 0ul;
-}
-
 // D3D12 vertex stream output (see d3d12_command_encoder.hpp StreamOutputDrawData).
 struct D3DALLOYSOElement {
   uint slot;
@@ -1213,6 +1208,7 @@ struct D3DALLOYMSAABoundsParams {
   uint view_layer_offset;
   uint view_offsets_enabled;
   uint primitive_id_offset;
+  uint cull_rows[8];
 };
 
 struct D3DALLOYMSAATileBounds {
@@ -1241,6 +1237,16 @@ struct D3DALLOYMSAATileBounds {
   }
   const uint index_base = params.line_mode ? 20 * primitive + 18
       : params.conservative ? 24 * primitive + 18 : 3 * primitive;
+  for (uint r = 0; r < 8 && params.cull_rows[r]; ++r) {
+    bool4 outside(true);
+    for (uint v = 0; v < count; ++v) {
+      const ulong word = ulong(indices[index_base + v]) * params.record_dwords + params.cull_rows[r] - 1;
+      const device uint *row = vertices + word;
+      const float4 distance = as_type<float4>(uint4(row[0], row[1], row[2], row[3]));
+      outside = outside && !(distance >= 0.0f);
+    }
+    if (any(outside)) { bounds[primitive] = result; return; }
+  }
   const uint first = indices[index_base];
   // Native mesh capture leaves unused primitive slots zeroed. A zero homogeneous
   // position for every vertex cannot survive D3D clipping; do not replay that slot.
@@ -1868,11 +1874,22 @@ static bool so_gs_primitive(uint topology, uint position, uint v, uint run_start
   destination[0] += source[0];
 }
 
+// Metal Boolean guarantees a nonzero visible result. Publish the D3D12
+// canonical 0/1 while combining all intervals contributing to this query.
+[[kernel]] void query_accumulate_binary_visibility(
+    device const ulong* source [[buffer(0)]],
+    device ulong* destination [[buffer(1)]]
+) {
+  destination[0] = (destination[0] | source[0]) != 0;
+}
+
 [[kernel]] void query_accumulate_visibility_batch(
     device const ulong *source [[buffer(0)]], device ulong *destination [[buffer(1)]],
     constant ulong2 *indices [[buffer(2)]], uint i [[thread_position_in_grid]]) {
   const ulong2 pair = indices[i];
-  destination[pair.y] += source[pair.x];
+  const uint slot = uint(pair.y);
+  if (pair.y >> 32) destination[slot] = (destination[slot] | source[pair.x]) != 0;
+  else destination[slot] += source[pair.x];
 }
 
 [[kernel]] void clear_texture_1d_float(

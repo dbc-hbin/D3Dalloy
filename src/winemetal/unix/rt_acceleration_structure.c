@@ -235,6 +235,20 @@ d3dalloy_mtl_handle d3dalloy_as_sidecar_generations(d3dalloy_mtl_handle sidecar)
   return d3dalloy_handle(d3dalloy_sidecar(sidecar).generations);
 }
 
+d3dalloy_mtl_handle d3dalloy_as_sidecar_find_generation(d3dalloy_mtl_handle handle, uint64_t resource_id) {
+  D3DALLOYASSidecar *sidecar = d3dalloy_sidecar(handle);
+  if (!resource_id) return 0;
+  if (sidecar.accelerationStructure.gpuResourceID._impl == resource_id)
+    return d3dalloy_handle(sidecar.accelerationStructure);
+  // A TLAS generation also retains the instance and contribution buffers. Only
+  // the acceleration structure protocol exposes the identity stored in the AS header.
+  for (id object in sidecar.generations)
+    if ([object conformsToProtocol:@protocol(MTLAccelerationStructure)] &&
+        [(id<MTLAccelerationStructure>)object gpuResourceID]._impl == resource_id)
+      return d3dalloy_handle(object);
+  return 0;
+}
+
 int d3dalloy_as_sidecar_allocate(d3dalloy_mtl_handle handle, d3dalloy_mtl_handle device, uint64_t size, uint64_t count) {
   D3DALLOYASSidecar *sidecar = d3dalloy_sidecar(handle);
   if (!sidecar || !size)

@@ -126,7 +126,7 @@ int main() {
   ComPtr<ID3D12CommandAllocator> allocator;
   check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)),
         "CreateCommandAllocator");
-  ComPtr<ID3D12GraphicsCommandList1> list;
+  ComPtr<ID3D12GraphicsCommandList2> list;
   check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
                                   IID_PPV_ARGS(&list)), "CreateCommandList");
 
@@ -316,6 +316,10 @@ float psDepth(uint sample : SV_SampleIndex) : SV_Depth {
           "Create depth pipeline state");
   }
 
+  // Neither unused GPU predicate may affect the following unconditional draw.
+  list->SetPredication(predicateUpload.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+  list->SetPredication(predicateUpload.Get(), sizeof(UINT64), D3D12_PREDICATION_OP_EQUAL_ZERO);
+  list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   list->SetGraphicsRootSignature(root.Get());
   list->SetPipelineState(pso.Get());
   list->OMSetRenderTargets(1, &msaaRtv, FALSE, nullptr);
@@ -361,9 +365,12 @@ float psDepth(uint sample : SV_SampleIndex) : SV_Depth {
   predicateDestination.pResource = predicateTrueMsaa.Get();
   list->CopyTextureRegion(&predicateDestination, 0, 0, 0, &msaaSource, nullptr);
 
+  // Change the predicate after SetPredication but before its first conditional command.
+  list->SetPredication(predicate.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
   transition(list.Get(), predicate.Get(), D3D12_RESOURCE_STATE_PREDICATION,
              D3D12_RESOURCE_STATE_COPY_DEST);
-  list->CopyBufferRegion(predicate.Get(), 0, predicateUpload.Get(), 0, sizeof(UINT64));
+  const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER overwritePredicate{predicate->GetGPUVirtualAddress(), 0};
+  list->WriteBufferImmediate(1, &overwritePredicate, nullptr);
   transition(list.Get(), predicate.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
              D3D12_RESOURCE_STATE_PREDICATION);
   predicateDestination.pResource = predicateSnapshotMsaa.Get();
@@ -595,7 +602,7 @@ float psDepth(uint sample : SV_SampleIndex) : SV_Depth {
   depthReadback->Unmap(0, &depthWritten);
 
   std::printf("OWNED_D3D12_COPY_RESOLVE_MSAA_PREDICATION_PASS false=7 true=2.5 source_update_unpredicated=1\n");
-  std::printf("OWNED_D3D12_COPY_RESOLVE_PREDICATE_SNAPSHOT_PASS initial_one=1 predicated_write_zero=1 saved_one_executes=1 rebound_zero_skips=1\n");
+  std::printf("OWNED_D3D12_COPY_RESOLVE_PREDICATE_SNAPSHOT_PASS initial_one=1 write_zero_before_first_use=1 saved_one_executes=1 rebound_zero_skips=1\n");
   std::printf("OWNED_D3D12_COPY_RESOLVE_PASS average=2.5 min=1 max=4 guard=99 uav=1 aliasing=1\n");
   std::printf("OWNED_D3D12_COPY_RESOLVE_RGBA_PASS average=2.5,11.5,23,38.5 min=1,10,20,37 max=4,13,26,40 guard=99,98,97,96\n");
   std::printf("OWNED_D3D12_COPY_RESOLVE_DEPTH_STENCIL_PASS depth_min=0.1 depth_max=0.9 stencil_min=10 stencil_max=40 partial=1 plane_preservation=1 predicate_false=1 predicate_true=1\n");

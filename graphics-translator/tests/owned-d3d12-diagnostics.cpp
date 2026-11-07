@@ -73,7 +73,6 @@ void agility_installed_factory(GetInterface get_interface) {
   require(a->GetFlags() == static_cast<D3D12_DEVICE_FACTORY_FLAGS>(7), "agility-flags-roundtrip");
   require(a->CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr) == S_FALSE, "agility-null-device-probe");
   require(a->CreateDevice(nullptr, D3D_FEATURE_LEVEL_10_0, __uuidof(ID3D12Device), &out) == E_INVALIDARG && !out, "agility-low-fl");
-  require(a->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_2, __uuidof(ID3D12Device), &out) == DXGI_ERROR_UNSUPPORTED && !out, "agility-high-fl");
   require(a->CreateDevice(sdk.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), &out) == E_INVALIDARG && !out, "agility-invalid-adapter");
   require(a->GetConfigurationInterface(CLSID_D3D12Tools, __uuidof(ID3D12Tools), &out) == E_NOINTERFACE && !out, "agility-no-fake-tools");
   require(a->GetConfigurationInterface(installed_factory, __uuidof(ID3D12DeviceFactory), &out) == E_NOINTERFACE && !out, "agility-unknown-config-clsid");
@@ -83,6 +82,13 @@ void agility_installed_factory(GetInterface get_interface) {
   settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
   ComPtr<ID3D12Device5> before, after, other, global;
   check(a->CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&before)), "agility-before-config");
+  const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_11_0};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS support{2, levels, D3D_FEATURE_LEVEL_11_0};
+  check(before->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &support, sizeof(support)), "agility-feature-levels");
+  ComPtr<ID3D12Device> high;
+  HRESULT high_hr = a->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_2, IID_PPV_ARGS(&high));
+  require(support.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_12_2 ? high_hr == S_OK && high
+      : high_hr == DXGI_ERROR_UNSUPPORTED && !high, "agility-high-fl");
   ComPtr<ID3D12Debug> debug; check(a->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&debug)), "agility-local-debug");
   debug->EnableDebugLayer();
   settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);

@@ -4332,7 +4332,15 @@ ResourceLowering::guardNullDescriptors(llvm::CallInst *call) {
   if (!handle->texture)
     return llvm::Error::success();
   builder.SetInsertPoint(call);
-  llvm::Value *present = builder.CreateIsNotNull(handle->texture->ResourceHandle);
+  const auto &texture = *handle->texture;
+  // A 3D or multisample descriptor can select a different physical texture;
+  // typed buffers can carry emulation data in place of a native handle.
+  const auto kind = texture.ResourceKindLogical;
+  const bool direct_texture = kind != llvm::air::Texture::texture3d && kind != llvm::air::Texture::texture_buffer &&
+      kind != llvm::air::Texture::texture2d_ms && kind != llvm::air::Texture::texture2d_ms_array;
+  llvm::Value *present = direct_texture && call->getModule()->getModuleFlag("d3dalloy.d3d12.root-signature")
+      ? builder.CreateNot(createTextureIsNull(builder, texture.ResourceHandle))
+      : builder.CreateIsNotNull(texture.ResourceHandle);
   if (handle->texture->EmulationTag)
     present = builder.CreateOr(
         present, builder.CreateTrunc(handle->texture->EmulationTag, builder.getInt1Ty())
@@ -4351,10 +4359,6 @@ ResourceLowering::guardNullDescriptors(llvm::CallInst *call) {
   auto *continuation = call->getParent();
   call->moveBefore(then_term);
   if (!call->getType()->isVoidTy()) {
-    builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
-    auto *merged = builder.CreatePHI(call->getType(), 2);
-    call->replaceUsesWithIf(merged, [&](llvm::Use &use) { return use.getUser() != merged; });
-    merged->addIncoming(call, then_block);
     llvm::Constant *empty = llvm::Constant::getNullValue(call->getType());
     auto *result = llvm::dyn_cast<llvm::StructType>(call->getType());
     if (result && result->hasName() && result->getName().take_front(16) == "dx.types.ResRet." &&
@@ -4366,7 +4370,27 @@ ResourceLowering::guardNullDescriptors(llvm::CallInst *call) {
       fields.back() = builder.getInt32(1);
       empty = llvm::ConstantStruct::get(result, fields);
     }
-    merged->addIncoming(empty, head);
+    // Preserve the original member demand for usesStatus() and for AIR texture
+    // reads. A whole ResRet PHI makes a dead residency result look observable.
+    if (result && llvm::all_of(call->users(), [](llvm::User *user) {
+          auto *extract = llvm::dyn_cast<llvm::ExtractValueInst>(user);
+          return extract && extract->getNumIndices() == 1;
+        })) {
+      for (auto *user : call->users()) {
+        auto *extract = llvm::cast<llvm::ExtractValueInst>(user);
+        auto *merged = llvm::PHINode::Create(extract->getType(), 2, "", continuation->getFirstNonPHI());
+        extract->replaceAllUsesWith(merged);
+        extract->moveBefore(then_term);
+        merged->addIncoming(extract, then_block);
+        merged->addIncoming(empty->getAggregateElement(extract->getIndices()[0]), head);
+      }
+    } else {
+      builder.SetInsertPoint(continuation, continuation->getFirstInsertionPt());
+      auto *merged = builder.CreatePHI(call->getType(), 2);
+      call->replaceAllUsesWith(merged);
+      merged->addIncoming(call, then_block);
+      merged->addIncoming(empty, head);
+    }
   }
   return llvm::Error::success();
 }

@@ -51,7 +51,7 @@ struct IndirectComputeCommandData {
   uint64_t argument_buffer;
   uint64_t predicate;
   uint32_t predicate_op;
-  uint32_t predicate_padding;
+  uint32_t first_command;
   uint64_t static_samplers;
   uint64_t rootsig_qwords;
   uint64_t immutable_constants;
@@ -101,20 +101,35 @@ struct ClosedDescriptorShape {
 };
 struct ClosedDispatchShape : ClosedDescriptorShape {
   bool uses_pass_descriptors = false;
-  small_vector<uint8_t, 4> buffers;
+  uint64_t buffers = 0;
 };
 struct ClosedPassShape : ClosedDescriptorShape {
   explicit ClosedPassShape(const EncoderData *record) : record(record) {}
   const EncoderData *record;
   bool compute_commands_complete = true, dispatch_access_complete = false;
   std::vector<ClosedDispatchShape> dispatches;
+  std::vector<size_t> dispatch_memberships;
 };
 struct RecordingHead : EncoderData {
   ~RecordingHead();
   std::atomic<uint32_t> in_flight{0};
   std::vector<RecordedStateEvent> state_events;
+  const EncoderData *last_implicit_encoder = nullptr;
   std::vector<RecordedBoundary> boundaries;
-  std::vector<Com<ID3D12DescriptorHeap>> descriptor_heaps;
+  struct RetainedDescriptorHeap {
+    Com<ID3D12DescriptorHeap> heap;
+    D3D12_DESCRIPTOR_HEAP_TYPE type;
+    UINT count;
+    uint64_t base = UINT64_MAX; // First needed by a directly indexed root.
+    size_t previous; // One-based link in the command list's lookup bucket.
+
+    RetainedDescriptorHeap(ID3D12DescriptorHeap *object, D3D12_DESCRIPTOR_HEAP_TYPE kind, UINT descriptors, size_t link)
+        : heap(object), type(kind), count(descriptors), previous(link) {}
+    RetainedDescriptorHeap(RetainedDescriptorHeap &&) noexcept = default;
+  };
+  std::vector<RetainedDescriptorHeap> descriptor_heaps;
+  // Heap COM references survive replay even when ordinary shader roots cannot address a sampler heap.
+  bool may_read_sampler_heap = false;
   std::vector<Rc<BufferAllocation>> root_allocations;
   std::unordered_set<BufferAllocation *> root_allocation_set;
   // GPU-selected indirect root/VB addresses cannot be resolved while recording.
@@ -136,6 +151,7 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   friend class MTLD3D12GraphicsCommandListImpl;
   friend struct SimpleCommandContext<MTLD3D12CommandAllocatorImpl>;
   HRESULT SealRecordingPlan();
+  void RemoveOverwrittenClear(EncoderData *before, RenderEncoderData *clear);
 
   D3D12_COMMAND_LIST_TYPE type_;
   std::shared_ptr<std::atomic<uint64_t>> recording_generation_ = std::make_shared<std::atomic<uint64_t>>(0);
@@ -171,6 +187,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   EncoderData *encoder_current = nullptr;
   RecordingHead *recording_head_ = nullptr;
   size_t encoder_count_ = 0;
+  // Recording progress only; queue replay never changes this serial.
+  uint64_t hud_work_serial_ = 0;
 
   // Closed command-list entry pointers may outlive the list object while a
   // queue worker defers CPU encoding behind a future fence signal. Appending a
@@ -178,15 +196,32 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
   owned_graphics::StableSubmissionStorage<RecordingHead> encoder_lists_;
 
   struct CachedICB {
-    WMTIndirectCommandBufferInfo info{};
-    WMTResourceOptions options;
     WMT::Reference<WMT::IndirectCommandBuffer> buffer;
-    uint64_t capacity, resource_id, last_epoch;
-    bool used = false;
+    uint64_t resource_id, last_epoch;
+    uint32_t capacity, used;
   };
-  std::vector<CachedICB> icb_;
-  WMT::Reference<WMT::IndirectCommandBuffer> AcquireICB(WMTIndirectCommandBufferInfo &info,
-      uint64_t count, WMTResourceOptions options);
+  struct ICBPool {
+    std::vector<CachedICB> pages;
+    size_t active = SIZE_MAX;
+    std::map<uint32_t, std::vector<size_t>> available; // partial tails for this recording
+    struct WholePages {
+      std::vector<size_t> indices;
+      size_t unused = 0;
+    };
+    std::map<uint32_t, WholePages> whole; // stable capacity classes across resets
+    size_t indexed_pages = 0;
+
+    void IndexPage(uint32_t remaining, size_t i) {
+      auto fit = available.lower_bound(remaining);
+      if (fit != available.end() && fit->first == remaining) fit->second.push_back(i);
+      else available.emplace_hint(fit, remaining, std::vector<size_t>{i});
+    }
+  };
+  using ICBKey = std::pair<WMTResourceOptions, decltype(NativeIndirectCommandKey(WMTIndirectCommandBufferInfo{}))>;
+  std::map<ICBKey, ICBPool> icb_;
+  template<class Prepare>
+  WMT::Reference<WMT::IndirectCommandBuffer> AcquirePreparedICB(WMTIndirectCommandBufferInfo &info,
+      uint32_t count, WMTResourceOptions options, uint32_t &first_command, bool reuse_only, Prepare prepare);
 
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
   ClearRTV<MTLD3D12CommandAllocatorImpl, WMT4::Compiler, WMT4::Library, WMT4::Function> clear_rtv_;
@@ -212,6 +247,8 @@ class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllo
 
 public:
   uint64_t GetTraceId() const { return trace_id_; }
+  WMT::Reference<WMT::IndirectCommandBuffer> AcquireICB(WMTIndirectCommandBufferInfo &info,
+      uint32_t count, WMTResourceOptions options, uint32_t &first_command);
   RecordedBoundary &RecordBoundary(RecordedBoundaryReason reason) {
     auto *anchor = encoder_current ? encoder_current : encoder_last;
     const auto *command = anchor && anchor->type == EncoderType::Render
@@ -352,6 +389,10 @@ public:
   T *
   AllocatePass() {
     auto p = (new (AllocateCPUHeap(sizeof(T), alignof(T))) T());
+    if constexpr (std::is_same_v<T, ClearEncoderData> || std::is_same_v<T, ResolveEncoderData> ||
+                  std::is_same_v<T, PredicatedTextureCopyEncoderData> ||
+                  std::is_same_v<T, CaptureFrontierEncoderData>)
+      ++hud_work_serial_;
     p->id = owned_graphics::NewObjectId();
     encoder_current = p;
     return p;
@@ -363,15 +404,187 @@ public:
     return (T *)AllocateCPUHeap(sizeof(T) * Count, alignof(T));
   };
 
+  template <bool extend_single = false, typename Wide>
+  bool EncodeDrawRun(WMTPrimitiveType primitive, const Wide &args, wmtdraw_index_binding ib = {},
+                     WMTIndexType index_type = WMTIndexTypeUInt16) {
+    constexpr bool indexed = std::is_same_v<Wide, wmtdraw_indexed_parameters>;
+    constexpr auto type = indexed ? WMTRenderCommandDrawIndexedRun : WMTRenderCommandDrawRun;
+    auto *encoder = static_cast<RenderEncoderData *>(encoder_current);
+    int32_t base = 0;
+    if constexpr (indexed) base = args.base_vertex;
+    auto *run = reinterpret_cast<wmtcmd_render_draw_run *>(encoder->cmd_tail);
+    bool small = (args.count | args.first) <= UINT16_MAX && (args.instances | args.base_instance) <= UINT8_MAX &&
+                 base >= INT16_MIN && base <= INT16_MAX;
+    if constexpr (extend_single)
+      if (run->type == type && !(run->flags & WMTDrawRunSmall)) small = false;
+    uint8_t flags = (small ? WMTDrawRunSmall : 0) | (index_type == WMTIndexTypeUInt32 ? WMTDrawRunIndex32 : 0);
+    size_t stride = small ? sizeof(wmtdraw_small_parameters) : sizeof(Wide);
+    const auto *bound = encoder->draw_run_binding;
+    const bool same_binding = !indexed || (bound && bound->index_buffer == ib.index_buffer &&
+                                           bound->index_offset == ib.index_offset);
+    auto *cursor = static_cast<char *>(ptr_add(cpu_heap_, cpu_heap_offset_));
+    void *slot = nullptr;
+    if (same_binding && run->type == type && run->flags == flags && run->primitive_type == primitive &&
+        run->count < UINT16_MAX && stride < kCPUHeapSize - cpu_heap_offset_ &&
+        static_cast<const char *>(wmt_draw_run_tuples(run)) + stride * run->count == cursor) {
+      const auto &boundaries = recording_head_->boundaries;
+      if (boundaries.empty() || boundaries.back().command != encoder->cmd_tail) {
+        slot = cursor;
+        cpu_heap_offset_ += stride;
+        ++run->count;
+      }
+    }
+    // A nonzero reference must land in this slab and point strictly backwards.
+    auto binding_reference = [&](uintptr_t start) -> uint16_t {
+      const uintptr_t distance = start - reinterpret_cast<uintptr_t>(bound);
+      if (!same_binding || !distance || distance > UINT16_MAX * 8u ||
+          reinterpret_cast<uintptr_t>(bound) < reinterpret_cast<uintptr_t>(cpu_heap_)) return 0;
+      return uint16_t(distance / 8);
+    };
+    if constexpr (extend_single) {
+      if (!slot) {
+        const auto *leaf = encoder->cmd_tail;
+        const auto &boundaries = recording_head_->boundaries;
+        if (!boundaries.empty() && boundaries.back().command == leaf) return false;
+        uint32_t first_count, first_start;
+        int32_t first_base = 0;
+        uint16_t back8 = 0;
+        size_t leaf_bytes;
+        if constexpr (indexed) {
+          uint32_t offset;
+          auto capture = [&](const auto *first) {
+            if (first->primitive_type != primitive || first->index_buffer != ib.index_buffer ||
+                first->index_type != index_type || first->index_buffer_offset < ib.index_offset)
+              return false;
+            offset = uint32_t(first->index_buffer_offset - ib.index_offset);
+            first_count = first->index_count;
+            leaf_bytes = sizeof(*first);
+            return true;
+          };
+          if (leaf->type == WMTRenderCommandDrawIndexedSmall) {
+            if (!capture(reinterpret_cast<const wmtcmd_render_draw_indexed_small *>(leaf))) return false;
+          } else if (leaf->type == WMTRenderCommandDrawIndexedCompact) {
+            const auto *first = reinterpret_cast<const wmtcmd_render_draw_indexed_compact *>(leaf);
+            if (!capture(first)) return false;
+            first_base = first->base_vertex;
+          } else return false;
+          const unsigned shift = index_type == WMTIndexTypeUInt32 ? 2 : 1;
+          if (offset & ((1u << shift) - 1)) return false;
+          first_start = offset >> shift;
+          back8 = binding_reference(reinterpret_cast<uintptr_t>(leaf));
+        } else {
+          if (leaf->type != WMTRenderCommandDrawCompact) return false;
+          const auto *first = reinterpret_cast<const wmtcmd_render_draw_compact *>(leaf);
+          if (first->primitive_type != primitive) return false;
+          first_count = first->vertex_count;
+          first_start = first->vertex_start;
+          leaf_bytes = sizeof(*first);
+        }
+        small &= (first_count | first_start) <= UINT16_MAX && first_base >= INT16_MIN && first_base <= INT16_MAX;
+        if (!small) { flags &= ~WMTDrawRunSmall; stride = sizeof(Wide); }
+        const size_t extra = sizeof(*run) + 2 * stride + (indexed && !back8 ? sizeof(ib) : 0) - leaf_bytes;
+        // Two cold wide indexed leaves are smaller than a run with an embedded binding.
+        if ((indexed && !small && !back8) || reinterpret_cast<const char *>(leaf) + leaf_bytes != cursor ||
+            extra >= kCPUHeapSize - cpu_heap_offset_) return false;
+        run->type = type;
+        run->primitive_type = primitive;
+        run->flags = flags;
+        run->count = 2;
+        run->binding_back8 = back8;
+        slot = run + 1;
+        if constexpr (indexed) {
+          if (!back8) {
+            auto *binding = static_cast<wmtdraw_index_binding *>(slot);
+            *binding = ib;
+            encoder->draw_run_binding = binding;
+            slot = binding + 1;
+          }
+        }
+        if (small)
+          *static_cast<wmtdraw_small_parameters *>(slot) = {uint16_t(first_count), uint16_t(first_start), 1, 0, int16_t(first_base)};
+        else if constexpr (indexed)
+          *static_cast<Wide *>(slot) = {first_count, 1, first_start, 0, first_base};
+        else
+          *static_cast<Wide *>(slot) = {first_count, 1, first_start, 0};
+        slot = static_cast<char *>(slot) + stride;
+        cpu_heap_offset_ += extra;
+      }
+    } else if (!slot) {
+      size_t bytes = sizeof(*run) + stride;
+      uint16_t back8 = 0;
+      if constexpr (indexed) {
+        const auto aligned = (cpu_heap_offset_ + 7) & ~size_t(7);
+        if (aligned + bytes < kCPUHeapSize)
+          back8 = binding_reference(reinterpret_cast<uintptr_t>(cpu_heap_) + aligned);
+        if (!back8) bytes += sizeof(ib);
+      }
+      run = static_cast<wmtcmd_render_draw_run *>(AllocateCPUHeap(bytes, 8));
+      run->type = type;
+      run->primitive_type = primitive;
+      run->flags = flags;
+      run->count = 1;
+      run->binding_back8 = back8;
+      run->next.set(nullptr);
+      encoder->cmd_tail->next.set(run);
+      encoder->cmd_tail = reinterpret_cast<wmtcmd_base *>(run);
+      slot = run + 1;
+      if constexpr (indexed) {
+        if (!back8) {
+          auto *binding = static_cast<wmtdraw_index_binding *>(slot);
+          *binding = ib;
+          encoder->draw_run_binding = binding;
+          slot = binding + 1;
+        }
+      }
+    }
+    if (small)
+      *static_cast<wmtdraw_small_parameters *>(slot) = {uint16_t(args.count), uint16_t(args.first),
+          uint8_t(args.instances), uint8_t(args.base_instance), int16_t(base)};
+    else
+      memcpy(slot, &args, stride);
+    ++hud_work_serial_;
+    return true;
+  }
+
   template <typename cmd_struct>
   cmd_struct &
-  EncodeRenderCommand() {
+  EncodeRenderCommand(size_t payload_bytes = 0) {
     assert(encoder_current->type == EncoderType::Render);
     auto encoder = static_cast<RenderEncoderData *>(encoder_current);
-    auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
+    constexpr bool compact24 = std::is_same_v<cmd_struct, wmtcmd_render_draw_compact> ||
+                               std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed_small>;
+    static_assert(!compact24 || alignof(cmd_struct) <= 8);
+    constexpr auto alignment = compact24 ? 8 : 16;
+    auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct) + payload_bytes, alignment);
+    if constexpr (std::is_same_v<cmd_struct, wmtcmd_render_setviewport> || std::is_same_v<cmd_struct, wmtcmd_render_setviewports>)
+      encoder->fixed_viewports = nullptr;
+    if constexpr (std::is_same_v<cmd_struct, wmtcmd_render_setscissorrect> || std::is_same_v<cmd_struct, wmtcmd_render_setscissorrects>)
+      encoder->fixed_scissors = nullptr;
+    if constexpr (
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_compact> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed_compact> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed_small> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indirect_range> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed_indirect_range> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_indexed_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_meshthreadgroups> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_draw_meshthreadgroups_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_geometry_draw> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_geometry_draw_indexed> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_geometry_draw_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_geometry_draw_indexed_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_tessellation_mesh_draw> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_tessellation_mesh_draw_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_d3dalloy_tessellation_mesh_draw_indexed_indirect> ||
+        std::is_same_v<cmd_struct, wmtcmd_render_executecommands>)
+      ++hud_work_serial_;
     encoder->cmd_tail->next.set(storage);
     encoder->cmd_tail = (wmtcmd_base *)storage;
-    storage->next.set(nullptr);
+    encoder->cmd_tail->next.set(nullptr);
     return *storage;
   }
 
@@ -388,6 +601,7 @@ public:
       // command stays untracked.
       encoder->submission_access_complete = false;
     auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
+    ++hud_work_serial_;
     encoder->cmd_tail->next.set(storage);
     encoder->cmd_tail = (wmtcmd_base *)storage;
     storage->next.set(nullptr);
@@ -400,9 +614,15 @@ public:
     assert(encoder_current->type == EncoderType::Compute);
     auto encoder = static_cast<ComputeEncoderData *>(encoder_current);
     auto storage = (cmd_struct *)AllocateCPUHeap(sizeof(cmd_struct), 16);
+    if constexpr (std::is_same_v<cmd_struct, wmtcmd_compute_dispatch_indirect_range> ||
+                  std::is_same_v<cmd_struct, wmtcmd_compute_dispatch_compact> ||
+                  std::is_same_v<cmd_struct, wmtcmd_compute_dispatch> ||
+                  std::is_same_v<cmd_struct, wmtcmd_compute_dispatch_indirect> ||
+                  std::is_same_v<cmd_struct, wmtcmd_compute_executecommands>)
+      ++hud_work_serial_;
     encoder->cmd_tail->next.set(storage);
     encoder->cmd_tail = (wmtcmd_base *)storage;
-    storage->next.set(nullptr);
+    encoder->cmd_tail->next.set(nullptr);
     return *storage;
   }
 
@@ -495,7 +715,7 @@ public:
   IndirectComputeCommandData *EncodeIndirectComputeCommand(
       MTLD3D12CommandSignature *pCmdSig, MTLD3D12ComputePipelineState *pPSO, size_t MaxCount, bool statistics);
 
-  IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull);
+  IndirectRenderCommandData *EncodeIndirectRenderCommand(MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull, bool reuse_only = false);
 };
 
 } // namespace d3dalloy

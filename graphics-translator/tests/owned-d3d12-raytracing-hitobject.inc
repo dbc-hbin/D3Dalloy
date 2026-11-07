@@ -339,6 +339,16 @@ int runAtomic(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8_t> &
       mode, extendedBad ? "FAIL" : "PASS");
     bad += extendedBad;
   }
+  const UINT64 zero = 0;
+  auto predicate = geometry.upload(&zero, sizeof(zero));
+  const auto culled = runner.run("atomic64-rt-culled", scene.tlas->GetGPUVirtualAddress(),
+    std::vector<stateobj::LaneRay>(1), [&](ID3D12GraphicsCommandList4 *list, D3D12_DISPATCH_RAYS_DESC dispatch) {
+      list->SetPipelineState1(object.Get());
+      list->SetPredication(predicate.Get(), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+      list->DispatchRays(&dispatch);
+      list->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    });
+  bad += !std::all_of(culled.begin(), culled.end(), [](uint32_t word) { return word == UINT32_MAX; });
   if (!bad) std::puts("OWNED_D3D12_RAYTRACING_ATOMIC64_PASS");
   return stateobj::reportCase("atomic64-rt", bad);
 }

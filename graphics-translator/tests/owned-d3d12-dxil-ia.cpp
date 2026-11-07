@@ -566,6 +566,13 @@ int testNonfiniteDistances(ID3D12Device *device, Context &ctx, UINT samples) {
     Cull cullInfVS(uint id : SV_VertexID) {
       Cull v; v.position = position(id); v.distance = asfloat(0x7f800000u); return v;
     }
+    Cull cullNegativeVS(uint id : SV_VertexID) {
+      Cull v; v.position = position(id); v.distance = -1; return v;
+    }
+    Cull cullMixedVS(uint id : SV_VertexID) {
+      Cull v; v.position = position(id); v.distance = id ? -1 : 1; return v;
+    }
+    float4 solidPS() : SV_Target0 { return float4(0, 1, 0, 1); }
     Cull cullNanVS(uint id : SV_VertexID) {
       Cull v; v.position = position(id);
       v.distance = id == 0 ? asfloat(0x7fc00000u) : 1; return v;
@@ -647,6 +654,10 @@ int testNonfiniteDistances(ID3D12Device *device, Context &ctx, UINT samples) {
     bool expectDraw, expectNonfinite, requireNan, sampleIndex;
   };
   constexpr Case cases[] = {
+    {"cull-vs-only-negative", "cullNegativeVS", "solidPS", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+      D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3, false, false, false, false},
+    {"cull-vs-only-mixed", "cullMixedVS", "solidPS", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+      D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3, true, false, false, false},
     {"clip-inf", "clipInfVS", "clipPS", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
       D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3, true, true, false, false},
     {"cull-inf", "cullInfVS", "cullPS", D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,

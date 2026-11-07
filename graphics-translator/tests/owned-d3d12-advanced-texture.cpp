@@ -128,6 +128,12 @@ void runAdvanced(ID3D12Device *device, UINT shape, UINT bits, const wchar_t *sha
     }
     s.MaxAnisotropy = 1; s.ShaderRegister = i; s.MaxLOD = i == 3 ? 0 : D3D12_FLOAT32_MAX; s.MinLOD = i == 4 ? 1 : 0;
     s.MipLODBias = i == 5 ? 1 : 0;
+    // Row 13 normally selects view mip 1 via MinLOD. In the 2D compute
+    // gradient case the same readback must instead be produced by sampler bias.
+    if (i == 4 && shape == 2 && !std::strcmp(operation, "cmpgrad") && !std::strcmp(stage, "cs")) {
+      s.MinLOD = 0;
+      s.MipLODBias = 1;
+    }
   }
   RootSignatureDesc2 rootDesc{2, params, 6, samplers, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
   auto root = createRootSignature(device, rootDesc);

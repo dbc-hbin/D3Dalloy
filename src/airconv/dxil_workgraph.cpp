@@ -53,7 +53,6 @@
 #include "dxbc_converter.hpp"
 #include "dxil_converter.hpp"
 #include "dxil_signature.hpp"
-#include "metallib_writer.hpp"
 #include "nt/air_builder.hpp"
 
 #include "air_workgraph.h"
@@ -566,10 +565,10 @@ class NodeLowering {
 public:
   NodeLowering(
     Module &module, Function &function, const SM50_WG_NODE_COMPILE_DESC &desc, const NodeReflection &node,
-    Value *context, Value *thread_index_flat, Value *group_index, Value *dispatch_thread
+    Value *context, Value *thread_index_flat
   )
       : module(module), function(function), desc(desc), node(node), context(context),
-        thread_flat(thread_index_flat), group_index(group_index), dispatch_thread(dispatch_thread),
+        thread_flat(thread_index_flat),
         i32(Type::getInt32Ty(module.getContext())), i64(Type::getInt64Ty(module.getContext())) {}
 
   Error run();
@@ -586,8 +585,6 @@ private:
   const NodeReflection &node;
   Value *context;
   Value *thread_flat;
-  Value *group_index;
-  Value *dispatch_thread;
   Type *i32;
   Type *i64;
   std::map<Value *, NodeHandle> nodes;
@@ -1244,7 +1241,7 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   if (auto error = LowerStageIO(ctx, no_io))
     return error;
 
-  NodeLowering lowering(module, *function, desc, *node, ctx_words, flat, nullptr, nullptr);
+  NodeLowering lowering(module, *function, desc, *node, ctx_words, flat);
   lowering.input_first = input_first;
   lowering.input_count = input_count;
   if (auto error = lowering.run())
@@ -1263,13 +1260,7 @@ Error compileNode(const SM50_WG_NODE_COMPILE_DESC &desc, SM50CompiledBitcodeInte
   StripDXILArtifacts(module);
   if (verifyModule(module, &errs()))
     return createError("work graph node compilation produced invalid IR");
-  if (auto error = LowerAtomic64Phase(module)) return error;
-  d3dalloy::runOptimizationPasses(module);
-  if (auto error = LowerImmutableConstants(module, compiled))
-    return error;
-  raw_svector_ostream stream(compiled.vec);
-  metallib::MetallibWriter writer;
-  if (auto error = writer.Write(module, stream))
+  if (auto error = FinalizeShader(module, compiled, true))
     return error;
   out.ThreadgroupSize[0] = group[0];
   out.ThreadgroupSize[1] = group[1];

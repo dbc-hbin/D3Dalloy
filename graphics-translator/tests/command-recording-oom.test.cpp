@@ -71,7 +71,7 @@ constexpr bool SUCCEEDED(HRESULT hr) { return hr >= 0; }
 constexpr int D3D12_COMMAND_LIST_TYPE_DIRECT = 0, D3D12_COMMAND_LIST_TYPE_COMPUTE = 2;
 constexpr int D3D12_MESSAGE_ID_UNKNOWN = 0, D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS = 2;
 constexpr int WMTResourceHazardTrackingModeUntracked = 0;
-constexpr int WMTComputeCommandDispatch = 1, WMTComputeCommandDispatchIndirect = 2;
+constexpr int WMTComputeCommandDispatch = 1, WMTComputeCommandDispatchIndirect = 2, WMTComputeCommandDispatchCompact = 3;
 
 namespace WMT { struct Buffer { bool valid = false; explicit operator bool() const { return valid; } }; }
 struct WMTSize { uint64_t width, height, depth; };
@@ -87,11 +87,21 @@ struct EncoderData {
 };
 struct CommandNext { void *value = nullptr; void set(void *pointer) { value = pointer; } };
 struct wmtcmd_base { CommandNext next; };
+struct ClearEncoderData;
+struct ResolveEncoderData;
+struct PredicatedTextureCopyEncoderData;
+struct CaptureFrontierEncoderData;
+struct wmtcmd_compute_executecommands;
+struct wmtcmd_compute_dispatch_indirect_range;
+struct RecordedDispatchAccess { const wmtcmd_base *command{}; };
 struct wmtcmd_compute_dispatch : wmtcmd_base { int type; WMTSize size; };
+struct wmtcmd_compute_dispatch_compact : wmtcmd_base { int type; uint16_t x, y, z; };
 struct wmtcmd_compute_dispatch_indirect : wmtcmd_base {
   int type; WMT::Buffer indirect_args_buffer; uint64_t indirect_args_offset;
 };
 struct ComputeEncoderData : EncoderData {
+  bool dispatch_access_complete = true;
+  std::vector<RecordedDispatchAccess> dispatch_accesses;
   wmtcmd_base cmd_head;
   wmtcmd_base *cmd_tail = &cmd_head;
 };
@@ -145,6 +155,7 @@ struct Device {
   struct Diagnostics { void Validation(int, const char *) {} } diagnostics;
   bool fail_close_buffer = false;
   unsigned removals = 0;
+  bool HasStandardSwizzleTextures() const { return false; }
   HRESULT RemovedReason() const { return S_OK; }
   void ReportRemoval(HRESULT) { ++removals; }
   Device &GetMTLDevice() { return *this; }
@@ -167,6 +178,7 @@ struct Arena {
   RecordingHead head;
   EncoderData *encoder_current = nullptr, *encoder_last = nullptr;
   RecordingHead *recording_head_ = nullptr;
+  uint64_t hud_work_serial_ = 0;
   size_t encoder_count_ = 0;
   struct CachedICB {bool used=false;};
   std::vector<CachedICB> icb_;
@@ -238,7 +250,11 @@ struct MTLD3D12GraphicsCommandListImpl : RecordingInterface {
   bool owned_closed_valid = false, predication_enabled_ = false;
   uint64_t owned_id = 1, owned_recording = 1;
   uint64_t async_targets_epoch_ = 0;
-  struct Pipeline { bool uses_atomic64 = false; } pipeline;
+  struct Pipeline { bool uses_atomic64 = false, uses_ray_query = false; } pipeline;
+  enum class HUDStatistic { Dispatch };
+  struct HUDRecordingScope {
+    HUDRecordingScope(MTLD3D12GraphicsCommandListImpl &, HUDStatistic, UINT, bool) {}
+  };
   Pipeline *pso_compute_ = &pipeline;
 
   MTLD3D12GraphicsCommandListImpl(Arena &arena, Device &device) : allocator_(&arena), device_(&device), entry(&arena.head) {
@@ -247,7 +263,8 @@ struct MTLD3D12GraphicsCommandListImpl : RecordingInterface {
   template <typename... Args> bool RecordBundle(Args...) { return false; }
   bool RejectDispatchInRenderPass() { return false; }
   uint64_t PreparePredicatedArguments(const void *, size_t) { return 0; }
-  bool PreDispatch() {
+  void DiscardPendingPredicate() { assert(!predication_enabled_); }
+  bool PreDispatch(bool, RecordedDispatchAccess *) {
     if (!allocator_->encoder_current) {
       auto *pass = allocator_->AllocatePass<ComputeEncoderData>();
       pass->type = EncoderType::Compute;
@@ -267,19 +284,24 @@ struct SignalTask {
 struct Queue {
   Device *device_;
   uint64_t owned_id_ = 1;
-  struct Inflight { std::vector<SignalTask> fence_completions; } inflight;
+  struct Inflight {
+    std::vector<SignalTask> fence_completions;
+    uint64_t swizzle_predecessor = 0;
+  } inflight;
+  void LoadSwizzleCarry(Inflight &) {}
   bool retire_on_commit = false;
   explicit Queue(Device &device) : device_(&device) {}
   struct CommittingScope {
     Queue *queue;
     Inflight &inflight;
     uint64_t seq = 1;
+    bool publish_swizzle_carry = false;
+    CommittingScope(Queue *q, bool, std::nullptr_t, bool) : queue(q), inflight(q->inflight) {}
     ~CommittingScope() {
       owned_graphics::submission_committed = true;
       if (queue->retire_on_commit) inflight.fence_completions.clear();
     }
   };
-  CommittingScope StartCommitting() { return {this, inflight}; }
 
 #include PRODUCTION_SIGNAL_BATCH
 };

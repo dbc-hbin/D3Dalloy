@@ -331,6 +331,7 @@ struct YaaglFgParams {
     uint2 depthSourceExtent;
     uint depthDilation;
     uint depthInverted;
+    uint copyMotion;
 };
 
 static uint2 fg_source_position(uint2 tid, uint2 extent, uint2 sourceExtent) {
@@ -453,12 +454,19 @@ kernel void yaagl_fg_normalize_depth_motion(
     texture2d<float, access::read> sourceDepth [[texture(4)]],
     constant YaaglFgParams& params [[buffer(0)]],
     uint2 tid [[thread_position_in_grid]]) {
+    // Native interpolation samples beyond the active content near its border.
+    if (any(tid >= params.extent)) {
+        depth.write(float4(0.0f), tid);
+        destination.write(half4(0.0h), tid);
+        return;
+    }
     uint2 depthPosition = fg_depth_position(tid, sourceDepth, params);
     float4 depthValue = sourceDepth.read(params.sceneOrigin + depthPosition);
     depth.write(depthValue, tid);
     uint2 mv = params.depthDilation ? fg_source_position(depthPosition, params.depthSourceExtent, params.sourceExtent)
                                     : fg_source_position(tid, params.extent, params.sourceExtent);
-    destination.write(fg_normalized_motion(fg_object_motion(source, mv, params), tid, depthValue.r, params), tid);
+    destination.write(params.copyMotion ? half4(source.read(uint2(params.sourceOrigin) + mv)) :
+        fg_normalized_motion(fg_object_motion(source, mv, params), tid, depthValue.r, params), tid);
 }
 
 // Exact doubling uses a fixed four-texel loop.

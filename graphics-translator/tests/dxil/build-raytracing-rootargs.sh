@@ -7,3 +7,5 @@ wine=$1 dxc=$2 prefix=$3 out=$4
 here=$(cd "$(dirname "$0")" && pwd)
 WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T lib_6_5 \
   "$here/raytracing-rootargs.hlsl" -Fo "$out/raytracing-rootargs.dxil" >/dev/null
+WINEPREFIX=$prefix WINEDEBUG=-all "$wine" "$dxc" -nologo -HV 2021 -T cs_6_0 -E TransitionCompute \
+  -D TRANSITION_COMPUTE=1 "$here/raytracing-rootargs.hlsl" -Fo "$out/raytracing-transition-cs.dxil" >/dev/null

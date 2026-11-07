@@ -5,6 +5,7 @@
 // point into allocations retained by GraphExecution until actual retirement.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
+#include <metal_command_buffer>
 #else
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +78,12 @@ struct WorkGraphSchedulerParams {
   WorkGraphSchedulerUInt Depth;
   WorkGraphSchedulerUInt BatchOffset;
   WorkGraphSchedulerUInt SharingOffset;
+#ifdef __METAL_VERSION__
+  metal::command_buffer Commands;
+#else
+  uint64_t Commands;
+#endif
+  WorkGraphSchedulerAddress Roots, Samplers;
 };
 
 struct WorkGraphSchedulerNode {
@@ -97,6 +104,13 @@ struct WorkGraphSchedulerNode {
   WorkGraphSchedulerUInt GroupLimit; // 1 nonterminal, 65535 terminal, 32 atomic64 terminal.
   WorkGraphSchedulerUInt DrainOffset, DrainCount; // Sorted distinct live targets in Targets[].
   WorkGraphSchedulerUInt Reserved[2];
+#ifdef __METAL_VERSION__
+  metal::compute_pipeline_state Pipeline;
+#else
+  uint64_t Pipeline;
+#endif
+  WorkGraphSchedulerAddress Constants;
+  WorkGraphSchedulerUInt Threads[3];
 };
 
 struct WorkGraphSchedulerQueueTemplate {
@@ -174,11 +188,11 @@ struct WorkGraphSchedulerContext {
 };
 
 #ifndef __METAL_VERSION__
-static_assert(sizeof(WorkGraphSchedulerParams) == 112 && alignof(WorkGraphSchedulerParams) == 8);
+static_assert(sizeof(WorkGraphSchedulerParams) == 136 && offsetof(WorkGraphSchedulerParams, Commands) == 112);
 static_assert(offsetof(WorkGraphSchedulerParams, LevelStride) == 88);
 static_assert(offsetof(WorkGraphSchedulerParams, NodeCount) == 96);
 static_assert(offsetof(WorkGraphSchedulerParams, SharingOffset) == 108);
-static_assert(sizeof(WorkGraphSchedulerNode) == 96 && alignof(WorkGraphSchedulerNode) == 8);
+static_assert(sizeof(WorkGraphSchedulerNode) == 128 && offsetof(WorkGraphSchedulerNode, Pipeline) == 96);
 static_assert(offsetof(WorkGraphSchedulerNode, Grid) == 16);
 static_assert(offsetof(WorkGraphSchedulerNode, DynamicOffset) == 40);
 static_assert(offsetof(WorkGraphSchedulerNode, TargetOffset) == 60);

@@ -72,7 +72,8 @@ int rays(Runner &run, ID3D12Device5 *device5, Context &ctx, const std::vector<ui
   hits[2].HitGroupExport = L"RQSIntersectionGroup";
   hits[2].IntersectionShaderImport = L"RQSIntersection";
   hits[2].Type = D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE;
-  D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{4, 8};
+  // Every export uses a four-byte payload; the configured transport capacity is deliberately larger.
+  D3D12_RAYTRACING_SHADER_CONFIG shaderConfig{32, 8};
   D3D12_RAYTRACING_PIPELINE_CONFIG pipelineConfig{1};
   ID3D12RootSignature *root = run.root();
   D3D12_STATE_SUBOBJECT subobjects[] = {

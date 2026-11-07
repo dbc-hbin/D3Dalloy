@@ -2,9 +2,13 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/OptimizationLevel.h"
 
+namespace llvm { class IRBuilderBase; }
+
 namespace d3dalloy {
 
 void initializeModule(llvm::Module &M);
+
+llvm::Value *createTextureIsNull(llvm::IRBuilderBase &builder, llvm::Value *texture);
 
 void runOptimizationPasses(llvm::Module &M);
 void lowerBoundedLoads(llvm::Module &M);

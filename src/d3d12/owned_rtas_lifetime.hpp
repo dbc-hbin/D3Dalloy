@@ -80,6 +80,9 @@ public:
     std::optional<typename Pending::iterator> pending;
     uint32_t encoded_token = 0;
     uint64_t encoded_queue = 0;
+    uint64_t encoded_submission = 0;
+    uint64_t pending_writes = 0;
+    bool retired_writer = false;
   };
 
   /** A submission id, handed out when a submission starts and retired when it completes. */
@@ -193,29 +196,32 @@ public:
    * An unknown token or zero queue invalidates any earlier execution evidence for the address.
    */
   Payload *
-  RecordEncoding(const Key &key, uint32_t token, uint64_t queue) {
+  RecordEncoding(const Key &key, uint32_t token, uint64_t queue, uint64_t submission = 0) {
     auto found = slots_.find(key);
     if (found == slots_.end())
       return nullptr;
     auto &slot = found->second;
     ClearEncoding(slot);
+    if (submission) ++slot.pending_writes;
     if (!token || !queue)
       return nullptr;
     for (auto &version : slot.versions) {
       if (version.token == token) {
         slot.encoded_token = token;
         slot.encoded_queue = queue;
+        slot.encoded_submission = submission;
         return &version.payload;
       }
     }
     return nullptr;
   }
 
-  /** Only a still-retained version last encoded on this exact queue is a FIFO predecessor. */
+  /** A foreign queue can use a writer only after its exact submission retired in isolation. */
   const Payload *
   FindEncoded(const Key &key, uint64_t queue) const {
     auto found = slots_.find(key);
-    if (!queue || found == slots_.end() || found->second.encoded_queue != queue || !found->second.encoded_token)
+    if (!queue || found == slots_.end() || !found->second.encoded_token ||
+        (found->second.encoded_queue != queue && !found->second.retired_writer))
       return nullptr;
     for (const auto &version : found->second.versions)
       if (version.token == found->second.encoded_token)
@@ -271,6 +277,7 @@ public:
     if (found == slots_.end())
       return false;
     bool matched = false;
+    if (token != found->second.encoded_token) found->second.retired_writer = false;
     for (auto &version : found->second.versions) {
       const bool was_live = version.live;
       version.live = version.token == token;
@@ -301,6 +308,16 @@ public:
       const uint32_t observed = read_token(lease.first);
       if (observed)
         Observe(lease.first, observed);
+      auto slot = slots_.find(lease.first);
+      if (slot != slots_.end() && slot->second.pending_writes) {
+        auto &s = slot->second;
+        --s.pending_writes;
+        // Replays may write the same token. The GPU mirror alone cannot
+        // distinguish them; require the last actual encoder's submission and
+        // no earlier writer that could still replace its bytes.
+        s.retired_writer = !s.pending_writes && id == s.encoded_submission &&
+            observed && observed == s.encoded_token;
+      }
     }
     for (const auto &[key, token] : leases) {
       auto found = slots_.find(key);
@@ -395,6 +412,8 @@ private:
   ClearEncoding(Slot &slot) {
     slot.encoded_token = 0;
     slot.encoded_queue = 0;
+    slot.encoded_submission = 0;
+    slot.retired_writer = false;
   }
 
   /**

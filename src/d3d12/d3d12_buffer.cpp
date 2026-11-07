@@ -79,6 +79,7 @@ public:
       desc_.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
     }
 
+    uint64_t placement_size = 0;
     if (pHeap) {
       auto size_and_align = device_->GetMTLDevice().heapBufferSizeAndAlign(desc_.Width, {});
       const UINT64 heap_size = pHeap->GetDesc().SizeInBytes;
@@ -86,6 +87,7 @@ public:
               Offset, size_and_align.size, heap_size, desc_.Alignment, size_and_align.align
           ))
         return E_INVALIDARG;
+      placement_size = size_and_align.size;
     }
 
     try {
@@ -132,6 +134,10 @@ public:
     }
     if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;
+    buffer->current()->d3d12_gpu_only = !IsCpuVisibleHeap(&heap_props_) &&
+        !share && !(pHeap && pHeap->external_memory);
+    if (pHeap && pHeap->placement_ranges)
+      buffer->current()->exclusivePlacement = pHeap->placement_ranges->Register(Offset, placement_size);
     owns_registration_ = !pHeap;
     HRESULT hr = device_->RegisterResidencyAndVA(
         buffer->current(), owns_registration_ ? this : nullptr,
@@ -317,7 +323,7 @@ public:
       hr = BuildBufferSlice(desc_.Width, ViewDesc.Buffer.FirstElement, ViewDesc.Buffer.NumElements, Stride, false, Slice);
       if (FAILED(hr))
         return hr;
-      return Heap->AddShaderResourceView(Index, buffer.ptr(), Slice);
+      return Heap->AddShaderResourceView(Index, owned_id, buffer.ptr(), Slice);
     }
 
     MTL_DXGI_FORMAT_DESC Format;
@@ -334,7 +340,7 @@ public:
                             12, true, Slice);
       if (FAILED(hr))
         return hr;
-      return Heap->AddRGB32ShaderResourceView(Index, buffer.ptr(), Slice, ViewDesc.Shader4ComponentMapping);
+      return Heap->AddRGB32ShaderResourceView(Index, owned_id, buffer.ptr(), Slice, ViewDesc.Shader4ComponentMapping);
     }
     const auto read_capability = device_->GetMTLPixelFormatCapability(Format.PixelFormat);
     if ((Format.Flag & (MTL_DXGI_FORMAT_TYPELESS | MTL_DXGI_FORMAT_BC |
@@ -357,7 +363,7 @@ public:
     auto view = buffer->createView(view_descriptor);
     if (!buffer->view(view))
       return E_OUTOFMEMORY;
-    return Heap->AddShaderResourceView(Index, buffer.ptr(), view, Slice);
+    return Heap->AddShaderResourceView(Index, owned_id, buffer.ptr(), view, Slice);
   };
 
   virtual HRESULT STDMETHODCALLTYPE
@@ -404,7 +410,7 @@ public:
       if (FAILED(hr))
         return hr;
       if (!pCounter)
-        return Heap->AddUnorderedAccessView(Index, buffer.ptr(), Slice, nullptr, 0);
+        return Heap->AddUnorderedAccessView(Index, owned_id, buffer.ptr(), Slice, nullptr, 0, 0);
 
       auto Counter = static_cast<MTLD3D12Resource *>(pCounter);
       if (!Counter->buffer || (ViewDesc.Buffer.CounterOffsetInBytes % D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT))
@@ -414,7 +420,7 @@ public:
           sizeof(UINT) > counter_desc.Width - ViewDesc.Buffer.CounterOffsetInBytes)
         return E_INVALIDARG;
       return Heap->AddUnorderedAccessView(
-          Index, buffer.ptr(), Slice, Counter->buffer.ptr(), ViewDesc.Buffer.CounterOffsetInBytes
+          Index, owned_id, buffer.ptr(), Slice, Counter->buffer.ptr(), ViewDesc.Buffer.CounterOffsetInBytes, Counter->owned_id
       );
     }
 
@@ -448,7 +454,7 @@ public:
     auto view = buffer->createView(view_descriptor);
     if (!buffer->view(view))
       return E_OUTOFMEMORY;
-    return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice);
+    return Heap->AddUnorderedAccessView(Index, owned_id, buffer.ptr(), view, Slice);
   };
 
   virtual HRESULT STDMETHODCALLTYPE

@@ -4900,6 +4900,7 @@ public:
       EmitST([state](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
         cmd.type = WMTRenderCommandSetRasterizerState;
+        cmd.changed = WMTRasterAll;
         state->SetupRasterizerState(cmd);
       });
     }

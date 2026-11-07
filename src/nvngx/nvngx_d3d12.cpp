@@ -36,9 +36,14 @@ namespace {
 __attribute__((used)) static const char kOwnedNgxD3D12Marker[] = "own-ngxd3d12";
 
 constexpr uint32_t kFeatureSuperSampling = 1;
+constexpr uint32_t kFeatureSpatial = 9;
 constexpr uint32_t kFeatureFrameGeneration = 11;
 constexpr uint32_t kFeatureRayReconstruction = 13;
 constexpr uint32_t kRayReconstructionFlag = 256; // Owned transport selector, not a public DLSS flag.
+bool supportedFeature(unsigned int feature) {
+  return feature == kFeatureSuperSampling || feature == kFeatureSpatial || feature == kFeatureFrameGeneration ||
+      feature == kFeatureRayReconstruction;
+}
 constexpr auto kSupportAdapterUnsupported = static_cast<NVNGX_FEATURE_SUPPORT_RESULT>(4);
 constexpr uint32_t kSupportedCreateFlags =
     NVNGX_DLSS_FLAG_HDR | NVNGX_DLSS_FLAG_MV_LOWRES | NVNGX_DLSS_FLAG_DEPTH_INVERTED |
@@ -406,7 +411,7 @@ makeCapabilityParameters() {
   // the capability map must not pre-enable it for callers that never asked.
   out->Set("DLSS.Enable.Output.Subrects", 0);
   out->Set("RTXValue", 0);
-  bool fg = false, rr = false;
+  bool fg = false, rr = false, spatial = false;
   {
     std::lock_guard lock(g_mutex);
     for (const auto &[identity, entry] : g_devices) {
@@ -414,12 +419,14 @@ makeCapabilityParameters() {
       if (SUCCEEDED(entry.extension->SupportsTemporalFeature(512, &supported))) fg |= supported != FALSE;
       supported = FALSE;
       if (SUCCEEDED(entry.extension->SupportsTemporalFeature(kRayReconstructionFlag, &supported))) rr |= supported != FALSE;
+      supported = FALSE;
+      if (SUCCEEDED(entry.extension->SupportsTemporalFeature(WMTMetal4FXSpatialFlag, &supported))) spatial |= supported != FALSE;
     }
   }
   for (const auto &[name, available] : {std::pair{"FrameGeneration", fg}, std::pair{"SuperSamplingDenoising", rr},
        std::pair{"InPainting", false}, std::pair{"ImageSuperResolution", false},
        std::pair{"SlowMotion", false}, std::pair{"VideoSuperResolution", false},
-       std::pair{"ImageSignalProcessing", false}, std::pair{"DeepResolve", false}, std::pair{"DeepDVC", false}}) {
+       std::pair{"ImageSignalProcessing", spatial}, std::pair{"DeepResolve", false}, std::pair{"DeepDVC", false}}) {
     std::string prefix(name);
     out->Set((prefix + ".Available").c_str(), available ? 1u : 0u);
     out->Set((prefix + ".FeatureInitResult").c_str(), static_cast<unsigned int>(available ? kResultSuccess : kResultFeatureNotSupported));
@@ -427,6 +434,7 @@ makeCapabilityParameters() {
     out->Set((prefix + ".MinDriverVersionMajor").c_str(), 0u);
     out->Set((prefix + ".MinDriverVersionMinor").c_str(), 0u);
   }
+  out->Set("#\x09", spatial ? 1u : 0u);
   out->Set("DLSSG.MultiFrameCountMax", 1u);
   out->Set("DLSSDOptimalSettingsCallback", reinterpret_cast<void *>(&optimalSettingsCallback));
   out->Set("DLSSDGetStatsCallback", reinterpret_cast<void *>(&statsCallback));
@@ -434,7 +442,7 @@ makeCapabilityParameters() {
 }
 
 NVNGX_RESULT
-parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC *desc) {
+parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPSCALE_D3D12_CREATE_DESC *desc, bool spatial) {
   if (!params || !device || !desc)
     return kResultInvalidParameter;
   *desc = {};
@@ -449,6 +457,14 @@ parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPS
     return result;
   if (!desc->InputWidth || !desc->InputHeight || !desc->OutputWidth || !desc->OutputHeight)
     return kResultInvalidParameter;
+  desc->CreationNodeMask = getOptionalUInt(params, "CreationNodeMask", 1u);
+  desc->VisibilityNodeMask = getOptionalUInt(params, "VisibilityNodeMask", 1u);
+  if (!deviceMaskValid(device, desc->CreationNodeMask) || !deviceMaskValid(device, desc->VisibilityNodeMask))
+    return kResultInvalidParameter;
+  if (spatial) {
+    desc->FeatureFlags = WMTMetal4FXSpatialFlag;
+    return kResultSuccess;
+  }
 
   const int flags = getOptionalInt(params, NVNGX_Parameter_DLSS_Feature_Create_Flags, 0);
   if (flags < 0)
@@ -463,10 +479,6 @@ parseCreate(const ParametersImpl *params, ID3D12Device *device, MTL_TEMPORAL_UPS
   if (subrects != 0 && subrects != 1)
     return kResultInvalidParameter;
   desc->OutputSubrectsEnabled = subrects ? TRUE : FALSE;
-  desc->CreationNodeMask = getOptionalUInt(params, "CreationNodeMask", 1u);
-  desc->VisibilityNodeMask = getOptionalUInt(params, "VisibilityNodeMask", 1u);
-  if (!deviceMaskValid(device, desc->CreationNodeMask) || !deviceMaskValid(device, desc->VisibilityNodeMask))
-    return kResultInvalidParameter;
   return kResultSuccess;
 }
 
@@ -482,6 +494,13 @@ parseFrame(
     return result;
   if (auto result = getRequiredResource(params, NVNGX_Parameter_Output, &desc->Output); result != kResultSuccess)
     return result;
+  if (feature.kind == kFeatureSpatial) {
+    desc->InputContentWidth = getOptionalUInt(params, "Rect.W", feature.create.InputWidth);
+    desc->InputContentHeight = getOptionalUInt(params, "Rect.H", feature.create.InputHeight);
+    desc->ColorBaseX = getOptionalUInt(params, "Rect.X", 0);
+    desc->ColorBaseY = getOptionalUInt(params, "Rect.Y", 0);
+    return kResultSuccess;
+  }
   if (auto result = getRequiredResource(params, NVNGX_Parameter_Depth, &desc->Depth); result != kResultSuccess)
     return result;
   if (auto result = getRequiredResource(params, NVNGX_Parameter_MotionVectors, &desc->MotionVector); result != kResultSuccess)
@@ -575,6 +594,15 @@ parseRayReconstructionFrame(const ParametersImpl *params, const FeatureState &fe
   if (result != kResultSuccess) return result;
   frame.RoughnessPacked = feature.roughness_packed; frame.DepthLinear = feature.depth_linear;
   frame.ExposureTexture = nullptr; frame.PreExposure = 1;
+  // RR slot 6 carries a premultiplied RGBA overlay. A transparency mask or
+  // independent per-channel opacity cannot use the native overlay's alpha.
+  if (frame.TransparencyMask || getOptionalResource(params, "DLSS.TransparencyLayerOpacity"))
+    return kResultUnsupportedParameter;
+  if (frame.CompositionBaseX || frame.CompositionBaseY) return kResultInvalidParameter;
+  frame.TransparencyMask = getOptionalResource(params, "DLSS.TransparencyLayer");
+  frame.CompositionBaseX = getOptionalUInt(params, "DLSS.TransparencyLayer.Subrect.Base.X", 0);
+  frame.CompositionBaseY = getOptionalUInt(params, "DLSS.TransparencyLayer.Subrect.Base.Y", 0);
+  if (!frame.TransparencyMask && (frame.CompositionBaseX || frame.CompositionBaseY)) return kResultInvalidParameter;
   auto responsivity = getOptionalResource(params, "DLSSD.ResponsivityMask");
   const UINT responsivity_x = getOptionalUInt(params, "DLSSD.ResponsivityMask.Subrect.Base.X", 0);
   const UINT responsivity_y = getOptionalUInt(params, "DLSSD.ResponsivityMask.Subrect.Base.Y", 0);
@@ -1146,7 +1174,7 @@ NVSDK_NGX_D3D12_GetScratchBufferSize(unsigned int feature, const NVNGXParameter 
   if (!out_size)
     return kResultInvalidParameter;
   *out_size = 0;
-  if (feature != kFeatureSuperSampling && feature != kFeatureFrameGeneration && feature != kFeatureRayReconstruction)
+  if (!supportedFeature(feature))
     return kResultFeatureNotSupported;
   return kResultSuccess;
 }
@@ -1161,7 +1189,7 @@ NVSDK_NGX_D3D12_CreateFeature(
   *out_handle = nullptr;
   if (!list || !params)
     return kResultInvalidParameter;
-  if (feature != kFeatureSuperSampling && feature != kFeatureFrameGeneration && feature != kFeatureRayReconstruction)
+  if (!supportedFeature(feature))
     return kResultFeatureNotSupported;
 
   Com<IMTLD3D12GraphicsCommandListExt> list_ext = nullptr;
@@ -1196,7 +1224,7 @@ NVSDK_NGX_D3D12_CreateFeature(
     if (!QueryPerformanceFrequency(&state->fg_counter_frequency) ||
         !QueryPerformanceCounter(&state->fg_last_counter)) return kResultPlatformError;
   } else {
-    result = parseCreate(parameter->storage.get(),device.ptr(),&state->create);
+    result = parseCreate(parameter->storage.get(),device.ptr(),&state->create,feature == kFeatureSpatial);
     owned_graphics::Trace("ngx_d3d12_create_parse", ",\"result\":", static_cast<unsigned>(result),
         ",\"input_width\":", state->create.InputWidth, ",\"input_height\":", state->create.InputHeight,
         ",\"output_width\":", state->create.OutputWidth, ",\"output_height\":", state->create.OutputHeight,
@@ -1305,11 +1333,12 @@ NVSDK_NGX_D3D12_GetFeatureRequirements(
   requirement->MinHWArchitecture = 0;
   requirement->MinOSVersion[0] = 0;
   const UINT feature = static_cast<UINT>(discovery_info->FeatureID);
-  if (feature != kFeatureSuperSampling && feature != kFeatureFrameGeneration && feature != kFeatureRayReconstruction) {
+  if (!supportedFeature(feature)) {
     return kResultFeatureNotSupported;
   }
   const auto owned_adapter = Com<IMTLDXGIAdapter>::queryFrom(adapter);
-  const UINT flags = feature == kFeatureRayReconstruction ? kRayReconstructionFlag : feature == kFeatureFrameGeneration ? 512u : 0u;
+  const UINT flags = feature == kFeatureSpatial ? WMTMetal4FXSpatialFlag :
+      feature == kFeatureRayReconstruction ? kRayReconstructionFlag : feature == kFeatureFrameGeneration ? 512u : 0u;
   if (!owned_adapter || !WMT4::TemporalFeature::Supports(owned_adapter->GetMTLDevice(),flags))
     return kResultSuccess;
   requirement->FeatureSupported = NVNGX_FEATURE_SUPPORT_RESULT_SUPPORTED;

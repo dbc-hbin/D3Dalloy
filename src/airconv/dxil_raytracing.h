@@ -32,6 +32,7 @@
  * Width/Height/Depth return in the kernel prologue.
  */
 #define SM50_RT_RAYGEN_THREADGROUP_SIZE 64u
+#define SM50_RT_ICB_KERNEL "d3dalloy.rt.icb_dispatch"
 
 #ifdef __cplusplus
 extern "C" {
@@ -124,6 +125,16 @@ struct SM50_RT_EXPORT {
   uint64_t LocalRootSignatureSize;
 };
 
+/* Only for growable state objects. Parent is the immutable compiler artifact of
+ * the exact inherited prefix. Result is owned by the caller through SM50DestroyBitcode. */
+struct SM50_RT_INCREMENTAL {
+  sm50_bitcode_t Parent;
+  sm50_bitcode_t Result;
+  uint64_t RetainedBytes;
+  uint32_t InheritedCount;
+  uint32_t Reused;
+};
+
 struct SM50_RT_PIPELINE_DESC {
   const struct SM50_RT_LIBRARY *Libraries;
   uint32_t LibraryCount;
@@ -147,6 +158,7 @@ struct SM50_RT_PIPELINE_DESC {
   /** Caller-owned name storage, retained while consuming function reflection (also WoW64-safe). */
   char *FunctionNames;
   uint64_t FunctionNamesSize;
+  struct SM50_RT_INCREMENTAL *Incremental;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -250,6 +262,9 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
   uint32_t PipelineToken;
   /** Immutable constant-pool GPU address, retained by the dispatched pipeline. */
   uint64_t ImmutableConstants;
+  /* The ICB binds these adjacent Metal resource IDs as a separate argument buffer. */
+  uint64_t IntersectionFunctionTable;
+  uint64_t VisibleFunctionTable;
 };
 
 /**
@@ -281,13 +296,10 @@ struct SM50_RT_DISPATCH_ARGUMENTS {
  * arguments" or any other substitute.
  */
 struct SM50_RT_FRAME {
-  /** Export index of the shader currently running (visible function slot - 1). */
-  uint32_t RecordIndex;
-  /** Linear dispatch index: DispatchRaysIndex().x + y * DispatchWidth. */
-  uint32_t LinearIndex;
+  /** Grid coordinates shared with hit, miss and callable invocations. */
+  uint32_t DispatchIndex[3];
   /** Current recursion depth, 0 in the raygen. */
   uint32_t Depth;
-  uint32_t Flags;
   /**
    * The local root arguments of the record this invocation runs as: the address of
    * the bytes right after the record's 32 byte identifier in the application's own
@@ -440,6 +452,8 @@ enum SM50_RT_FUNCTION_KIND : uint32_t {
 enum SM50_RT_FUNCTION_FLAG {
   SM50_RT_FUNCTION_FLAG_DISPATCH_ENTRY = 1u,
   SM50_RT_FUNCTION_FLAG_DEVICE_ATOMIC64_PHASE = 2u,
+  SM50_RT_FUNCTION_FLAG_RAY_QUERY = 4u,
+  SM50_RT_FUNCTION_FLAG_ICB_READS_FUNCTION_TABLES = 8u,
 };
 
 struct SM50_RT_FUNCTION_INFO {

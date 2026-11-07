@@ -210,16 +210,6 @@ MDNode *clipPositionInput(unsigned index, LLVMContext &context) {
   });
 }
 
-MDNode *reciprocalWInput(unsigned index, LLVMContext &context) {
-  return MDTuple::get(context, {
-    ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), index)),
-    MDString::get(context, "air.fragment_input"), MDString::get(context, "user(msaa_reciprocal_w)"),
-    MDString::get(context, "air.interpolation_function"), MDString::get(context, "air.no_perspective"),
-    MDString::get(context, "air.arg_type_name"), MDString::get(context, "float"),
-    MDString::get(context, "air.arg_name"), MDString::get(context, "msaa_reciprocal_w")
-  });
-}
-
 MDNode *lineEndpointInput(unsigned index, StringRef name, LLVMContext &context) {
   return MDTuple::get(context, {
     ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(context), index)),
@@ -1396,23 +1386,12 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
       if (originalArgs[i] == coverageOld) coverageArg = i;
   }
   unsigned clipArg = ~0u;
-  unsigned reciprocalWArg = ~0u;
-  if (variant == SM50_MSAA_COVERAGE && positionPull && !line) {
+  if (variant == SM50_MSAA_COVERAGE && ((positionPull && !line) || coarseShading)) {
     clipArg = parameters.size();
     auto *interpolant = StructType::getTypeByName(context, "struct._interpolant_t");
     if (!interpolant) interpolant = StructType::create(context, "struct._interpolant_t");
     parameters.push_back(interpolant->getPointerTo(1));
     metadata.push_back(clipPositionInput(clipArg, context));
-    reciprocalWArg = parameters.size();
-    parameters.push_back(interpolant->getPointerTo(1));
-    metadata.push_back(reciprocalWInput(reciprocalWArg, context));
-  }
-  if (variant == SM50_MSAA_COVERAGE && coarseShading && reciprocalWArg == ~0u) {
-    auto *interpolant = StructType::getTypeByName(context, "struct._interpolant_t");
-    if (!interpolant) interpolant = StructType::create(context, "struct._interpolant_t");
-    reciprocalWArg = parameters.size();
-    parameters.push_back(interpolant->getPointerTo(1));
-    metadata.push_back(reciprocalWInput(reciprocalWArg, context));
   }
   unsigned lineStartArg = ~0u, lineEndArg = ~0u, lineIntervalArg = ~0u;
   if (line && variant == SM50_MSAA_COVERAGE) {
@@ -1743,12 +1722,9 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           PointerType::get(clipType, unsigned(air::AddressSpace::device)));
         conditionalStore(builder, *entry, realWon, pointer, value);
 
-        auto *reciprocalW = entry->getArg(reciprocalWArg);
-        auto reciprocalCenter = module.getOrInsertFunction("air.interpolate_center_no_perspective.f32",
-          FunctionType::get(builder.getFloatTy(), {reciprocalW->getType()}, false));
-        auto *q = location ? interpolateSample(builder, module, "no_perspective", builder.getFloatTy(),
-          reciprocalW, builder.getInt32(location - 1), split, ".f32") :
-          builder.CreateCall(reciprocalCenter, {reciprocalW});
+        // Divide after hardware clipping: W may be zero at an input vertex.
+        auto *q = builder.CreateFDiv(ConstantFP::get(builder.getFloatTy(), 1),
+                                     builder.CreateExtractElement(value, builder.getInt32(3)));
         auto scalarDx = module.getOrInsertFunction("air.dfdx.f32",
           FunctionType::get(builder.getFloatTy(), {builder.getFloatTy()}, false));
         auto scalarDy = module.getOrInsertFunction("air.dfdy.f32",
@@ -2026,7 +2002,7 @@ Error transformPixel(Module &module, const SM50_SHADER_D3D12_MSAA_PIXEL_DATA &op
           constants.push_back({offsets[input.argument], value});
         }
       coarse::capture(builder, module, *entry, scratch, inputWords, position, control, pixel, centerZOffset,
-                      planes, interpolants, entry->getArg(reciprocalWArg), rate, constants,
+                      planes, interpolants, entry->getArg(clipArg), rate, constants,
         [&](unsigned index, Value *xy) {
           // Pull plans and coarse planes are appended together in fragment-input order.
           const auto &plan = pulled[index];

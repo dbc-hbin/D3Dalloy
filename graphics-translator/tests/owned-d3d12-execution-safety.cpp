@@ -639,6 +639,11 @@ void bufferDecay() {
   auto q = queue(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
   auto resource = buffer(dev.Get(), D3D12_HEAP_TYPE_DEFAULT, 256);
   auto readback = buffer(dev.Get(), D3D12_HEAP_TYPE_READBACK, 256);
+  auto upload = buffer(dev.Get(), D3D12_HEAP_TYPE_UPLOAD, 256);
+  void *mapped = nullptr;
+  check(upload->Map(0, nullptr, &mapped), "buffer-initial-map");
+  *static_cast<UINT *>(mapped) = 0xcafebabe;
+  upload->Unmap(0, nullptr);
   auto a = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
   auto b = allocator(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
   auto first = list(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT, a.Get());
@@ -647,6 +652,11 @@ void bufferDecay() {
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   barrier.Transition.pResource = resource.Get();
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  // The helper supplied COPY_DEST to CreateCommittedResource, but the fresh buffer starts in COMMON.
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  first->ResourceBarrier(1, &barrier);
+  first->CopyBufferRegion(resource.Get(), 0, upload.Get(), 0, sizeof(UINT));
   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
   first->ResourceBarrier(1, &barrier);
@@ -662,6 +672,9 @@ void bufferDecay() {
   check(q->Signal(done.Get(), 1), "buffer-decay-signal");
   wait(done.Get(), 1);
   expect(dev->GetDeviceRemovedReason(), S_OK, "buffer-decay-valid");
+  check(readback->Map(0, nullptr, &mapped), "buffer-initial-readback");
+  if (*static_cast<const UINT *>(mapped) != 0xcafebabe) fail("buffer-initial-value");
+  readback->Unmap(0, nullptr);
 }
 void splitCrossCall(bool invalid) {
   auto dev = device();

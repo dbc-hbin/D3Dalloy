@@ -68,6 +68,7 @@ uint64_t d3dalloy_as_sidecar_size(d3dalloy_mtl_handle sidecar);
 int d3dalloy_as_sidecar_allocate(d3dalloy_mtl_handle sidecar, d3dalloy_mtl_handle device, uint64_t native_size, uint64_t instance_count);
 uint64_t d3dalloy_as_sidecar_instance_count(d3dalloy_mtl_handle sidecar);
 d3dalloy_mtl_handle d3dalloy_as_sidecar_generations(d3dalloy_mtl_handle sidecar);
+d3dalloy_mtl_handle d3dalloy_as_sidecar_find_generation(d3dalloy_mtl_handle sidecar, uint64_t resource_id);
 
 /* Compute helpers use an already-open MTLComputeCommandEncoder and the named pipeline state
  * compiled from rt_as_prepass.metal. All handles/offsets are borrowed. */

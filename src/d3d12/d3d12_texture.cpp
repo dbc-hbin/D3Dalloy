@@ -662,6 +662,8 @@ public:
     if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;
 
+    if (pHeap && pHeap->placement_ranges)
+      buffer->current()->exclusivePlacement = pHeap->placement_ranges->Register(heap_offset, native_buffer.size);
     Flags<TextureAllocationFlag> texture_flags;
     if (!volume) texture->rename(texture->allocate(texture_flags));
     if (!texture->current() || !texture->current()->texture())
@@ -762,8 +764,10 @@ public:
     if (desc_.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)
       return InitializeRowMajor(texture_info, pHeap, HeapOffset);
 
+    uint64_t placement_size = 0;
     if (pHeap) {
       auto size_and_align = device_->GetMTLDevice().heapTextureSizeAndAlign(texture_info);
+      placement_size = size_and_align.size;
       const UINT64 heap_size = pHeap->GetDesc().SizeInBytes;
       if (!resource_contract::PlacementFits(
               HeapOffset, size_and_align.size, heap_size, desc_.Alignment, size_and_align.align
@@ -809,6 +813,8 @@ public:
       texture->rename(texture->allocate(flags));
     if (!texture->current() || !texture->current()->texture())
       return shared && share ? E_INVALIDARG : E_OUTOFMEMORY;
+    if (pHeap && pHeap->placement_ranges)
+      texture->current()->exclusivePlacement = pHeap->placement_ranges->Register(HeapOffset, placement_size);
     texture->privateAttachmentStore = !pHeap && !shared && flags.test(TextureAllocationFlag::GpuPrivate) &&
         !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
         desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc_.DepthOrArraySize == 1 && desc_.SampleDesc.Count == 1;
@@ -1032,7 +1038,7 @@ public:
 
     if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D12Object) || riid == __uuidof(ID3D12DeviceChild) ||
         riid == __uuidof(ID3D12Pageable) || riid == __uuidof(ID3D12Resource) ||
-        riid == __uuidof(ID3D12Resource1) || riid == __uuidof(ID3D12Resource2)) {
+        riid == __uuidof(ID3D12Resource1) || riid == __uuidof(ID3D12Resource2) || riid == kOwnedTextureId) {
       *ppvObject = ref(this);
       return S_OK;
     }
@@ -1604,7 +1610,7 @@ public:
 
     const bool cube_view = ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE ||
                            ViewDesc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-    return Heap->AddShaderResourceView(Index, texture.ptr(), View, ResourceMinLODClamp, cube_view,
+    return Heap->AddShaderResourceView(Index, owned_id, texture.ptr(), View, ResourceMinLODClamp, cube_view,
                                       desc_.SampleDesc.Count > 1 && desc_.SampleDesc.Quality == 0xfffffffeu,
                                       sampler_feedback::EmptyViewDefaults(ViewDesc.Format, ViewDesc.Shader4ComponentMapping) |
                                       (texture->reservedVolumeLayoutAddress ?
@@ -1761,7 +1767,7 @@ public:
       View.mip_end = logical_uav_mip + 1;
       View.mip_count = desc_.MipLevels;
     }
-    return Heap->AddUnorderedAccessView(Index, texture.ptr(), View, first_w_slice, w_size,
+    return Heap->AddUnorderedAccessView(Index, owned_id, texture.ptr(), View, first_w_slice, w_size,
         sampler_feedback::EmptyViewDefaults(ViewDesc.Format, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING));
   };
 

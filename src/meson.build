@@ -1,6 +1,7 @@
 winemetal_unix_sources = files(
   'winemetal/unix/winemetal_unix.c',
   'winemetal/unix/winemetal_metal4.c',
+  'winemetal/unix/winemetal_metal4_hud.c',
   'winemetal/unix/winemetal_metal4_pipeline.c',
   'winemetal/unix/winemetal_metal4_query.c',
   'winemetal/unix/winemetal_metal4_fx.mm',

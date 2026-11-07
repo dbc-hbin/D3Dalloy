@@ -17,6 +17,16 @@
 
 namespace d3dalloy::sharing {
 
+struct SharedObjectAccess {
+  static SharedObject *make() { return new SharedObject(); }
+  static void adopt(SharedObject *object, HANDLE section, void *view, const WCHAR *leaf) {
+    object->section_ = section;
+    object->header_ = static_cast<Header *>(view);
+    object->payload_ = static_cast<uint8_t *>(view) + kPayloadOffset;
+    swprintf(object->section_name_, 80, L"Local\\%ls", leaf);
+  }
+};
+
 namespace {
 
 constexpr uint64_t kGranularity = 0x10000;
@@ -50,8 +60,7 @@ MapWhole(HANDLE section, uint64_t &size) {
 }
 
 HRESULT
-OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedObject> &out,
-         SharedObject *(*make)(), bool (*adopt)(SharedObject *, HANDLE, void *, const WCHAR *)) {
+OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedObject> &out) {
   auto leaf = SectionLeafName(section);
   if (leaf.rfind(L"d3dalloy.share.", 0) != 0 || leaf.size() >= 80)
     return E_INVALIDARG;
@@ -85,8 +94,8 @@ OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedOb
     UnmapViewOfFile(header);
     return E_INVALIDARG;
   }
-  std::shared_ptr<SharedObject> object(make());
-  adopt(object.get(), own, header, leaf.c_str());
+  std::shared_ptr<SharedObject> object(SharedObjectAccess::make());
+  SharedObjectAccess::adopt(object.get(), own, header, leaf.c_str());
 
   std::lock_guard<std::mutex> lock(registry_mutex);
   auto &slot = registry[hex.data()];
@@ -100,17 +109,6 @@ OpenMain(HANDLE section, const uint8_t *expected_token, std::shared_ptr<SharedOb
 }
 
 } // namespace
-
-struct SharedObjectAccess {
-  static SharedObject *make() { return new SharedObject(); }
-  static bool adopt(SharedObject *object, HANDLE section, void *view, const WCHAR *leaf) {
-    object->section_ = section;
-    object->header_ = static_cast<Header *>(view);
-    object->payload_ = static_cast<uint8_t *>(view) + kPayloadOffset;
-    swprintf(object->section_name_, 80, L"Local\\%ls", leaf);
-    return true;
-  }
-};
 
 SharedObject::~SharedObject() {
   if (slot_ >= 0) {
@@ -316,7 +314,7 @@ Open(HANDLE handle, std::shared_ptr<SharedObject> &out) {
     return E_INVALIDARG;
   auto leaf = SectionLeafName(handle);
   if (leaf.rfind(L"d3dalloy.share.", 0) == 0)
-    return OpenMain(handle, nullptr, out, SharedObjectAccess::make, SharedObjectAccess::adopt);
+    return OpenMain(handle, nullptr, out);
   if (leaf.rfind(L"d3dalloy.d3d12.", 0) != 0)
     return E_INVALIDARG;
 
@@ -333,7 +331,7 @@ Open(HANDLE handle, std::shared_ptr<SharedObject> &out) {
   HANDLE section = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, copy.section_name);
   if (!section)
     return E_INVALIDARG;
-  HRESULT hr = OpenMain(section, copy.token, out, SharedObjectAccess::make, SharedObjectAccess::adopt);
+  HRESULT hr = OpenMain(section, copy.token, out);
   CloseHandle(section);
   return hr;
 }

@@ -122,7 +122,8 @@ HRESULT CollectAtomic64PhaseBindings(MTLD3D12Device *device, std::span<const Sta
           auto counter = device->LookupDescriptorResource(descriptor.UAVBuffer.counter, descriptor.counter_owner_id);
           if (counter) {
             bindings.resources.push_back(std::move(counter));
-            append_buffer(descriptor.UAVBuffer.counter, {descriptor.UAVBuffer.counter_offset, 4}, true);
+            append_buffer(descriptor.UAVBuffer.counter,
+                {descriptor.counter_page * D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT, 4}, true);
           }
         }
         break;

@@ -127,15 +127,16 @@ struct RecordedBufferAccess {
   uint64_t address, length;
   bool writes;
   uint64_t stages = 0;
+  uint32_t stride = 0, count = 1;
 };
 constexpr size_t kRecordedSubmissionBufferBudget = 64;
-constexpr size_t kRecordedDispatchBudget = 64;
 // Membership in the immutable encoder union, not a second set of COM owners.
 // Descriptor values and physical backing are still resolved for each Execute.
 struct RecordedDispatchAccess {
   const wmtcmd_base *command = nullptr;
   bool complete = false;
-  small_vector<uint8_t, 4> buffers, tables;
+  static_assert(kRecordedSubmissionBufferBudget <= 64);
+  uint64_t buffers = 0, tables = 0;
 };
 struct StandardSwizzleEncoderData : EncoderData {
   // A private COM reference survives the recording's allocator lease through
@@ -210,6 +211,7 @@ struct QueryVisibilityTarget {
   uint32_t index = 0;
   uint64_t source_offset = 0;
   bool reset = false;
+  bool binary = false;
 };
 
 /* Mirrors D3DALLOYSOAssembly in d3dalloy_command.metal (so_index_range / so_assemble). */
@@ -305,8 +307,10 @@ struct MSAAPrimitiveBoundsParams {
   uint32_t view_layer_offset;
   uint32_t view_offsets_enabled;
   uint32_t primitive_id_offset = ~0u;
+  // Offset plus one for each captured float4 cull row. Zero terminates the list.
+  uint32_t cull_rows[8]{};
 };
-static_assert(sizeof(MSAAPrimitiveBoundsParams) == 576);
+static_assert(sizeof(MSAAPrimitiveBoundsParams) == 608);
 
 struct MSAAPrimitiveTileBounds {
   uint32_t left;
@@ -372,7 +376,7 @@ struct IndirectRenderCommandData {
   uint64_t argument_buffer;
   uint64_t predicate;
   uint32_t predicate_op;
-  uint32_t predicate_padding;
+  uint32_t first_command;
   uint64_t static_samplers;
   uint64_t rootsig_qwords;
   uint64_t vertex_constants;
@@ -385,7 +389,8 @@ struct IndirectRenderCommandData {
   uint32_t vertex_argbuf_stride;
   uint64_t index_pull_controls;
   uint32_t index_pull_mode;
-  uint32_t index_pull_padding;
+  uint16_t static_sampler_stages;
+  uint16_t root_argument_stages;
   uint64_t so_draws;
   uint64_t pipeline_statistics;
 };
@@ -487,34 +492,24 @@ struct SOIndirectEncoderData {
 };
 
 /*
- * ExecuteIndirect whose captures are sized from the draw arguments: a VS+HS+DS+GS PSO (tsgs-design) or a VS+GS PSO
- * with stream output. The recording holds render passes that carry only the pipeline state. Per execution the
- * queue runs the GPU argument preflight, waits for it, sizes every command's captures exactly from its GPU-written
- * vertex and instance counts (the same sizes a direct draw of those arguments gets), then injects the per-command
- * draws. TS+GS: pass 1 (VS+HS / DS capture, never rasterized), the compaction dispatches, pass 2 (capture fetch /
- * GS) in API order. GS: one pass (`geometry`). Stream output is assembled per command in API order.
+ * ExecuteIndirect whose captures depend on draw arguments. Detached render templates carry the pipeline state;
+ * CaptureFrontier visits commands, instances and primitive/patch groups using bounded GPU scratch. TS+GS keeps a
+ * parent DS capture while its GS children consume it. Stream output is assembled in API order.
  */
 struct MeshCaptureIndirectData {
   bool domain_only = false;
   SM50_MSAA_MESH_LAYOUT msaa_layout{};
   SOIndirectPreflightParams preflight{};
-  /* Stream output after the GS: the recorded draw (chained per captured stream) whose assembly params live in
-   * `so_template->heap`. Every command copies it with its own scratch, params, control and status; the SO
-   * counters, predicate snapshot and targets stay shared, so commands append in API order. */
+  /* Stream output after the GS: retain the recorded draw chain and its assembly-parameter heap until frontier
+   * preparation copies the stream layouts. Counters, predicate snapshot and targets stay shared in API order. */
   std::shared_ptr<StreamOutputDrawData> so_template;
-  std::vector<StreamOutputAssemblyParams> so_params;  // per chained stream, copied from the recording heap
   WMT::Buffer index_buffer;
-  uint64_t index_offset = 0;
   uint32_t index_view_size = 0;
   WMT::Buffer index_view_heap;
-  uint64_t index_view_offset = 0, index_view_stride = 0, index_view_address = 0;
+  uint64_t index_view_stride = 0, index_view_address = 0;
   WMT::Buffer root_heap, vertex_heap, predicate_heap;
-  uint64_t root_offset = 0, root_stride = 0, vertex_offset = 0, vertex_stride = 0;
+  uint64_t root_stride = 0, vertex_stride = 0;
   uint64_t root_address = 0, vertex_address = 0;
-  const uint8_t *root_memory = nullptr, *vertex_memory = nullptr;
-  std::vector<uint32_t> root_view_offsets;
-  uint32_t vertex_mask = 0;
-  bool update_index = false;
   D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut_value = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
   SM50_TESS_CAPTURE_LAYOUT layout{};
   uint32_t control_points = 0;
@@ -526,7 +521,6 @@ struct MeshCaptureIndirectData {
   uint32_t vertex_per_warp = 0;
   uint32_t warp_increment = 0;
   bool geometry = false;
-  bool indexed = false;
   /* GS over an indexed strip with an active cut, or over a triangle strip with adjacency: before the pass every
    * command is expanded on the GPU into the equivalent list (d3dalloy_mesh_strip_cut, as a direct draw of the same
    * arguments), drawn with the list variant; `topology` is then the strip topology, `vertex_per_warp` and
@@ -535,13 +529,7 @@ struct MeshCaptureIndirectData {
 
   uint32_t strip_vertices_per_primitive = 0;
   WMT::Buffer statistics_buffer;  // IAVertices accounting of the expansion (statistics queries only)
-  uint64_t statistics_offset = 0;
   uint64_t statistics_address = 0;
-  uint64_t max_threadgroups = 0;
-  /* PRIMITIVE_CLAIM statistics: per-command claim headers (command i at statistics_claim_offset + 32 * i), bound
-   * to the fragment stage before each command's rasterizing draw. Empty: none. */
-  WMT::Buffer statistics_claim;
-  uint64_t statistics_claim_offset = 0;
   SM50_STATISTICS_CLAIM_HEADER frontier_statistics_claim{};
 };
 
@@ -638,7 +626,12 @@ struct RenderEncoderData : EncoderData {
   // Every ordinary draw contributes its root/input and reflected table uses.
   // An unresolved or advanced draw permanently excludes the pass.
   bool submission_group_safe = false;
+  bool fixed_indirect = false;
+  BufferAllocation *last_indirect_allocation = nullptr;
+  size_t last_indirect_read = 0;
   uint8_t submission_color_output_mask = 0;
+  uint64_t clean_draw_generation = UINT64_MAX;
+  ID3D12DescriptorHeap *clean_draw_heap = nullptr;
   // Cached masked native PSOs must outlive public PSO/list reset or release.
   small_vector<WMT::Reference<WMT::RenderPipelineState>, 2> masked_pipeline_states;
   bool submission_snapshot_budget = false;
@@ -648,6 +641,11 @@ struct RenderEncoderData : EncoderData {
   bool depth_bounds_active = false;
   // Last depth-stencil state and rasterizer tuple emitted into this encoder's chain (0 / invalid: none yet).
   obj_handle_t fixed_depth_stencil_state = 0;
+  // Last effective arrays point into immutable packets owned by this encoder's allocator.
+  const WMTViewport *fixed_viewports = nullptr;
+  const WMTScissorRect *fixed_scissors = nullptr;
+  UINT fixed_region_count = 0;
+  uint32_t fixed_empty_regions = 0;
   bool fixed_raster_valid = false;
   WMTTriangleFillMode fixed_fill_mode{};
   WMTCullMode fixed_cull_mode{};
@@ -674,6 +672,7 @@ struct RenderEncoderData : EncoderData {
   bool rov_marker_attachmentless = false;
   wmtcmd_render_nop cmd_head;
   wmtcmd_base *cmd_tail;
+  const wmtdraw_index_binding *draw_run_binding = nullptr;
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
   // Descriptor identity only; ordinary passes retain their existing native read-only behavior.
@@ -698,16 +697,15 @@ struct RenderEncoderData : EncoderData {
   std::unique_ptr<MSAADrawData> msaa_draw;
   std::unique_ptr<std::vector<StandardSwizzleTableUse>> swizzle_tables;
   std::vector<Atomic64RootBinding> atomic64_roots;
-  /* Capture-sized ExecuteIndirect: pass 1 or 2 of a TS+GS `capture_indirect`, or 1 (its only pass) of a GS one;
-   * 0: none. The queue appends the per-command draws. */
+  // Immutable capture inputs shared by the detached CaptureFrontier render templates.
   std::shared_ptr<const MeshCaptureIndirectData> capture_indirect;
-  uint8_t capture_indirect_pass = 0;
   bool use_tessellation = 0;
   bool use_geometry = 0;
 };
 
 struct BlitEncoderData : EncoderData {
   bool submission_access_complete = true;
+  bool has_immediate_marker = false;
   size_t submission_copy_count = 0;
   std::vector<RecordedBufferAccess> submission_buffers;
   // Whole-subresource texture copies the planner can describe; every other
@@ -750,6 +748,8 @@ struct Atomic64RayDispatchUse {
 struct ComputeEncoderData : EncoderData {
   bool submission_access_complete = false;
   bool dispatch_access_complete = true;
+  uint64_t clean_dispatch_generation = UINT64_MAX;
+  ID3D12DescriptorHeap *clean_dispatch_heap = nullptr;
   std::vector<RecordedDispatchAccess> dispatch_accesses;
   bool submission_snapshot_budget = false;
   bool submission_root_srv_opaque = false;
@@ -843,16 +843,11 @@ enum class QueryEncoderOp : uint8_t {
   ResolveOcclusion,
   ResolveBinaryOcclusion,
   ResolveTimestamp,
-  /* SO statistics: copy the stream counter pair at `counters`+`counters_offset` into the
-   * heap's Begin snapshot at `source`+`snapshot_offset`. */
-  BeginSOStatistics,
-  /* Write (counter - snapshot) into the heap result at `source`+`start_index`*16. */
-  EndSOStatistics,
-  ResolveSOStatistics,
+  // Stream-output and pipeline statistics use the same snapshot/resolve commands.
+  BeginStatistics,
+  EndStatistics,
+  ResolveStatistics,
   ResetPipelineStatistics,
-  BeginPipelineStatistics,
-  EndPipelineStatistics,
-  ResolvePipelineStatistics,
   /* No query: an in-command-buffer event signal/wait that makes writes through one GPU virtual address
    * visible through every other address aliasing the same memory (sparse tiles sharing a heap page).
    * Metal fences and memory barriers do not; see d3d12_reserved_resource.hpp. */
@@ -873,7 +868,6 @@ struct QueryEncoderData : EncoderData {
   uint32_t start_index = 0;
   uint32_t query_count = 0;
   uint64_t destination_offset = 0;
-  /* Pipeline-statistics ops: bytes per query record (88 for PIPELINE_STATISTICS, 112 for STATISTICS1). */
   uint32_t record_bytes = 0;
 };
 
@@ -898,11 +892,13 @@ struct RTASPostbuildInfo {
 /* One acceleration-structure command. It carries everything the queue needs to run the GPU
  * prepass and then encode the native build/refit/copy on the application's own command buffer. */
 struct RTASEncoderData : EncoderData {
-  RTASComputePipelines pipelines;
+  // Device-owned and immutable once published. All replay is on the owning device's queue.
+  const RTASComputePipelines *pipelines = nullptr;
   raytracing::ShadowPlan shadowPlan;
   raytracing::ShadowMetadata metadata{};
   bool deferredUpdate = false;
-  uint64_t nativeCapacity = 0;
+  raytracing::NativeSizes nativeSizes{};
+  raytracing::BufferLocation refitScratch;
   raytracing::BuildInputs deferredInputs;
   std::vector<WMT::Reference<WMT::Buffer>> ommInputBuffers;
   raytracing::BufferLocation sourceLocation{}, destinationLocation{};

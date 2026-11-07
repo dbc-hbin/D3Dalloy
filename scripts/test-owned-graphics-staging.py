@@ -970,19 +970,22 @@ class StagingPolicyTests(unittest.TestCase):
         for native_arch, abi in (("arm64", "arm64x"), ("x86_64", "x64")):
             subprocess.run(["clang", "-arch", native_arch, str(source), "-o", str(target)],
                            check=True, capture_output=True, timeout=60)
-            for with_fg in (False, True):
+            for with_fg, with_ngx, ngx_observer in ((False, False, False), (True, False, False),
+                                                     (False, True, False), (False, True, True)):
                 wrapper.write_text(stage_owned_graphics.render_wrapper(
-                    arch=architecture(native_arch, abi), with_fsr=with_fg, with_fsr_framegeneration=with_fg))
+                    arch=architecture(native_arch, abi), with_fsr=with_fg, with_fsr_framegeneration=with_fg,
+                    with_nvngx=with_ngx, with_ngx_fg_observer=ngx_observer))
                 wrapper.chmod(0o755)
                 for with_observer in (False, True):
                     for with_audit in (False, True):
-                        with self.subTest(arch=native_arch, fg=with_fg, observer=with_observer, audit=with_audit):
+                        with self.subTest(arch=native_arch, fg=with_fg, ngx=with_ngx, ngx_observer=ngx_observer,
+                                          observer=with_observer, audit=with_audit):
                             environment["OWNED_FG_OBSERVER"] = str(observer) if with_observer else ""
                             environment["OWNED_GRAPHICS_DYLD_AUDIT"] = "1" if with_audit else "0"
                             result = subprocess.run([str(wrapper), "argument with spaces", "-e", "literal=value"],
                                                     env=environment, text=True, capture_output=True, timeout=30)
                             self.assertEqual(result.returncode, 0, result.stderr)
-                            inserted = with_fg and with_observer
+                            inserted = (with_fg or ngx_observer) and with_observer
                             self.assertEqual(result.stdout.splitlines(), [
                                 f"insert={observer if inserted else ''}", f"audit={'1' if with_audit else ''}",
                                 "arg=argument with spaces", "arg=-e", "arg=literal=value"])

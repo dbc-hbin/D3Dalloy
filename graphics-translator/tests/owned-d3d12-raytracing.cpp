@@ -392,6 +392,10 @@ struct Context {
     // Command-list recording errors are sticky in D3D12; Close() must surface them
     // instead of letting a silently rejected DispatchRays look like a pass.
     check(list->Close(), "CommandList::Close");
+    executeAndWait();
+  }
+
+  void executeAndWait() {
     ID3D12CommandList *lists[] = {list.Get()};
     queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++fenceValue;
@@ -1476,6 +1480,7 @@ int testRaytracing(ID3D12Device5 *device5, Context &ctx, const std::vector<uint8
 #include "owned-d3d12-raytracing-asserialize.inc"
 #include "owned-d3d12-raytracing-rayquery.inc"
 #include "owned-d3d12-raytracing-rootargs.inc"
+#include "owned-d3d12-raytracing-transitions.inc"
 #include "owned-d3d12-raytracing-coverage.inc"
 #include "owned-d3d12-raytracing-rayquery-stages.inc"
 #include "owned-d3d12-raytracing-linkage.inc"
@@ -1808,6 +1813,8 @@ int run(int argc, wchar_t **argv) {
     std::fprintf(stderr, "usage: owned-d3d12-raytracing.exe <raytracing.dxil> <raytracing-contract.dxil> "
                          "<raytracing-stateobj.dxil> [further suite DXIL]\n"
                          "       owned-d3d12-raytracing.exe --collection-samplers <raytracing-rootargs.dxil>\n"
+                         "       owned-d3d12-raytracing.exe --transitions <raytracing-rootargs.dxil> "
+                         "<raytracing-transition-cs.dxil>\n"
                          "       owned-d3d12-raytracing.exe --metadata-arena <raytracing-contract.dxil>\n"
                          "       owned-d3d12-raytracing.exe --refit-chain <raytracing-contract.dxil>\n");
     return 2;
@@ -1844,6 +1851,8 @@ int run(int argc, wchar_t **argv) {
   check(device.As(&device5), "QueryInterface(ID3D12Device5)");
 
   Context context(device.Get());
+  if (argc == 4 && std::wcscmp(argv[1], L"--transitions") == 0)
+    return rttransition::run(device5.Get(), context, readFile(argv[2]), readFile(argv[3]));
   if (argc == 3 && std::wcscmp(argv[1], L"--refit-chain") == 0)
     return refitchain::runAll(device5.Get(), context, readFile(argv[2]));
   if (argc == 3 && std::wcscmp(argv[1], L"--metadata-arena") == 0)
@@ -1893,6 +1902,12 @@ int run(int argc, wchar_t **argv) {
   } else {
     const auto rootargsDxil = readFile(argv[11]);
     failures += rootargs::run(device5.Get(), context, rootargsDxil);
+    if (argc < 27) {
+      std::fprintf(stderr, "OWNED_D3D12_RAYTRACING_FAIL step=transitions: missing raytracing-transition-cs.dxil\n");
+      ++failures;
+    } else {
+      failures += rttransition::run(device5.Get(), context, rootargsDxil, readFile(argv[26]));
+    }
     failures += testCollectionStaticSamplers(device5.Get(), context, rootargsDxil);
   }
   if (argc < 11) {

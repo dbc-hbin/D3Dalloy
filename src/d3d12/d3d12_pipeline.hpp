@@ -78,7 +78,7 @@ public:
     return &sm50_bitcode_;
   }
 
-  operator sm50_bitcode_t() {
+  operator sm50_bitcode_t() const {
     return sm50_bitcode_;
   }
 

@@ -116,7 +116,8 @@ public:
     bool encode(void* commandBuffer, void* fence,
                 std::shared_ptr<const ExecutionLease>& lease,
                 Error* error = nullptr, bool forceReset = false,
-                void* splitContext = nullptr, void* (*splitCommandBuffer)(void*) = nullptr) const noexcept;
+                void* splitContext = nullptr, void* (*splitCommandBuffer)(void*) = nullptr,
+                std::uint32_t* neighboringEncoders = nullptr) const noexcept;
     std::uint64_t generationId() const noexcept;
 
 private:

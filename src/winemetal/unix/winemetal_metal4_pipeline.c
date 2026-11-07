@@ -98,6 +98,8 @@ winemetal_metal4_pipeline_call(struct WMTMetal4Call *params) {
       [linking release];
     }
     params->ret[0] = (uint64_t)archive_pipeline((id<MTL4Compiler>)params->args[0],descriptor,dynamic,YES,&error);
+    if (params->operation == WMTMetal4PipelineLinkedCompute && params->ret[0])
+      params->ret[2] = [(id<MTLComputePipelineState>)params->ret[0] shaderValidation] == MTLShaderValidationEnabled;
     [dynamic release];
     [descriptor release];
     break;

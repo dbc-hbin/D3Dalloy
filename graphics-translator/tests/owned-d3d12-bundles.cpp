@@ -1198,8 +1198,13 @@ void testImmediate(ID3D12Device *device) {
                                                D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
                                                D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
     commands.list->WriteBufferImmediate(3, params, modes);
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER replacement{va + 8, 0x835102ea};
+    D3D12_WRITEBUFFERIMMEDIATE_MODE enter = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+    commands.list->WriteBufferImmediate(1, &replacement, &enter);
     params[0] = {va + 16, 0xdeadbeef};
-    commands.list->WriteBufferImmediate(1, params, nullptr);
+    params[1] = {va + 20, 0x87654321};
+    params[2] = {va + 28, 0x76543210};
+    commands.list->WriteBufferImmediate(3, params, nullptr);
     commands.list->WriteBufferImmediate(0, nullptr, nullptr);
     commands.close();
     std::memset(params, 0, sizeof(params));
@@ -1211,8 +1216,8 @@ void testImmediate(ID3D12Device *device) {
     auto q = queue(device, type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? D3D12_COMMAND_LIST_TYPE_DIRECT : type);
     submit(q.Get(), type == D3D12_COMMAND_LIST_TYPE_BUNDLE ? parent.list.Get() : commands.list.Get());
     drain(device, q.Get());
-    const UINT expected[8] = {0x11111111, 0xa1b2c3d4, 0x12345678, 0xfedcba98,
-                               0xdeadbeef, 0x11111111, 0x11111111, 0x11111111};
+    const UINT expected[8] = {0x11111111, 0xa1b2c3d4, 0x835102ea, 0xfedcba98,
+                               0xdeadbeef, 0x87654321, 0x11111111, 0x76543210};
     const auto bytes = readback(result.Get(), sizeof(expected));
     if (std::memcmp(bytes.data(), expected, sizeof(expected)))
       fail("WriteBufferImmediate readback/guards");

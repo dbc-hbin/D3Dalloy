@@ -465,7 +465,7 @@ BuildStreamOutputLayout(
 
 HRESULT
 ShaderImmutableConstants::Initialize(
-    MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode
+    MTLD3D12Device *device, const SM50_COMPILED_BITCODE &compiled, sm50_bitcode_t bitcode, bool share_zero
 ) {
   if (!compiled.ConstantDataSize)
     return S_OK;
@@ -474,6 +474,12 @@ ShaderImmutableConstants::Initialize(
   if (!alignment || (alignment & (alignment - 1)) || compiled.ConstantDataSize > UINT32_MAX ||
       alignment > UINT32_MAX || !compiled.ConstantData)
     return E_INVALIDARG;
+  if (share_zero && compiled.ConstantDataSize == 16 && alignment <= 16 && !compiled.ConstantRelocationCount) {
+    uint64_t words[2];
+    if (!SM50ReadCompiledBitcode(bitcode, SM50_COMPILED_BITCODE_PART_CONSTANTS, compiled.ConstantData, words, sizeof(words)))
+      return E_INVALIDARG;
+    if (!(words[0] | words[1])) return device->GetSharedZeroConstants(*this);
+  }
   /* Directly addressable relocations (every 64-bit image) are read in place; WoW64 copies them once. */
   std::vector<SM50_CONSTANT_RELOCATION> copied_relocations;
   auto *relocations = static_cast<const SM50_CONSTANT_RELOCATION *>(SM50AccessiblePointer(compiled.ConstantRelocations));
@@ -544,40 +550,9 @@ MTLD3D12PipelineState::InitializeShader(
     sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl,
     std::vector<MTL_SM50_SHADER_ARGUMENT> *resource_bindings
 ) {
-  using namespace microsoft;
-  if (pRefl) {
-    HRESULT hr = artifacts.Reflect(Bytecode, ppShader, *pRefl, resource_bindings);
-    TraceShaderProbe(Stage, Bytecode, "reflection-cache", hr);
-    return hr;
-  }
-  HRESULT hr;
-  CDXBCParser Parser;
-  if (FAILED(hr = Parser.ReadDXBC(Bytecode.pShaderBytecode, Bytecode.BytecodeLength))) {
-    TraceShaderProbe(Stage, Bytecode, "invalid-container", hr);
-    return hr;
-  }
-
-  // DXIL containers are handed to the same SM50 entry points as SHEX: the
-  // compiler recognizes the DXIL blob and runs the owned DXIL front end, so the
-  // raster contract (requested entry name, reflection, root signature) is
-  // identical for both container formats.
-  const char *chunk = "unknown";
-  if (Parser.FindNextMatchingBlob(microsoft::DXBC_DXIL) != DXBC_BLOB_NOT_FOUND)
-    chunk = "DXIL";
-  else if (Parser.FindNextMatchingBlob(microsoft::DXBC_GenericShaderEx) != DXBC_BLOB_NOT_FOUND)
-    chunk = "SHEX";
-  else if (Parser.FindNextMatchingBlob(microsoft::DXBC_GenericShader) != DXBC_BLOB_NOT_FOUND)
-    chunk = "SHDR";
-
-  SM50Error error;
-  if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
-    ERR("Failed to initialize shader: ", SM50GetErrorMessageString(error));
-    TraceShaderProbe(Stage, Bytecode, chunk, E_FAIL);
-    return E_FAIL;
-  }
-
-  TraceShaderProbe(Stage, Bytecode, chunk, S_OK);
-  return S_OK;
+  HRESULT hr = artifacts.Reflect(Bytecode, ppShader, *pRefl, resource_bindings);
+  TraceShaderProbe(Stage, Bytecode, "reflection-cache", hr);
+  return hr;
 }
 
 class MTLD3D12GraphicsPipelineStateImpl : public MTLD3D12Pageable<MTLD3D12GraphicsPipelineState> {
@@ -630,6 +605,7 @@ protected:
   SharedShaderBytecode pull_vs_bytecode;
   // The explicit root signature is shared by every lazy graphics variant.
   SharedShaderBytecode pull_root_blob;
+  bool statistics_root_shareable = false;
   std::vector<SM50_IA_INPUT_ELEMENT> pull_ia_elements;
   bool supports_index_pull = false;
   WMT::Reference<WMT4::Function> pull_vertex_function;
@@ -655,15 +631,8 @@ protected:
   WMT::Reference<WMT4::Function> view_statistics_indirect_vertex_function;
   std::mutex statistics_pso_mutex;
   std::mutex msaa_pso_mutex;
-  std::unique_ptr<MSAAPipelineVariants> msaa_variants;
-  bool msaa_variants_attempted = false;
-  std::unique_ptr<MSAAPipelineVariants> msaa_statistics_variants;
-  bool msaa_statistics_variants_attempted = false;
-  /* Coarse shading variants, indexed by statistics_enabled. */
-  std::array<std::unique_ptr<MSAAPipelineVariants>, 2> msaa_coarse_variants;
-  std::array<bool, 2> msaa_coarse_variants_attempted{};
-  std::array<std::unique_ptr<MSAAPipelineVariants>, 4> msaa_frontier_variants;
-  std::array<bool, 4> msaa_frontier_variants_attempted{};
+  std::array<std::unique_ptr<MSAAPipelineVariants>, 8> msaa_variants;
+  std::array<bool, 8> msaa_variants_attempted{};
   std::mutex capture_frontier_pso_mutex;
   std::array<std::unique_ptr<CaptureFrontierPipelines>, 2> capture_frontier_variants;
   std::array<bool, 2> capture_frontier_variants_attempted{};
@@ -714,6 +683,7 @@ protected:
         return hr;
       threads = {reflection.ThreadgroupSize[0], reflection.ThreadgroupSize[1], reflection.ThreadgroupSize[2]};
       uses_atomic64 |= reflection.HasAtomic64 != 0;
+      uses_ray_query |= reflection.HasRayQuery != 0;
       out = device_->GetShaderArtifactCache().RetainBytecode(bytecode.pShaderBytecode, bytecode.BytecodeLength);
       return S_OK;
     };
@@ -770,6 +740,7 @@ protected:
         return hr;
       mesh_input_primitive = reflection.GeometryShader.Primitive;
       uses_atomic64 |= reflection.HasAtomic64 != 0;
+      uses_ray_query |= reflection.HasRayQuery != 0;
       gs_max_output_vertices = reflection.GeometryShader.MaxOutputVertexCount;
       gs_output_topology = reflection.GeometryShader.OutputTopology;
       gs_instance_count = std::max<uint32_t>(1, reflection.GeometryShader.InstanceCount);
@@ -799,6 +770,7 @@ protected:
       return hr;
     tess_threads_per_patch = reflection.ThreadsPerPatch;
     uses_atomic64 |= reflection.HasAtomic64 != 0;
+    uses_ray_query |= reflection.HasRayQuery != 0;
     if (mesh_kind == MeshPipelineKind::TessellationGeometry) {
       // The GS reads the tessellator output primitives: point, line (isoline) or triangle (either winding).
       const auto output = reflection.Tessellator.OutputPrimitive;
@@ -808,6 +780,7 @@ protected:
         return hr;
       mesh_input_primitive = gs_reflection.GeometryShader.Primitive;
       uses_atomic64 |= gs_reflection.HasAtomic64 != 0;
+      uses_ray_query |= gs_reflection.HasRayQuery != 0;
       gs_max_output_vertices = gs_reflection.GeometryShader.MaxOutputVertexCount;
       gs_output_topology = gs_reflection.GeometryShader.OutputTopology;
       gs_instance_count = std::max<uint32_t>(1, gs_reflection.GeometryShader.InstanceCount);
@@ -824,6 +797,7 @@ protected:
       return hr;
     mesh_max_potential_tess_factor = domain_reflection.PostTessellator.MaxPotentialTessFactor;
     uses_atomic64 |= domain_reflection.HasAtomic64 != 0;
+    uses_ray_query |= domain_reflection.HasRayQuery != 0;
     if (!device_->GetMTLDevice().supportsFamily(WMTGPUFamilyApple9))
       mesh_max_potential_tess_factor = std::min(8u, mesh_max_potential_tess_factor);
     copy(pDesc->HS, mesh_hs_bytecode);
@@ -1679,6 +1653,7 @@ public:
     if (pDesc->PS.pShaderBytecode && FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "PS", pDesc->PS, &shader_ps, &ref_ps, &resource_bindings)))
       return hr;
     uses_atomic64 |= use_fragment && ref_ps.HasAtomic64;
+    uses_ray_query |= use_fragment && ref_ps.HasRayQuery;
     // Mesh variants use the device artifact cache, not the serialized ordinary-stage PSO blob.
     const uint32_t stages = (mesh ? 0u : 1u << PipelineCache::Vertex) |
                             (use_fragment ? 1u << PipelineCache::Fragment : 0);
@@ -1700,6 +1675,7 @@ public:
       if (FAILED(hr = InitializeShader(device_->GetShaderArtifactCache(), "VS", pDesc->VS, &shader_vs, &ref_vs, &resource_bindings)))
         return hr;
       uses_atomic64 |= ref_vs.HasAtomic64 != 0;
+      uses_ray_query |= ref_vs.HasRayQuery != 0;
       if (uses_atomic64) { common.next = &atomic_phase; common.metal_version = SM50_SHADER_METAL_410; }
       SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
       data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
@@ -1766,14 +1742,18 @@ public:
         rootsig.bytecode_length = pDesc->VS.BytecodeLength;
       }
       rootsig.next = &data_ia_layout;
-      if (pDesc->pRootSignature)
+      if (pDesc->pRootSignature) {
         pull_root_blob = device_->GetShaderArtifactCache().RetainBytecode(rootsig.bytecode, rootsig.bytecode_length);
+        statistics_root_shareable = !mesh && !stream_output.active &&
+            !view_instancing.count && !static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->IsLocal;
+      }
 
       if (mesh) {
         // The VS is compiled into each mesh variant's object function (BuildMeshPipeline).
       } else if (cache_.Compile(
               PipelineCache::Vertex, device_->GetShaderArtifactCache(), pDesc->VS,
-              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &sm50_err
+              shader_vs, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, "vs_main", &sm50_err,
+              pDesc->pRootSignature, ref_vs
           )) {
         const auto error = SM50GetErrorMessageString(sm50_err);
         const bool first = RecordShaderCompileFailure(
@@ -1787,7 +1767,7 @@ public:
       if (!mesh) {
         const auto vs_bitcode_compiled = cache_.view(PipelineCache::Vertex);
         if (FAILED(hr = vertex_constants.Initialize(device_, vs_bitcode_compiled,
-                                                    cache_.bitcode(PipelineCache::Vertex))))
+                                                    cache_.bitcode(PipelineCache::Vertex), true)))
           return hr;
         auto vs_lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), vs_bitcode_compiled,
                                                               cache_.bitcode(PipelineCache::Vertex), err);
@@ -1847,14 +1827,15 @@ public:
           continue;
         }
       }
-      const void *root_blob = pDesc->PS.pShaderBytecode;
       if (coverage_input && inner_coverage_input) return E_INVALIDARG;
       sample_mask_constant = !coverage_input;
-      size_t root_length = pDesc->PS.BytecodeLength;
-      if (pDesc->pRootSignature)
-        root_length = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature)->GetBlob(&root_blob);
-      needs_rov_buffer_marker = device_->GetShaderArtifactCache().RasterOrderedMarker(
-          pDesc->PS, {root_blob, root_length}, shader_ps);
+      auto *signature = static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature);
+      if (!ref_ps.RootArgumentsUnused && (!signature || signature->HasPixelUAVTable)) {
+        const void *root_blob = pDesc->PS.pShaderBytecode;
+        const size_t root_length = signature ? signature->GetBlob(&root_blob) : pDesc->PS.BytecodeLength;
+        needs_rov_buffer_marker = device_->GetShaderArtifactCache().RasterOrderedMarker(
+            pDesc->PS, {root_blob, root_length}, shader_ps);
+      }
     }
     // D3D12 forbids sample-frequency execution with the fixed center pattern.
     if (owned_sample_desc.Quality == 0xfffffffeu && owned_sample_frequency_pixel_shader)
@@ -1927,7 +1908,8 @@ public:
 
       if (cache_.Compile(
               PipelineCache::Fragment, device_->GetShaderArtifactCache(), pDesc->PS,
-              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &sm50_err
+              shader_ps, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&rootsig, ps_name.c_str(), &sm50_err,
+              pDesc->pRootSignature, ref_ps
           )) {
         const auto error = SM50GetErrorMessageString(sm50_err);
         const bool first = RecordShaderCompileFailure(
@@ -1938,7 +1920,7 @@ public:
         return E_FAIL;
       }
       const auto ps_bitcode_compiled = cache_.view(PipelineCache::Fragment);
-      if (FAILED(hr = fragment_constants.Initialize(device_, ps_bitcode_compiled, cache_.bitcode(PipelineCache::Fragment))))
+      if (FAILED(hr = fragment_constants.Initialize(device_, ps_bitcode_compiled, cache_.bitcode(PipelineCache::Fragment), true)))
         return hr;
       // Wide MS output is linked only to the compact captured-pixel variants.
       // Retain its compiled AIR/cache data, but never ask Metal to link the
@@ -1949,8 +1931,7 @@ public:
         if (!ps_lib)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
         ps_func = sample_mask_constant
-          ? device_->GetShaderArtifactCache().SampleMaskFunction(ps_lib, ps_name.c_str(),
-              {rootsig.bytecode, rootsig.bytecode_length}, owned_sample_mask, err)
+          ? device_->GetShaderArtifactCache().SampleMaskFunction(ps_lib, ps_name.c_str(), owned_sample_mask, err)
           : device_->GetShaderArtifactCache().Function(ps_lib, ps_name.c_str());
         if (!ps_func)
           return cache_.loaded() ? E_INVALIDARG : E_FAIL;
@@ -2039,7 +2020,7 @@ public:
             pDesc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
             use_fragment && !stream_output.active && !rasterization_disabled &&
             !forced_sample_count && !ForcedSampleReplay() && !owned_conservative &&
-            !owned_distance_interpolation && !owned_mesh_output_replay && !uses_atomic64 &&
+            !RequiresDistanceReplay() && !owned_mesh_output_replay && !uses_atomic64 &&
             !needs_rov_buffer_marker && !owned_depth_bounds && !sample_position_input &&
             !coverage_input && !inner_coverage_input && !owned_shading_rate_pixel_shader &&
             !pDesc->BlendState.AlphaToCoverageEnable && !ref_ps.PixelShader.HasCoverageOutput &&
@@ -2059,6 +2040,32 @@ public:
       indirect_vertex_function = vs_func;
       indirect_fragment_function = ps_func;
       indirect_info = info;
+    }
+
+    if (mesh)
+      root_argument_stages |= WMTMetal4StageVertex | WMTMetal4StageObject | WMTMetal4StageMesh;
+    else if (!ref_vs.RootArgumentsUnused || view_location_offsets)
+      root_argument_stages |= WMTMetal4StageVertex;
+    if (use_fragment && !ref_ps.RootArgumentsUnused)
+      root_argument_stages |= WMTMetal4StageFragment;
+
+    // Mesh variants can fuse multiple D3D stages into one object/mesh program.
+    uint32_t sampler_visibility = 0;
+    if (pDesc->pRootSignature) {
+      sampler_visibility = StaticSamplerVisibility(static_cast<MTLD3D12RootSignature *>(pDesc->pRootSignature),
+                                                   {}, resource_bindings, ~0u);
+    } else {
+      const D3D12_SHADER_BYTECODE embedded[] = {{}, pDesc->VS, pDesc->HS, pDesc->DS, pDesc->GS,
+                                                pDesc->PS, extras.as, extras.ms};
+      for (unsigned stage = 1; stage < std::size(embedded); ++stage)
+        if (embedded[stage].pShaderBytecode)
+          sampler_visibility |= StaticSamplerVisibility(nullptr, embedded[stage], resource_bindings, 1u << stage);
+    }
+    constexpr uint32_t pixel_visibility = 1u << D3D12_SHADER_VISIBILITY_PIXEL;
+    if (use_fragment && (sampler_visibility & pixel_visibility)) static_sampler_stages |= WMTMetal4StageFragment;
+    if (sampler_visibility & ~pixel_visibility) {
+      static_sampler_stages |= WMTMetal4StageVertex;
+      if (mesh) static_sampler_stages |= WMTMetal4StageObject | WMTMetal4StageMesh;
     }
 
     // DSSO
@@ -2112,6 +2119,19 @@ public:
     return cache_.GetBlob(blob);
   }
 
+  WMT::Reference<WMT4::Function> CompileVertexVariant(void *next, ShaderImmutableConstants &constants,
+                                                   bool root_independent = false) {
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
+    layout.next = next;
+    layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+    layout.slot_mask = slot_mask;
+    layout.num_elements = pull_ia_elements.size();
+    layout.elements = pull_ia_elements.data();
+    return CompilePipelineVariant(device_, pull_vs_bytecode, pull_root_blob, "vs_main", &layout, constants,
+                                  root_independent);
+  }
+
   // Caller holds the corresponding ordinary/index-pull/statistics variant mutex.
   // These uncached ICB entries must not reuse the cached direct VS: Metal 4 ICB
   // execution does not inherit encoder vertex-amplification view mappings.
@@ -2122,7 +2142,6 @@ public:
       return true;
     auto &constants = statistics ? indirect_view_pipeline_statistics_vertex_constants
                                 : index_pull ? indirect_view_index_pull_vertex_constants : indirect_view_vertex_constants;
-    SM50Error compile_error;
     SM50_SHADER_COMMON_DATA common{};
     common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
@@ -2172,36 +2191,7 @@ public:
       no_raster.next = tail;
       tail = &no_raster;
     }
-    SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-    layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-    layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-    layout.slot_mask = slot_mask;
-    layout.num_elements = pull_ia_elements.size();
-    layout.elements = pull_ia_elements.data();
-    layout.next = tail;
-    SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-    root.type = SM50_SHADER_ROOT_SIGNATURE;
-    root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
-    root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-    root.next = &layout;
-    SM50ShaderBitcode compiled;
-    std::shared_ptr<const ShaderStageArtifact> artifact;
-    if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
-                    reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                    "vs_main", &compiled, &compile_error, artifact)) {
-      ERR("Failed to compile indirect view VS: ", SM50GetErrorMessageString(compile_error));
-      return false;
-    }
-    SM50_COMPILED_BITCODE bytecode{};
-    if (artifact) bytecode = artifact->view;
-    else SM50GetCompiledBitcode(compiled, &bytecode);
-    if (FAILED(constants.Initialize(device_, bytecode, compiled)))
-      return false;
-    WMT::Reference<WMT::Error> error;
-    auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-    if (!library)
-      return false;
-    function = device_->GetShaderArtifactCache().Function(library, "vs_main");
+    function = CompileVertexVariant(tail, constants);
     return bool(function);
   }
 
@@ -2233,9 +2223,9 @@ public:
   }
 
   virtual WMT::RenderPipelineState
-  GetIndirectCommandBufferPipelineState() override {
+  GetIndirectCommandBufferPipelineState(bool create) override {
     std::lock_guard<std::mutex> lock(indirect_pso_mutex);
-    if (!indirect_pso) {
+    if (!indirect_pso && create) {
       WMT::Reference<WMT::Error> error;
       auto info = indirect_info;
       info.vertex_function = indirect_vertex_function.handle;
@@ -2265,7 +2255,6 @@ public:
       return {};
     WMT::Reference<WMT::Error> error;
     if (!pull_vertex_function && !(indirect && view_location_offsets)) {
-      SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
       common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
@@ -2273,35 +2262,7 @@ public:
       SM50_SHADER_COMPILATION_ARGUMENT_DATA pull{};
       pull.type = SM50_SHADER_D3D12_INDEX_PULL;
       pull.next = &common;
-      SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-      layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-      layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-      layout.slot_mask = slot_mask;
-      layout.num_elements = pull_ia_elements.size();
-      layout.elements = pull_ia_elements.data();
-      layout.next = &pull;
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
-      root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-      root.next = &layout;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile indexed pull VS: ", SM50GetErrorMessageString(compile_error));
-        return {};
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(index_pull_vertex_constants.Initialize(device_, bytecode, compiled)))
-        return {};
-      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!lib)
-        return {};
-      pull_vertex_function = device_->GetShaderArtifactCache().Function(lib, "vs_main");
+      pull_vertex_function = CompileVertexVariant(&pull, index_pull_vertex_constants);
       if (!pull_vertex_function)
         return {};
     }
@@ -2327,7 +2288,6 @@ public:
     std::lock_guard<std::mutex> lock(statistics_pso_mutex);
     WMT::Reference<WMT::Error> error;
     if (!statistics_vertex_function && !(indirect && view_location_offsets)) {
-      SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
       common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
@@ -2352,41 +2312,15 @@ public:
       no_raster.DataEncoded = ~0u;
       no_raster.RasterizationDisabled = true;
       no_raster.next = &capture;
-      SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-      layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-      layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-      layout.slot_mask = slot_mask;
-      layout.num_elements = pull_ia_elements.size();
-      layout.elements = pull_ia_elements.data();
-      layout.next = pipeline_statistics_capture.rasterization_enabled ||
-                            stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM
-                        ? static_cast<void *>(&capture) : static_cast<void *>(&no_raster);
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
-      root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-      root.next = &layout;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile statistics VS: ", SM50GetErrorMessageString(compile_error));
-        return {};
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(pipeline_statistics_vertex_constants.Initialize(device_, bytecode, compiled)))
-        return {};
-      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!lib)
-        return {};
-      statistics_vertex_function = device_->GetShaderArtifactCache().Function(lib, "vs_main");
+      const bool rasterize = pipeline_statistics_capture.rasterization_enabled ||
+                             stream_output.rasterized_stream != D3D12_SO_NO_RASTERIZED_STREAM;
+      statistics_vertex_function = CompileVertexVariant(
+          rasterize ? static_cast<void *>(&capture) : static_cast<void *>(&no_raster), pipeline_statistics_vertex_constants,
+          !indirect && statistics_root_shareable && ref_vs.RootArgumentsUnused);
       if (!statistics_vertex_function)
         return {};
     }
-    if (!EnsureStatisticsFragmentFunction())
+    if (!EnsureStatisticsFragmentFunction(!indirect && statistics_root_shareable && ref_ps.RootArgumentsUnused))
       return {};
     auto &variant = indirect ? statistics_indirect_pso : statistics_pso;
     if (!variant) {
@@ -2399,10 +2333,6 @@ public:
       }
       info.fragment_function = statistics_fragment_function.handle;
       info.support_indirect_command_buffers = indirect;
-      
-      
-      
-      
       variant = CreateNativePipeline(info, error);
       if (!variant)
         ERR("Failed to create statistics graphics PSO: ", error.description().getUTF8String());
@@ -2411,10 +2341,8 @@ public:
   }
 
   /* The counting PS variant (PSInvocations); caller holds statistics_pso_mutex. */
-  bool EnsureStatisticsFragmentFunction() {
+  bool EnsureStatisticsFragmentFunction(bool root_independent = false) {
     if (!statistics_ps_bytecode.empty() && !statistics_fragment_function) {
-      WMT::Reference<WMT::Error> error;
-      SM50Error compile_error;
       SM50_SHADER_COMMON_DATA common{};
       common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
       common.type = SM50_SHADER_COMMON;
@@ -2442,28 +2370,8 @@ public:
       pixel.native_sample_count = owned_sample_frequency_pixel_shader ? EffectiveRasterSampleCount() : 1;
       std::copy(statistics_ps_formats.begin(), statistics_ps_formats.end(), pixel.pixel_formats);
       pixel.next = &statistics;
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
-      root.bytecode_length = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
-      root.next = &pixel;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      statistics_ps_name.c_str(), &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile statistics PS: ", SM50GetErrorMessageString(compile_error));
-        return {};
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(pipeline_statistics_fragment_constants.Initialize(device_, bytecode, compiled)))
-        return {};
-      auto lib = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!lib)
-        return {};
-      statistics_fragment_function = device_->GetShaderArtifactCache().Function(lib, statistics_ps_name.c_str());
+      statistics_fragment_function = CompilePipelineVariant(device_, statistics_ps_bytecode, pull_root_blob,
+          statistics_ps_name.c_str(), &pixel, pipeline_statistics_fragment_constants, root_independent);
       if (!statistics_fragment_function)
         return false;
     }
@@ -2508,27 +2416,6 @@ public:
     frontier.type = SM50_SHADER_D3D12_CAPTURE_FRONTIER;
     frontier.next = uses_atomic64 ? static_cast<void *>(&atomic_phase) : static_cast<void *>(&common);
     WMT::Reference<WMT::Error> error;
-    auto compile = [&](const SharedShaderBytecode &source, const char *name,
-                       SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, ShaderImmutableConstants &constants,
-                       WMT::Reference<WMT4::Function> &function) -> bool {
-      SM50Error compile_error;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({source.data(), source.size()}, args, name,
-                                                         &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile capture frontier ", name, ": ", SM50GetErrorMessageString(compile_error));
-        return false;
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(constants.Initialize(device_, bytecode, compiled))) return false;
-      auto library = device_->GetShaderArtifactCache().Library(
-          device_->GetMetal4Compiler(), bytecode, compiled, error);
-      function = library ? device_->GetShaderArtifactCache().Function(library, name)
-                         : WMT::Reference<WMT4::Function>();
-      return bool(function);
-    };
     WMT::Reference<WMT4::Function> capture_vertex, replay_vertex, replay_fragment;
     const bool rasterize = indirect_info.rasterization_enabled;
     for (uint32_t replay = 0; replay < (rasterize ? 2u : 1u); ++replay) {
@@ -2567,22 +2454,9 @@ public:
         no_raster.next = tail;
         tail = &no_raster;
       }
-      SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-      layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-      layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-      layout.slot_mask = slot_mask;
-      layout.num_elements = pull_ia_elements.size();
-      layout.elements = pull_ia_elements.data();
-      layout.next = tail;
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
-      root.bytecode_length = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-      root.next = &layout;
-      if (!compile(pull_vs_bytecode, "vs_main",
-          reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-          replay ? variants->replay_vertex_constants : variants->capture_constants,
-          replay ? replay_vertex : capture_vertex))
+      auto &vertex = replay ? replay_vertex : capture_vertex;
+      vertex = CompileVertexVariant(tail, replay ? variants->replay_vertex_constants : variants->capture_constants);
+      if (!vertex)
         return nullptr;
     }
     WMTComputePipelineInfo capture_info;
@@ -2606,14 +2480,9 @@ public:
         pixel.native_sample_count = owned_sample_frequency_pixel_shader ? EffectiveRasterSampleCount() : 1;
         std::copy(statistics_ps_formats.begin(), statistics_ps_formats.end(), pixel.pixel_formats);
         pixel.next = tail;
-        SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-        root.type = SM50_SHADER_ROOT_SIGNATURE;
-        root.bytecode = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
-        root.bytecode_length = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
-        root.next = &pixel;
-        if (!compile(statistics_ps_bytecode, statistics_ps_name.c_str(),
-            reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-            variants->replay_fragment_constants, replay_fragment))
+        replay_fragment = CompilePipelineVariant(device_, statistics_ps_bytecode, pull_root_blob,
+            statistics_ps_name.c_str(), &pixel, variants->replay_fragment_constants);
+        if (!replay_fragment)
           return nullptr;
       }
       auto replay_info = indirect_info;
@@ -2629,13 +2498,9 @@ public:
   const MSAAPipelineVariants *GetMSAAPipelineVariants(
       bool statistics_enabled, bool coarse, bool frontier = false) override {
     std::lock_guard<std::mutex> lock(msaa_pso_mutex);
-    const uint32_t frontier_cache_index = uint32_t(statistics_enabled) | (uint32_t(coarse) << 1);
-    auto &cached = frontier ? msaa_frontier_variants[frontier_cache_index]
-        : coarse ? msaa_coarse_variants[statistics_enabled]
-        : statistics_enabled ? msaa_statistics_variants : msaa_variants;
-    auto &attempted = frontier ? msaa_frontier_variants_attempted[frontier_cache_index]
-        : coarse ? msaa_coarse_variants_attempted[statistics_enabled]
-        : statistics_enabled ? msaa_statistics_variants_attempted : msaa_variants_attempted;
+    const unsigned index = unsigned(statistics_enabled) | (unsigned(coarse) << 1) | (unsigned(frontier) << 2);
+    auto &cached = msaa_variants[index];
+    auto &attempted = msaa_variants_attempted[index];
     if (attempted)
       return cached.get();
     attempted = true;
@@ -2672,10 +2537,6 @@ public:
     common.flags = SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     common.type = SM50_SHADER_COMMON;
     common.metal_version = kD3D12ShaderMetalVersion;
-    const auto *vs_root_blob = pull_root_blob.empty() ? pull_vs_bytecode.data() : pull_root_blob.data();
-    const size_t vs_root_size = pull_root_blob.empty() ? pull_vs_bytecode.size() : pull_root_blob.size();
-    const auto *ps_root_blob = pull_root_blob.empty() ? statistics_ps_bytecode.data() : pull_root_blob.data();
-    const size_t ps_root_size = pull_root_blob.empty() ? statistics_ps_bytecode.size() : pull_root_blob.size();
     WMT::Reference<WMT4::Function> vertex_replay;
     WMT::Reference<WMT4::Function> fragments[4];
     SM50_MSAA_INTERPOLATION_LAYOUT line_interpolation{};
@@ -2686,7 +2547,6 @@ public:
     auto compile_pixel = [&]() -> bool {
       for (uint32_t i = 0; has_pixel_shader && i < (variants->sample_frequency ? 4u : 3u); i++) {
       if (variants->sample_frequency && (i == 1 || (i == 2 && !uses_atomic64))) continue;
-      SM50Error compile_error;
       SM50_SHADER_D3D12_MSAA_PIXEL_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_PIXEL;
       msaa.variant = i == 3 ? SM50_MSAA_SAMPLE_APP : SM50_MSAA_COVERAGE + i;
@@ -2744,26 +2604,9 @@ public:
       else if (i == 2 || i == 3)
         std::copy(statistics_ps_formats.begin(), statistics_ps_formats.end(), pixel.pixel_formats);
       pixel.next = &msaa;
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = ps_root_blob;
-      root.bytecode_length = ps_root_size;
-      root.next = &pixel;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({statistics_ps_bytecode.data(), statistics_ps_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      statistics_ps_name.c_str(), &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile MSAA PS variant ", i, ": ", SM50GetErrorMessageString(compile_error));
-        return false;
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
-      if (FAILED(fragment_constants[i]->Initialize(device_, bytecode, compiled)))
-        return false;
-      auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      if (!library || !(fragments[i] = device_->GetShaderArtifactCache().Function(library, statistics_ps_name.c_str()))) {
+      fragments[i] = CompilePipelineVariant(device_, statistics_ps_bytecode, pull_root_blob,
+          statistics_ps_name.c_str(), &pixel, *fragment_constants[i]);
+      if (!fragments[i]) {
         ERR("Failed to load MSAA PS variant ", i);
         return false;
       }
@@ -2771,7 +2614,6 @@ public:
       return true;
     };
     auto compile_vertex = [&](uint32_t i) -> bool {
-      common.metal_version = uses_atomic64 && !i ? SM50_SHADER_METAL_410 : kD3D12ShaderMetalVersion;
       if (mesh_kind != MeshPipelineKind::None) {
         const uint32_t pass = mesh_kind == MeshPipelineKind::TessellationGeometry
             ? kMeshTessellationGeometryPass : 0;
@@ -2796,7 +2638,6 @@ public:
         vertex_replay = replay.replay_function;
         return bool(vertex_replay);
       }
-      SM50Error compile_error;
       SM50_SHADER_D3D12_MSAA_VERTEX_DATA msaa{};
       msaa.type = SM50_SHADER_D3D12_MSAA_VERTEX;
       msaa.variant = i ? SM50_MSAA_VERTEX_REPLAY : SM50_MSAA_VERTEX_CAPTURE;
@@ -2827,13 +2668,7 @@ public:
       conservative_raster.type = SM50_SHADER_D3D12_CONSERVATIVE_RASTER;
       conservative_raster.next = msaa.next;
       if (owned_conservative && i) msaa.next = &conservative_raster;
-      SM50_SHADER_IA_INPUT_LAYOUT_DATA layout{};
-      layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
-      layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
-      layout.slot_mask = slot_mask;
-      layout.num_elements = pull_ia_elements.size();
-      layout.elements = pull_ia_elements.data();
-      layout.next = &msaa;
+      void *tail = &msaa;
       std::vector<SM50_SO_CAPTURE_ELEMENT> capture_elements;
       SM50_SHADER_D3D12_STREAM_OUTPUT_CAPTURE_DATA capture{};
       if (!i && (stream_output.active || statistics_enabled)) {
@@ -2849,29 +2684,10 @@ public:
         capture.num_elements = capture_elements.size();
         capture.elements = capture_elements.data();
         capture.next = &msaa;
-        layout.next = &capture;
+        tail = &capture;
       }
-      SM50_SHADER_ROOT_SIGNATURE_DATA root{};
-      root.type = SM50_SHADER_ROOT_SIGNATURE;
-      root.bytecode = vs_root_blob;
-      root.bytecode_length = vs_root_size;
-      root.next = &layout;
-      SM50ShaderBitcode compiled;
-      std::shared_ptr<const ShaderStageArtifact> artifact;
-      if (device_->GetShaderArtifactCache().CompileShader({pull_vs_bytecode.data(), pull_vs_bytecode.size()},
-                      reinterpret_cast<SM50_SHADER_COMPILATION_ARGUMENT_DATA *>(&root),
-                      "vs_main", &compiled, &compile_error, artifact)) {
-        ERR("Failed to compile MSAA VS variant ", i, ": ", SM50GetErrorMessageString(compile_error));
-        return false;
-      }
-      SM50_COMPILED_BITCODE bytecode{};
-      if (artifact) bytecode = artifact->view;
-      else SM50GetCompiledBitcode(compiled, &bytecode);
       auto &constants = i ? variants->replay_vertex_constants : variants->capture_constants;
-      if (FAILED(constants.Initialize(device_, bytecode, compiled)))
-        return false;
-      auto library = device_->GetShaderArtifactCache().Library(device_->GetMetal4Compiler(), bytecode, compiled, error);
-      auto function = library ? device_->GetShaderArtifactCache().Function(library, "vs_main") : WMT::Reference<WMT4::Function>();
+      auto function = CompileVertexVariant(tail, constants);
       if (!function)
         return false;
       if (i) vertex_replay = function;

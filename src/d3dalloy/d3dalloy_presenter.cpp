@@ -228,10 +228,9 @@ Presenter::synchronizeLayerPropertiesImpl(bool wait_for_gpu_completion, bool do_
                           final_colorspace == WMTColorSpaceHDR_PQ, is_hdr && hdr_metadata != nullptr,
                           sample_count_ > 1, gamma_enable, composition_residual, linear_composition_transport};
     // Invalidation means a layer transition, not necessarily a new pipeline.
-    if (!present_blit_ || !present_scale_ || !(key == pipeline_key_)) {
-      buildRenderPipelineState(key.is_pq, key.with_hdr_metadata, key.is_ms, key.gamma_enable,
-                               key.composition_residual, key.linear_composition_transport);
+    if (!(key == pipeline_key_) || (!compiler_ && (!classic_pipelines_.blit || !classic_pipelines_.scale))) {
       pipeline_key_ = key;
+      if (!compiler_) buildRenderPipelineState(classic_pipelines_, true, true);
     }
     layer_.setProps(layer_props_);
     layer_.setColorSpace(linear_composition_transport
@@ -301,9 +300,9 @@ Presenter::encodeCommands(
       (geometry.source_width == backbuffer.width() && geometry.source_height == backbuffer.height());
   if (backbuffer.width() == (uint64_t)width && backbuffer.height() == (uint64_t)height &&
       full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output) {
-    encoder.setRenderPipelineState(present_blit_);
+    encoder.setRenderPipelineState(classic_pipelines_.blit);
   } else {
-    encoder.setRenderPipelineState(present_scale_);
+    encoder.setRenderPipelineState(classic_pipelines_.scale);
   }
   encoder.setViewport({0, 0, width, height, 0, 1});
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
@@ -326,7 +325,6 @@ Presenter::encodeCommandsMetal4(
   MetalLayer_acquirePresentDrawable(&present);
   WMT::MetalDrawable drawable{present.drawable};
   if (!drawable) return {};
-  if (!cmdbuf.useDrawable(drawable)) return {};
   WMT::Texture destination{present.texture};
   const double width = layer_props_.drawable_width;
   const double height = layer_props_.drawable_height;
@@ -361,6 +359,7 @@ Presenter::encodeCommandsMetal4(
       !metadata.composition_color_space && !pipeline_key_.source_srgb &&
       (!pipeline_key_.is_pq || format == WMTPixelFormatRGB10A2Unorm) &&
       !pipeline_key_.with_hdr_metadata && !pipeline_key_.gamma_enable) {
+    if (!cmdbuf.useDrawable(drawable)) return {};
     wmtcmd_blit_copy_from_texture_to_texture copy{};
     copy.type = WMTBlitCommandCopyFromTextureToTexture;
     copy.src = backbuffer;
@@ -387,26 +386,68 @@ Presenter::encodeCommandsMetal4(
     info.colors[1].store_action = WMTStoreActionStore;
     info.colors[1].texture = residual;
   }
+  // The native replay consumes this linked packet synchronously. Each drawable still
+  // gets its own metadata; only the LUT removed by shader specialization is omitted.
+  const bool samples_gamma = pipeline_key_.gamma_enable && !pipeline_key_.is_pq &&
+      !pipeline_key_.with_hdr_metadata && !pipeline_key_.linear_composition_transport;
+  const bool unscaled = source_width == uint64_t(width) && source_height == uint64_t(height) &&
+      full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output;
+  // The queue waits for the previous PresentState's encoding, even across queues.
+  // Layer synchronization also drains these encodes before it switches keys.
+  auto &recent = metal4_pipelines_;
+  if (!(recent.front().key == pipeline_key_) || !(unscaled ? recent.front().blit : recent.front().scale)) {
+    auto it = std::find_if(recent.begin(), recent.end(), [&](const auto &p) { return p.key == pipeline_key_; });
+    PipelinePair pending{pipeline_key_};
+    auto &target = it == recent.end() ? pending : *it;
+    auto &variant = unscaled ? target.blit : target.scale;
+    if (!variant) buildRenderPipelineState(target, unscaled, !unscaled);
+    if (!variant) {
+      work.pipeline_failed = true;
+      return {};
+    }
+    // Admit only a compiled variant. Copies and failed misses never displace a working pipeline.
+    if (it == recent.end()) {
+      it = recent.end() - 1;
+      *it = std::move(pending);
+    }
+    std::rotate(recent.begin(), it, it + 1);
+  }
+  if (!cmdbuf.useDrawable(drawable)) return {};
   auto encoder = cmdbuf.renderCommandEncoder(info);
   if (fence) encoder.waitForFence(fence, WMTRenderStageFragment);
-  encoder.setFragmentTexture(backbuffer, 0);
-  encoder.setFragmentTexture(gamma_lut_texture_, 1);
-  encoder.setFragmentBytes(&metadata, sizeof(metadata), 0);
-  if (source_width == uint64_t(width) && source_height == uint64_t(height) &&
-      full_source && geometry.rotation <= 1 && !geometry.scaling_none && !geometry.restrict_output)
-    encoder.setRenderPipelineState(present_blit_);
-  else
-    encoder.setRenderPipelineState(present_scale_);
-  encoder.setViewport({0, 0, width, height, 0, 1});
-  encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+  wmtcmd_render_settexture source{WMTRenderCommandSetFragmentTexture}, gamma{WMTRenderCommandSetFragmentTexture};
+  wmtcmd_render_setbytes constants{WMTRenderCommandSetFragmentBytes};
+  wmtcmd_render_setpso pipeline{WMTRenderCommandSetPSO};
+  wmtcmd_render_setviewport viewport{WMTRenderCommandSetViewport};
+  wmtcmd_render_draw draw{WMTRenderCommandDraw};
+  source.texture = backbuffer;
+  source.next.set(&constants);
+  if (samples_gamma) {
+    source.next.set(&gamma);
+    gamma.texture = gamma_lut_texture_;
+    gamma.index = 1;
+    gamma.next.set(&constants);
+  }
+  constants.bytes.set(&metadata);
+  constants.length = sizeof(metadata);
+  constants.next.set(&pipeline);
+  pipeline.pso = unscaled ? recent.front().blit : recent.front().scale;
+  pipeline.next.set(&viewport);
+  viewport.viewport = {0, 0, width, height, 0, 1};
+  viewport.next.set(&draw);
+  draw.primitive_type = WMTPrimitiveTypeTriangle;
+  draw.vertex_count = 3;
+  draw.instance_count = 1;
+  encoder.encodeCommands(reinterpret_cast<const wmtcmd_render_nop *>(&source));
   if (fence) encoder.updateFence(fence, WMTRenderStageFragment);
   encoder.endEncoding();
   return drawable;
 }
 
 void
-Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_ms, bool gamma_enable,
-                                   bool composition_residual, bool linear_composition_transport) {
+Presenter::buildRenderPipelineState(PipelinePair &target, bool build_blit, bool build_scale) {
+  const auto &[format, srgb, is_pq, with_hdr_metadata, is_ms, gamma_enable,
+               composition_residual, linear_composition_transport] = pipeline_key_;
   auto pool = WMT::MakeAutoreleasePool();
 
   uint32_t true_data = true, false_data = false;
@@ -420,7 +461,7 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
   constants[2].data.set(with_hdr_metadata ? &true_data : &false_data);
   constants[2].type = WMTDataTypeBool;
   constants[2].index = kPresentFCIndex_WithHDRMetadata;
-  constants[3].data.set(Is_sRGBVariant(source_format_) ? &true_data : &false_data);
+  constants[3].data.set(srgb ? &true_data : &false_data);
   constants[3].type = WMTDataTypeBool;
   constants[3].index = kPresentFCIndex_BackbufferIsSRGB;
   constants[4].data.set(is_ms ? &true_data : &false_data);
@@ -438,29 +479,30 @@ Presenter::buildRenderPipelineState(bool is_pq, bool with_hdr_metadata, bool is_
 
   // Both frontends consume the same library/constants but distinct compiler
   // domains: descriptors for Metal4, MTLFunction objects for classic D3D11.
-  auto build = [&](auto library, auto compile) {
+  auto build = [&](auto library, auto &vertex, auto compile) {
     WMT::Reference<WMT::Error> error;
-    auto vs_present_quad = library.newFunction("vs_present_quad");
-    auto fs_present_quad = library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
-    constants[0].data.set(&false_data);
-    auto fs_present_quad_scaled =
-        library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
+    if (!vertex) vertex = library.newFunction("vs_present_quad");
+    if (!vertex) return;
     WMTRenderPipelineInfo present_pipeline;
     WMT::InitializeRenderPipelineInfo(present_pipeline);
-    present_pipeline.colors[0].pixel_format = layer_props_.pixel_format;
-    if (composition_residual) present_pipeline.colors[1].pixel_format = layer_props_.pixel_format;
-    present_pipeline.vertex_function = vs_present_quad;
-    present_pipeline.fragment_function = fs_present_quad;
-    present_blit_ = compile(present_pipeline, error);
-    present_pipeline.fragment_function = fs_present_quad_scaled;
-    present_scale_ = compile(present_pipeline, error);
+    present_pipeline.colors[0].pixel_format = format;
+    if (composition_residual) present_pipeline.colors[1].pixel_format = format;
+    present_pipeline.vertex_function = vertex;
+    auto variant = [&](bool unscaled) {
+      constants[0].data.set(unscaled ? &true_data : &false_data);
+      auto fragment = library.newFunctionWithConstants("fs_present_quad", constants, std::size(constants), error);
+      present_pipeline.fragment_function = fragment;
+      return compile(present_pipeline, error);
+    };
+    if (build_blit) target.blit = variant(true);
+    if (build_scale) target.scale = variant(false);
   };
   if (compiler_)
-    build(WMT4::Library(lib_), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+    build(WMT4::Library(lib_), metal4_present_vertex_, [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
       return compiler_.newRenderPipelineState(info, error);
     });
   else
-    build(WMT::Library(lib_), [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
+    build(WMT::Library(lib_), classic_present_vertex_, [&](const WMTRenderPipelineInfo &info, WMT::Error &error) {
       return device_.newRenderPipelineState(info, error);
     });
 }

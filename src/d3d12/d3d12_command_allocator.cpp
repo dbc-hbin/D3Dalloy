@@ -37,6 +37,13 @@ RecordingHead::~RecordingHead() {
     DestroyRecordedRenderEncoder(render);
 }
 
+void MTLD3D12CommandAllocatorImpl::RemoveOverwrittenClear(EncoderData *before, RenderEncoderData *clear) {
+  assert(before->next == clear && clear->next == encoder_last && !encoder_current);
+  before->next = clear->next;
+  DestroyRecordedRenderEncoder(clear);
+  --encoder_count_;
+}
+
 MTLD3D12CommandAllocatorImpl::MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type) :
     MTLD3D12Pageable<MTLD3D12CommandAllocator>(pDevice),
     type_(Type),
@@ -90,8 +97,6 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   recording_head_ = nullptr;
   encoder_count_ = 0;
 
-  for (auto &entry : icb_) entry.used = false;
-
   copy_temp_allocator_.free_blocks(copy_temp_version_++);
 
   return S_OK;
@@ -133,10 +138,30 @@ MTLD3D12CommandAllocatorImpl::Reset() try {
     return hr;
   ++gpu_heap_epoch_;
   uint64_t retained_commands = 0;
-  std::erase_if(icb_, [&](const auto &entry) {
-    if (gpu_heap_epoch_ - entry.last_epoch > 50 || entry.capacity > 65536 - retained_commands) return true;
-    retained_commands += entry.capacity; return false;
-  });
+  for (auto it = icb_.begin(); it != icb_.end();) {
+    auto &pool = it->second;
+    pool.available.clear();
+    pool.active = SIZE_MAX;
+    const auto removed = std::erase_if(pool.pages, [&](const auto &page) {
+      if (gpu_heap_epoch_ - page.last_epoch > 50 || page.capacity > 65536 - retained_commands) return true;
+      retained_commands += page.capacity;
+      return false;
+    });
+    if (removed) {
+      pool.whole.clear(); // compaction can renumber retained pages
+      pool.indexed_pages = 0;
+    }
+    if (pool.pages.size() == 1) {
+      pool.pages[0].used = 0;
+      pool.active = 0;
+    } else {
+      for (; pool.indexed_pages < pool.pages.size(); ++pool.indexed_pages)
+        pool.whole[pool.pages[pool.indexed_pages].capacity].indices.push_back(pool.indexed_pages);
+      for (auto &[capacity, group] : pool.whole) group.unused = group.indices.size();
+    }
+    if (pool.pages.empty()) it = icb_.erase(it);
+    else ++it;
+  }
   // Retain a contiguous prefix: dropping an interior chunk would change virtual offsets.
   size_t keep = 1;
   uint64_t retained = gpu_heap_chunks_.front().capacity;
@@ -221,10 +246,11 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
       for (auto *cmd = reinterpret_cast<const wmtcmd_base *>(&compute.cmd_head); cmd;
            cmd = static_cast<const wmtcmd_base *>(cmd->next.get_accessible_or_null())) {
         const bool indirect = cmd->type == WMTComputeCommandDispatchIndirect;
+        const bool direct = cmd->type == WMTComputeCommandDispatch || cmd->type == WMTComputeCommandDispatchCompact;
         if (cmd->type != WMTComputeCommandNop && cmd->type != WMTComputeCommandSetPSO &&
             cmd->type != WMTComputeCommandSetBuffer && cmd->type != WMTComputeCommandUseResource &&
-            cmd->type != WMTComputeCommandDispatch && !indirect) shape.compute_commands_complete = false;
-        if (cmd->type == WMTComputeCommandDispatch || indirect) {
+            !direct && !indirect) shape.compute_commands_complete = false;
+        if (direct || indirect) {
           if (dispatch_index >= compute.dispatch_accesses.size() ||
               compute.dispatch_accesses[dispatch_index].command != cmd ||
               !compute.dispatch_accesses[dispatch_index].complete) {
@@ -237,10 +263,18 @@ HRESULT MTLD3D12CommandAllocatorImpl::SealRecordingPlan() try {
       }
       shape.dispatch_access_complete &= shape.compute_commands_complete &&
           dispatch_index == compute.dispatch_accesses.size();
+      const RecordedDispatchAccess *previous = nullptr;
       if (shape.dispatch_access_complete) for (const auto &dispatch : compute.dispatch_accesses) {
+        if (previous && previous->buffers == dispatch.buffers && previous->tables == dispatch.tables) {
+          shape.dispatch_memberships.push_back(shape.dispatches.size() - 1);
+          continue;
+        }
+        previous = &dispatch;
+        shape.dispatch_memberships.push_back(shape.dispatches.size());
         ClosedDispatchShape closed;
         closed.buffers = dispatch.buffers;
-        for (const auto index : dispatch.tables) {
+        for (uint64_t remaining = dispatch.tables; remaining; remaining &= remaining - 1) {
+          const auto index = unsigned(__builtin_ctzll(remaining));
           if (!compute.submission_tables || index >= compute.submission_tables->size()) {
             closed.descriptors_complete = false; break;
           }
@@ -450,25 +484,66 @@ MTLD3D12CommandAllocatorImpl::ClearRecordedCommands() {
 }
 
 WMT::Reference<WMT::IndirectCommandBuffer>
-MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uint64_t count, WMTResourceOptions options) {
-  // Both resolver families reset every entry [0,count), even count-buffer and
-  // predication-disabled entries, before testing their actual count. Extra
-  // capacity is never executed. Reset is accepted only after full retirement.
+MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, uint32_t count, WMTResourceOptions options,
+                                        uint32_t &first_command) {
+  return AcquirePreparedICB(info, count, options, first_command, false, [] { return true; });
+}
+
+template<class Prepare>
+WMT::Reference<WMT::IndirectCommandBuffer>
+MTLD3D12CommandAllocatorImpl::AcquirePreparedICB(WMTIndirectCommandBufferInfo &info, uint32_t count,
+    WMTResourceOptions options, uint32_t &first_command, bool reuse_only, Prepare prepare) {
+  // Each recording owns a distinct interval until the whole allocator retires.
+  // Keep resolver/execute positions physical; arguments and predicate counts stay local.
+  first_command = 0;
   info.gpu_resource_id = 0;
-  auto found = std::find_if(icb_.begin(), icb_.end(), [&](const auto &entry) {
-    return !entry.used && entry.capacity >= count && entry.options == options &&
-        NativeIndirectCommandKey(entry.info) == NativeIndirectCommandKey(info);
-  });
-  if (found != icb_.end()) {
-    found->used = true; found->last_epoch = gpu_heap_epoch_; info.gpu_resource_id = found->resource_id;
-    owned_graphics::Trace("indirect_buffer_reuse", ",\"allocator\":", trace_id_,
-        ",\"count\":", count, ",\"capacity\":", found->capacity);
-    return found->buffer;
+  const ICBKey key{options, NativeIndirectCommandKey(info)};
+  const auto first = icb_.begin();
+  auto it = first != icb_.end() && first->first == key ? first :
+            reuse_only ? icb_.find(key) : icb_.try_emplace(key).first;
+  if (it == icb_.end()) return {};
+  auto &pool = it->second;
+  const uint32_t remaining = pool.active == SIZE_MAX ? 0 : pool.pages[pool.active].capacity - pool.pages[pool.active].used;
+  const bool needs_page = pool.active == SIZE_MAX || remaining < count;
+  auto fit = pool.available.end();
+  auto whole = pool.whole.end();
+  if (needs_page) {
+    fit = pool.available.lower_bound(count);
+    whole = pool.whole.lower_bound(count);
+    while (whole != pool.whole.end() && !whole->second.unused) ++whole;
+    if (reuse_only && fit == pool.available.end() && whole == pool.whole.end()) return {};
   }
-  const auto key = info;
-  auto buffer = device_->GetMTLDevice().newIndirectCommandBuffer(info, count, options);
-  if (buffer) icb_.push_back({key, options, buffer, count, info.gpu_resource_id, gpu_heap_epoch_, true});
-  return buffer;
+  // PSO and control storage must be ready before consuming the selected interval.
+  if (!prepare()) return {};
+  if (needs_page) {
+    if (remaining) pool.IndexPage(remaining, pool.active);
+    pool.active = SIZE_MAX;
+    if (fit != pool.available.end() && (whole == pool.whole.end() || fit->first <= whole->first)) {
+      pool.active = fit->second.back();
+      fit->second.pop_back();
+      if (fit->second.empty()) pool.available.erase(fit);
+    } else if (whole != pool.whole.end()) {
+      auto &group = whole->second;
+      pool.active = group.indices[--group.unused];
+      pool.pages[pool.active].used = 0;
+    } else {
+      const auto capacity = uint32_t(std::min<uint64_t>((uint64_t(count) + 63) & ~uint64_t(63), UINT32_MAX));
+      auto buffer = device_->GetMTLDevice().newIndirectCommandBuffer(info, capacity, options);
+      if (buffer) {
+        pool.pages.push_back({buffer, info.gpu_resource_id, gpu_heap_epoch_, capacity, count});
+        pool.active = pool.pages.size() - 1;
+      }
+      return buffer;
+    }
+  }
+  auto &page = pool.pages[pool.active];
+  first_command = page.used;
+  page.used += count;
+  page.last_epoch = gpu_heap_epoch_;
+  info.gpu_resource_id = page.resource_id;
+  owned_graphics::Trace("indirect_buffer_reuse", ",\"allocator\":", trace_id_,
+      ",\"count\":", count, ",\"capacity\":", page.capacity, ",\"first_command\":", first_command);
+  return page.buffer;
 }
 
 IndirectComputeCommandData *
@@ -500,7 +575,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  auto icb = AcquireICB(info, MaxCount, WMTResourceStorageModeShared);
+  uint32_t first_command;
+  auto icb = AcquireICB(info, uint32_t(MaxCount), WMTResourceStorageModeShared, first_command);
   if (!icb) return nullptr;
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectComputeCommandData), 16);
@@ -510,6 +586,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   auto data = reinterpret_cast<IndirectComputeCommandData *>(Ptr);
 
   data->cmd_buf = info.gpu_resource_id;
+  data->first_command = first_command;
   data->max_count = MaxCount;
   data->tgsize_x = pPSO->threadgroup_size.width;
   data->tgsize_y = pPSO->threadgroup_size.height;
@@ -571,7 +648,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
   auto &cmd = EncodeComputeCommand<wmtcmd_compute_executecommands>();
   cmd.type = WMTComputeCommandExecuteCommandsInBuffer;
   cmd.indirect_command_buffer = icb;
-  cmd.location = 0;
+  cmd.location = first_command;
   cmd.length = MaxCount;
   auto &restore = EncodeComputeCommand<wmtcmd_compute_setpso>();
   restore.type = WMTComputeCommandSetPSO;
@@ -585,15 +662,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectComputeCommand(
 
 IndirectRenderCommandData *
 MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
-    MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull
+    MTLD3D12CommandSignature *pCmdSig, MTLD3D12GraphicsPipelineState *pPSO, size_t MaxCount, bool index_pull, bool reuse_only
 ) {
-  // The trailing restore binds the direct `pso`; indirect draws are never omitted.
-  if (!pPSO->WaitNativePipeline())
-    return nullptr;
-  auto indirect_pso = index_pull ? pPSO->GetIndexPullPipelineState(true)
-                                 : pPSO->GetIndirectCommandBufferPipelineState();
-  if (!indirect_pso)
-    return nullptr;
   WMTIndirectCommandBufferInfo info{};
   info.inherit_buffers = !(index_pull || pCmdSig->UpdateVertexBuffers || pCmdSig->UpdateIndexBuffer ||
                            pCmdSig->UpdateRootArguments || pPSO->view_location_offsets);
@@ -619,7 +689,16 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   info.max_object_threadgroup_memory_binding = 0;
   info.gpu_resource_id = 0;
 
-  auto icb = AcquireICB(info, MaxCount, WMTResourceStorageModePrivate);
+  WMT::RenderPipelineState indirect_pso;
+  auto prepare = [&] {
+    if (!pPSO->WaitNativePipeline()) return false;
+    indirect_pso = index_pull ? pPSO->GetIndexPullPipelineState(true)
+                              : pPSO->GetIndirectCommandBufferPipelineState(!reuse_only);
+    return indirect_pso && (!reuse_only || ReserveGPUHeap(sizeof(IndirectRenderCommandData), 16));
+  };
+  uint32_t first_command;
+  auto icb = AcquirePreparedICB(info, uint32_t(MaxCount), WMTResourceStorageModePrivate, first_command,
+                                reuse_only, prepare);
   if (!icb) return nullptr;
 
   auto [Ptr, Offset] = AllocateGPUHeap(sizeof(IndirectRenderCommandData), 16);
@@ -629,6 +708,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   auto data = reinterpret_cast<IndirectRenderCommandData *>(Ptr);
 
   data->cmd_buf = info.gpu_resource_id;
+  data->first_command = first_command;
   data->max_count = MaxCount;
   auto &vertex_constants = pPSO->view_location_offsets
       ? index_pull ? pPSO->indirect_view_index_pull_vertex_constants : pPSO->indirect_view_vertex_constants
@@ -666,6 +746,8 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->index_buffer_format = {};
     data->index_pull_controls = 0;
     data->index_pull_mode = ~0u;
+    data->static_sampler_stages = 0;
+    data->root_argument_stages = 0;
     data->so_draws = 0;
     data->pipeline_statistics = 0;
   }
@@ -730,7 +812,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
   auto &cmd = EncodeRenderCommand<wmtcmd_render_executecommands>();
   cmd.type = WMTRenderCommandExecuteCommandsInBuffer;
   cmd.indirect_command_buffer = icb;
-  cmd.location = 0;
+  cmd.location = first_command;
   cmd.length = MaxCount;
   auto &restore = EncodeRenderCommand<wmtcmd_render_setpso>();
   restore.type = WMTRenderCommandSetPSO;

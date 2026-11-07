@@ -24,12 +24,21 @@
 #include "d3dalloy_sampler.hpp"
 #include "log/log.hpp"
 #include <atomic>
+#include <bit>
+#include <cstring>
+#include <type_traits>
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 #include <map>
 #include <shared_mutex>
 #endif
 
 namespace d3dalloy {
+
+template <typename T>
+static void CopyDescriptorRecords(T *destination, const T *source, UINT count) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  std::memmove(destination, source, sizeof(T) * count);
+}
 
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
 namespace {
@@ -213,7 +222,33 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   D3D12_DESCRIPTOR_HEAP_DESC desc_;
 
   std::vector<ShaderVisibleDescriptorCPUStorage> descriptors_;
-  std::unique_ptr<std::atomic<uint64_t>[]> descriptor_versions_;
+  struct DescriptorBlock {
+    std::atomic<uint64_t> version{0};
+    std::atomic<uint64_t> pooled{0};
+    std::atomic<uint64_t> copy_token{0};
+
+    std::atomic<uint64_t> dirty_slots{UINT64_MAX};
+    std::atomic_flag publishing{};
+    uint64_t last_source_token = 0;
+
+    // Multiple CPU readers may copy the same block to different heaps.
+    // Only the publisher advances its baseline; a concurrent reader can
+    // always copy the complete block without waiting or claiming a token.
+    uint64_t PublishSource(uint64_t target, uint64_t &changed) {
+      if (publishing.test_and_set(std::memory_order_acquire)) return 0;
+      auto token = copy_token.load(std::memory_order_relaxed);
+      if (!token) {
+        const auto dirty = dirty_slots.exchange(0, std::memory_order_relaxed);
+        if (target && target == last_source_token) changed = dirty;
+        token = last_source_token = owned_graphics::NewObjectId();
+        copy_token.store(token, std::memory_order_relaxed);
+      }
+      publishing.clear(std::memory_order_release);
+      return token;
+    }
+  };
+  static_assert(kDescriptorVersionGranularity == 64);
+  std::unique_ptr<DescriptorBlock[]> blocks_;
   Rc<Buffer> buffer_;
   ShaderVisibleDescriptorGPUStorage *mapped_argument_buffer_ = nullptr;
   uint64_t argument_buffer_gpu_address_ = 0;
@@ -228,20 +263,57 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
   void InvalidateDescriptors(UINT first, UINT count) {
     if (!count) return;
     const uint64_t last = (uint64_t(first) + count - 1) / kDescriptorVersionGranularity;
-    for (uint64_t block = first / kDescriptorVersionGranularity; block <= last; ++block)
-      descriptor_versions_[block].fetch_add(1, std::memory_order_release);
+    for (uint64_t block = first / kDescriptorVersionGranularity; block <= last; ++block) {
+      blocks_[block].copy_token.store(0, std::memory_order_relaxed);
+      if (buffer_) blocks_[block].version.fetch_add(1, std::memory_order_release);
+      else {
+        const unsigned lo = block == first / 64 ? first % 64 : 0;
+        const unsigned hi = block == last ? (uint64_t(first) + count - 1) % 64 : 63;
+        blocks_[block].dirty_slots.fetch_or((UINT64_MAX << lo) & (UINT64_MAX >> (63 - hi)), std::memory_order_relaxed);
+      }
+    }
   }
 
-  ShaderVisibleDescriptorCPUStorage &WritableDescriptor(UINT index) {
+  bool HasPooledSlots(UINT first, UINT count) const {
+    while (count) {
+      const unsigned bit = first % 64, span = std::min<UINT>(count, 64 - bit);
+      const uint64_t mask = (UINT64_MAX >> (64 - span)) << bit;
+      if (blocks_[first / 64].pooled.load(std::memory_order_relaxed) & mask) return true;
+      first += span;
+      count -= span;
+    }
+    return false;
+  }
+
+  void MarkPooled(UINT index) {
+    if (!pool_slots_[index].texture)
+      blocks_[index / 64].pooled.fetch_or(uint64_t(1) << (index % 64), std::memory_order_relaxed);
+  }
+
+  void MarkPooledRange(UINT first, UINT count) {
+    while (count) {
+      const unsigned bit = first % 64, span = std::min<UINT>(count, 64 - bit);
+      blocks_[first / 64].pooled.fetch_or((UINT64_MAX >> (64 - span)) << bit, std::memory_order_relaxed);
+      first += span;
+      count -= span;
+    }
+  }
+
+  ShaderVisibleDescriptorCPUStorage &WritableDescriptor(UINT index, uint64_t owner_id = 0, uint64_t counter_owner_id = 0) {
     // Also invalidate partial/failed replacements. As with GetDescriptor,
     // callers must not race writes to a slot with a submitted use of that slot.
     InvalidateDescriptors(index, 1);
+    descriptors_[index].owner_id = owner_id;
+    descriptors_[index].counter_owner_id = counter_owner_id;
     return descriptors_[index];
   }
 
   void ResetPoolSlot(UINT index) {
-    if (pool_slots_[index].texture) view_pool_.clear(index);
-    pool_slots_[index] = {};
+    if (pool_slots_[index].texture) {
+      view_pool_.clear(index);
+      pool_slots_[index] = {};
+      blocks_[index / 64].pooled.fetch_and(~(uint64_t(1) << (index % 64)), std::memory_order_relaxed);
+    }
   }
 
   bool SetPoolSlot(UINT index, Texture *texture, TextureViewKey key) {
@@ -251,13 +323,14 @@ class MTLD3D12DescriptorHeapImpl : public MTLD3D12Pageable<MTLD3D12DescriptorHea
     }
     const auto descriptor = texture->viewDescriptor(key);
     auto &slot = pool_slots_[index];
+    MarkPooled(index);
     slot.texture = texture->current()->texture();
     slot.info = {uint32_t(descriptor.format), uint32_t(descriptor.type), descriptor.firstMiplevel,
                  descriptor.miplevelCount, descriptor.firstArraySlice, descriptor.arraySize};
     mapped_argument_buffer_[index].SRVTexture.resource_id = view_pool_.setTextureView(slot.texture, slot.info, index);
     // Native set replaces the old slot and its residency owner atomically. A
     // rejected set must still leave a null slot, as the former clear+set did.
-    if (!mapped_argument_buffer_[index].SRVTexture.resource_id) view_pool_.clear(index);
+    if (!mapped_argument_buffer_[index].SRVTexture.resource_id) ResetPoolSlot(index);
     return true;
   }
 #ifndef D3DALLOY_USE_EMBEDDED_HEAP_POINTER
@@ -272,14 +345,7 @@ public:
   }
 
   uint64_t GetDescriptorVersion(UINT index) const override {
-    return descriptor_versions_[index / kDescriptorVersionGranularity].load(std::memory_order_acquire);
-  }
-
-  void SetDescriptorOwner(UINT index, uint64_t owner_id, uint64_t counter_owner_id) override {
-    if (index >= descriptors_.size()) return;
-    auto &descriptor = WritableDescriptor(index);
-    descriptor.owner_id = owner_id;
-    descriptor.counter_owner_id = counter_owner_id;
+    return blocks_[index / kDescriptorVersionGranularity].version.load(std::memory_order_acquire);
   }
 
   HRESULT
@@ -295,7 +361,7 @@ public:
       return E_INVALIDARG;
     }
     descriptors_.resize(pDesc->NumDescriptors);
-    descriptor_versions_ = std::make_unique<std::atomic<uint64_t>[]>(
+    blocks_ = std::make_unique<DescriptorBlock[]>(
         (uint64_t(pDesc->NumDescriptors) + kDescriptorVersionGranularity - 1) / kDescriptorVersionGranularity);
     pool_slots_.resize(pDesc->NumDescriptors);
     pool_supported_ = device_->GetMTLDevice().supportsMetal4();
@@ -390,16 +456,16 @@ public:
   }
 
   virtual HRESULT
-  AddShaderResourceView(UINT Index, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
+  AddShaderResourceView(UINT Index, uint64_t owner_id, Texture *Texture, TextureViewKey View, FLOAT ResourceMinLODClamp,
                         bool CubeView, bool CenterSamplePattern, UINT64 FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    auto &cpu_storage = WritableDescriptor(Index);
+    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
+    if (texture_view ? !texture_view->texture : !mapped_argument_buffer_[Index].SRVTexture.resource_id) return E_OUTOFMEMORY;
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexture;
     cpu_storage.SRVTexture.texture = Texture;
     cpu_storage.SRVTexture.view = View;
-    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
-    if (texture_view && !texture_view->texture) return E_OUTOFMEMORY;
     auto &gpu_storage = mapped_argument_buffer_[Index];
     if (texture_view) gpu_storage.SRVTexture.resource_id = texture_view->gpuResourceID;
     // The physical view's array range counts faces; a shader cube-array
@@ -449,17 +515,17 @@ public:
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
+  AddUnorderedAccessView(UINT Index, uint64_t owner_id, Texture *Texture, TextureViewKey View, uint16_t FirstWSlice, uint16_t WSize, UINT FormatDefaults) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
-    auto &cpu_storage = WritableDescriptor(Index);
+    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
+    if (texture_view ? !texture_view->texture : !mapped_argument_buffer_[Index].SRVTexture.resource_id) return E_OUTOFMEMORY;
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexture;
     cpu_storage.UAVTexture.texture = Texture;
     cpu_storage.UAVTexture.view = View;
     cpu_storage.UAVTexture.first_w_slice = FirstWSlice;
     cpu_storage.UAVTexture.w_size = WSize;
-    const auto *texture_view = SetPoolSlot(Index, Texture, View) ? nullptr : &Texture->view(View);
-    if (texture_view && !texture_view->texture) return E_OUTOFMEMORY;
     auto &gpu_storage = mapped_argument_buffer_[Index];
     if (texture_view) gpu_storage.UAVTexture.resource_id = texture_view->gpuResourceID;
     // The D3D12 texture3D UAV's high metadata word packs its logical W range.
@@ -483,11 +549,11 @@ public:
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice) {
+  AddUnorderedAccessView(UINT Index, uint64_t owner_id, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVTexelBuffer;
     cpu_storage.UAVTexelBuffer.buffer = UAVBuffer;
     cpu_storage.UAVTexelBuffer.slice = Slice;
@@ -506,16 +572,16 @@ public:
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes) {
+  AddUnorderedAccessView(UINT Index, uint64_t owner_id, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT64 CounterOffsetInBytes, uint64_t counter_owner_id) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id, counter_owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::UAVBuffer;
     cpu_storage.UAVBuffer.buffer = UAVBuffer;
     cpu_storage.UAVBuffer.slice = Slice;
     cpu_storage.UAVBuffer.counter = Counter;
-    cpu_storage.UAVBuffer.counter_offset = CounterOffsetInBytes;
+    cpu_storage.counter_page = CounterOffsetInBytes / D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT;
     auto &gpu_storage = mapped_argument_buffer_[Index];
     if (UAVBuffer) {
       gpu_storage.UAVBuffer.pointer = UAVBuffer->current()->gpuAddress() + Slice.byteOffset;
@@ -530,11 +596,11 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) {
+  virtual HRESULT AddShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVTexelBuffer;
     cpu_storage.SRVTexelBuffer.buffer = Buffer;
     cpu_storage.SRVTexelBuffer.slice = Slice;
@@ -552,12 +618,12 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT AddRGB32ShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice,
+  virtual HRESULT AddRGB32ShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferSlice Slice,
                                              UINT Shader4ComponentMapping) {
     if (Index >= descriptors_.size() || !Buffer)
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVRGB32Buffer;
     cpu_storage.SRVRGB32Buffer.buffer = Buffer;
     cpu_storage.SRVRGB32Buffer.slice = Slice;
@@ -571,11 +637,11 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT AddShaderResourceView(UINT Index, Buffer *Buffer, BufferSlice Slice) {
+  virtual HRESULT AddShaderResourceView(UINT Index, uint64_t owner_id, Buffer *Buffer, BufferSlice Slice) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::SRVBuffer;
     cpu_storage.SRVBuffer.buffer = Buffer;
     cpu_storage.SRVBuffer.slice = Slice;
@@ -631,11 +697,11 @@ public:
   }
 
   virtual HRESULT
-  AddSamplerFeedbackView(UINT Index, Buffer *Cells, uint64_t CellBytes, bool Paired, uint64_t LayoutWord) {
+  AddSamplerFeedbackView(UINT Index, uint64_t owner_id, Buffer *Cells, uint64_t CellBytes, bool Paired, uint64_t LayoutWord) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     ResetPoolSlot(Index);
-    auto &cpu_storage = WritableDescriptor(Index);
+    auto &cpu_storage = WritableDescriptor(Index, owner_id);
     cpu_storage.type = ShaderVisibleDescriptorType::SamplerFeedback;
     cpu_storage.SamplerFeedback.buffer = Cells;
     cpu_storage.SamplerFeedback.slice = {0, CellBytes, 0, uint32_t(CellBytes / 4)};
@@ -667,12 +733,88 @@ public:
   virtual void
   CopyDescriptors(UINT From, MTLD3D12DescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
     auto *destination = static_cast<MTLD3D12DescriptorHeapImpl *>(pHeapTo);
-    if (destination == this && From == DescriptorTo) return;
+    if (!CopyCount || (destination == this && From == DescriptorTo)) return;
+    // A token identifies all CPU and GPU bytes of a complete unpooled block.
+    // D3D12 excludes writing the same slots concurrently. Independent writes
+    // in a shared block may race only on its atomic invalidation, never on data.
+    const UINT head = (-From) & (kDescriptorVersionGranularity - 1);
+    if (!buffer_ && destination->buffer_ &&
+        (From % kDescriptorVersionGranularity) == (DescriptorTo % kDescriptorVersionGranularity) &&
+        CopyCount >= head + kDescriptorVersionGranularity) {
+      if (head) {
+        CopyDescriptors(From, destination, DescriptorTo, head);
+        From += head;
+        DescriptorTo += head;
+        CopyCount -= head;
+      }
+      const UINT complete = CopyCount - CopyCount % kDescriptorVersionGranularity;
+      unsigned dirty_begin = 0;
+      auto copy = [&](unsigned begin, unsigned end) {
+        if (begin == end) return;
+        CopyDescriptorRecords(destination->descriptors_.data() + DescriptorTo + begin,
+            descriptors_.data() + From + begin, end - begin);
+        CopyDescriptorRecords(destination->mapped_argument_buffer_ + DescriptorTo + begin,
+            mapped_argument_buffer_ + From + begin, end - begin);
+      };
+      unsigned i = 0;
+      for (; i < complete; i += kDescriptorVersionGranularity) {
+        auto &source_block = blocks_[(From + i) / kDescriptorVersionGranularity];
+        auto &target_block = destination->blocks_[(DescriptorTo + i) / kDescriptorVersionGranularity];
+        const auto known = source_block.copy_token.load(std::memory_order_relaxed);
+        const auto target = target_block.copy_token.load(std::memory_order_relaxed);
+        if (known && target == known) {
+          copy(dirty_begin, i);
+          dirty_begin = i + kDescriptorVersionGranularity;
+          continue;
+        }
+        if (source_block.pooled.load(std::memory_order_relaxed) ||
+            target_block.pooled.load(std::memory_order_relaxed)) break;
+        target_block.version.fetch_add(1, std::memory_order_release);
+        uint64_t changed = UINT64_MAX;
+        const auto token = known ? known : source_block.PublishSource(target, changed);
+        target_block.copy_token.store(token, std::memory_order_relaxed);
+        if (changed != UINT64_MAX) {
+          copy(dirty_begin, i);
+          if (changed) {
+            const unsigned first = std::countr_zero(changed), end = 64 - std::countl_zero(changed);
+            const unsigned first_end = first + std::countr_one(changed >> first);
+            const uint64_t rest = first_end < end ? changed >> first_end : 0;
+            // Split only two separated runs; dense or fragmented masks retain a single bulk copy.
+            const unsigned gap = std::countr_zero(rest);
+            if (rest && gap >= 4 && std::has_single_bit((rest >> gap) + 1)) {
+              copy(i + first, i + first_end);
+              copy(i + first_end + gap, i + end);
+            } else {
+              copy(i + first, i + end);
+            }
+          }
+          dirty_begin = i + kDescriptorVersionGranularity;
+        }
+      }
+      copy(dirty_begin, i);
+      if (i == CopyCount) return;
+      From += i;
+      DescriptorTo += i;
+      CopyCount -= i;
+    }
     destination->InvalidateDescriptors(DescriptorTo, CopyCount);
+    // Non-pooled slots have no native view or retained texture to replace, including on heaps without a pool.
+    if (CopyCount == 1 && !pool_slots_[From].texture && !destination->pool_slots_[DescriptorTo].texture) {
+      destination->descriptors_[DescriptorTo] = descriptors_[From];
+      destination->mapped_argument_buffer_[DescriptorTo] = mapped_argument_buffer_[From];
+      return;
+    }
+    if ((!view_pool_ && !destination->view_pool_) ||
+        (CopyCount > 1 && !HasPooledSlots(From, CopyCount) && !destination->HasPooledSlots(DescriptorTo, CopyCount))) {
+      CopyDescriptorRecords(destination->descriptors_.data() + DescriptorTo, descriptors_.data() + From, CopyCount);
+      CopyDescriptorRecords(destination->mapped_argument_buffer_ + DescriptorTo, mapped_argument_buffer_ + From, CopyCount);
+      return;
+    }
     const bool overlap = destination == this && DescriptorTo < From + CopyCount && From < DescriptorTo + CopyCount;
     const bool reverse = overlap && DescriptorTo > From;
+    unsigned single_copy_until = 0;
     for (unsigned n = 0; n < CopyCount;) {
-      if (!overlap && view_pool_ && destination->view_pool_) {
+      if (!overlap && n >= single_copy_until && view_pool_ && destination->view_pool_) {
         unsigned range = 0;
         while (n + range < CopyCount && pool_slots_[From + n + range].texture)
           ++range;
@@ -683,12 +825,12 @@ public:
           const uint64_t destination_id = destination->view_pool_.copyTextureViews(
               view_pool_, From + n, DescriptorTo + n, range);
           if (destination_id) {
+            destination->MarkPooledRange(DescriptorTo + n, range);
+            CopyDescriptorRecords(destination->descriptors_.data() + DescriptorTo + n, descriptors_.data() + From + n,
+                                  range);
             for (unsigned i = 0; i < range; ++i) {
-              const auto slot = pool_slots_[From + n + i];
-              const auto cpu = descriptors_[From + n + i];
               auto gpu = mapped_argument_buffer_[From + n + i];
-              destination->descriptors_[DescriptorTo + n + i] = cpu;
-              destination->pool_slots_[DescriptorTo + n + i] = slot;
+              destination->pool_slots_[DescriptorTo + n + i] = pool_slots_[From + n + i];
               gpu.SRVTexture.resource_id = destination_id +
                   (gpu.SRVTexture.resource_id - source_id);
               destination->mapped_argument_buffer_[DescriptorTo + n + i] = gpu;
@@ -696,23 +838,25 @@ public:
             n += range;
             continue;
           }
+          // The ordinary-view fallback copies one slot at a time. Do not retry every suffix of this run.
+          single_copy_until = n + range;
         }
       }
       const unsigned i = reverse ? CopyCount - n - 1 : n;
-      const auto slot = pool_slots_[From + i];
-      const auto cpu = descriptors_[From + i];
+      const auto &slot = pool_slots_[From + i];
       auto gpu = mapped_argument_buffer_[From + i];
       // The native slot copy replaces the destination texture, so only a non-pool source needs the clear.
-      if (!slot.texture)
-        destination->ResetPoolSlot(DescriptorTo + i);
-      destination->descriptors_[DescriptorTo + i] = cpu;
-      destination->pool_slots_[DescriptorTo + i] = slot;
+      destination->descriptors_[DescriptorTo + i] = descriptors_[From + i];
       if (slot.texture) {
+        destination->MarkPooled(DescriptorTo + i);
+        destination->pool_slots_[DescriptorTo + i] = slot;
         gpu.SRVTexture.resource_id = destination->view_pool_.copyTextureView(
             view_pool_, From + i, DescriptorTo + i, slot.texture, slot.info);
         // A rejected copy leaves the old native slot; clear it as the reset would have.
         if (!gpu.SRVTexture.resource_id)
-          destination->view_pool_.clear(DescriptorTo + i);
+          destination->ResetPoolSlot(DescriptorTo + i);
+      } else {
+        destination->ResetPoolSlot(DescriptorTo + i);
       }
       destination->mapped_argument_buffer_[DescriptorTo + i] = gpu;
       ++n;
@@ -815,10 +959,9 @@ public:
 
   virtual void
   CopyDescriptors(UINT From, MTLD3D12RenderTargetDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
-    for (unsigned i = 0; i < CopyCount; i++) {
-      static_cast<MTLD3D12RenderTargetDescriptorHeapImpl *>(pHeapTo)->render_targets_[DescriptorTo + i] =
-          render_targets_[From + i];
-    }
+    if (CopyCount)
+      CopyDescriptorRecords(static_cast<MTLD3D12RenderTargetDescriptorHeapImpl *>(pHeapTo)->render_targets_.data() +
+          DescriptorTo, render_targets_.data() + From, CopyCount);
   }
 };
 
@@ -957,7 +1100,7 @@ public:
       return E_INVALIDARG;
   
     WMTSamplerInfo info;
-    PopulateWMTSamplerInfo(device_->GetMTLDevice(), info, *pDesc);
+    PopulateWMTSamplerInfo(info, *pDesc);
     const bool non_normalized = Flags & D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES;
     if (non_normalized) {
       if (!sampler_feedback::ValidNonNormalizedSampler(*pDesc))
@@ -990,11 +1133,24 @@ public:
 
   virtual void
   CopyDescriptors(UINT From, MTLD3D12SamplerDescriptorHeap *pHeapTo, UINT DescriptorTo, UINT CopyCount) {
-    for (unsigned i = 0; i < CopyCount; i++) {
-      static_cast<MTLD3D12SamplerDescriptorHeapImpl *>(pHeapTo)->samplers_[DescriptorTo + i] = samplers_[From + i];
-      static_cast<MTLD3D12SamplerDescriptorHeapImpl *>(pHeapTo)->mapped_argument_buffer_[DescriptorTo + i] =
-          mapped_argument_buffer_[From + i];
+    auto *destination = static_cast<MTLD3D12SamplerDescriptorHeapImpl *>(pHeapTo);
+    if (!CopyCount || (destination == this && From == DescriptorTo)) return;
+    auto first = samplers_.begin() + From;
+    auto target = destination->samplers_.begin() + DescriptorTo;
+    // The CPU records retain their samplers. Only the shader-visible record is a byte copy.
+    if (CopyCount == 1) {
+      if (*first != *target) *target = *first;
+      destination->mapped_argument_buffer_[DescriptorTo] = mapped_argument_buffer_[From];
+      return;
     }
+    if (destination == this && DescriptorTo > From && DescriptorTo - From < CopyCount)
+      std::copy_backward(first, first + CopyCount, target + CopyCount);
+    else if (*first == *target) {
+      for (UINT i = 1; i < CopyCount; ++i)
+        if (first[i] != target[i]) target[i] = first[i];
+    } else
+      std::copy_n(first, CopyCount, target);
+    CopyDescriptorRecords(destination->mapped_argument_buffer_ + DescriptorTo, mapped_argument_buffer_ + From, CopyCount);
   }
 };
 

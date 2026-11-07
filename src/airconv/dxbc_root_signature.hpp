@@ -28,6 +28,10 @@
 
 namespace d3dalloy {
 
+inline bool StaticSamplerRegisterInRange(uint32_t reg, uint32_t base, uint32_t count) {
+  return reg >= base && (count == UINT32_MAX || reg - base < count);
+}
+
 struct RawRootSignatureDesc {
   uint32_t Version;
   uint32_t NumParameters;

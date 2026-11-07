@@ -53,10 +53,12 @@ public:
     feedback = layout;
     const uint64_t bytes = layout.totalCells() * 4;
     auto metal = device_->GetMTLDevice();
-    if (bytes > metal.maxBufferLength())
+    if (bytes > device_->max_buffer_length)
       return E_OUTOFMEMORY;
+    uint64_t placement_size = 0;
     if (heap) {
       const auto native = metal.heapBufferSizeAndAlign(bytes, {});
+      placement_size = native.size;
       if (!resource_contract::PlacementFits(offset, native.size, heap->GetDesc().SizeInBytes,
                                             D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, native.align))
         return E_INVALIDARG;
@@ -81,6 +83,8 @@ public:
       buffer->rename(buffer->allocate(flags)); // a new Metal buffer is zero filled: created cleared
     if (!buffer->current() || !buffer->current()->buffer())
       return E_OUTOFMEMORY;
+    if (heap && heap->placement_ranges)
+      buffer->current()->exclusivePlacement = heap->placement_ranges->Register(offset, placement_size);
     owns_registration_ = !heap;
     HRESULT hr = device_->RegisterResidencyAndVA(buffer->current(), owns_registration_ ? this : nullptr,
                                                  heap || !(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT));
@@ -191,7 +195,7 @@ HRESULT
 SamplerFeedbackAllocationInfo(MTLD3D12Device *pDevice, const sampler_feedback::Layout &layout,
                               D3D12_RESOURCE_ALLOCATION_INFO1 &info) {
   const uint64_t bytes = layout.totalCells() * 4;
-  if (bytes > pDevice->GetMTLDevice().maxBufferLength())
+  if (bytes > pDevice->max_buffer_length)
     return E_INVALIDARG;
   const auto native = pDevice->GetMTLDevice().heapBufferSizeAndAlign(bytes, {});
   info.Alignment = std::max<uint64_t>(native.align, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);

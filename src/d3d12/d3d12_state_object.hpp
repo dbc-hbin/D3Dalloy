@@ -94,9 +94,24 @@ static_assert(offsetof(OwnedShaderIdentifier, reserved) == 24);
 inline constexpr uint32_t kOwnedShaderIdentifierMagic = 0x4c413344; // 'D3AL'
 inline constexpr uint16_t kOwnedShaderIdentifierVersion = 1;
 
+struct NativeRaytracingArtifact;
+struct RayDispatchPipeline {
+  std::shared_ptr<const NativeRaytracingArtifact> executable;
+  WMT::Reference<WMT::ComputePipelineState> pipeline;
+  WMT::Reference<WMT::IntersectionFunctionTable> intersection_table;
+  WMT::Reference<WMT::VisibleFunctionTable> visible_table;
+  uint32_t threads = 1, callback_slots = 0;
+  uint64_t visible_id = 0, intersection_id = 0;
+  std::vector<std::pair<uint32_t, WMT::Reference<WMT::FunctionHandle>>> callback_handles;
+  bool BindIntersectionTable(WMT::Reference<WMT::IntersectionFunctionTable> &table,
+                             WMT::Buffer arguments, uint64_t offset) const;
+};
+
 class MTLD3D12StateObject : public ID3D12StateObject {
 public:
   bool uses_atomic64 = false;
+  bool uses_ray_query = false;
+  MTLD3D12RootSignature *local_texture_tables = nullptr; // owned by the export
   ShaderImmutableConstants immutable_constants;
   /** One application visible export, subobject or hit group. */
   struct Export {
@@ -184,45 +199,8 @@ public:
   virtual uint32_t GetMaxPayloadSize() const = 0;
   virtual uint32_t GetMaxAttributeSize() const = 0;
 
-  virtual WMT::Reference<WMT::ComputePipelineState> GetPipelineState() const = 0;
-  /** Power-of-two thread count of one ray generation threadgroup (SM50_RT_RAYGEN_THREADGROUP_SIZE bound). */
-  virtual uint32_t GetRayGenerationThreadgroupThreads() const = 0;
-  /**
-   * Tables of the compiled intersection functions. Miss, closest hit, any hit and
-   * callable exports are reached by direct calls from the lowered traversal, so
-   * only intersection functions need an intersection function table entry.
-   */
-  virtual WMT::Reference<WMT::IntersectionFunctionTable> GetIntersectionFunctionTable() const = 0;
-  /**
-   * Prepare the intersection function table one dispatch needs.
-   *
-   * Its functions are this state object's shared triangle and bounding-box callbacks.
-   * They resolve the hit group from GPU shader-table records, not hardware IFT slots.
-   * What differs per dispatch is the dispatch-arguments block the callback reads, which is
-   * bound in the table's own buffer argument table at SM50_RT_BINDING_INDEX_DISPATCH - an
-   * intersection function cannot see the compute encoder's bindings, so it has to be bound here.
-   *
-   * An empty `table` gets a new table of this pipeline; a non-empty one must have been made by an
-   * earlier call for the same pipeline and must not be read by any in-flight command buffer, since
-   * its bindings are overwritten. The state object's own table (GetIntersectionFunctionTable) is
-   * never mutated: it keeps serving the ray generation shader's encoder binding. Returns false when
-   * the pipeline has no callback or the table cannot be created.
-   */
-  virtual bool BindDispatchIntersectionFunctionTable(
-      WMT::Reference<WMT::IntersectionFunctionTable> &table, WMT::Buffer arguments, uint64_t arguments_offset,
-      WMT::Reference<WMT::VisibleFunctionTable> visible_function_table
-  ) = 0;
-  /**
-   * Table of every export the compiled traversal reaches by export index.
-   *
-   * Miss, closest hit, any hit and callable exports lower to `[[visible]]` Metal
-   * functions and are called through this table, never directly: slot 0 is always
-   * the null entry and export index N lives in slot N + 1, which is the layout
-   * SM50_RT_BINDING_INDEX_VISIBLE_FUNCTION_TABLE documents. Intersection functions
-   * are `[[intersection]]` and are reached through the intersection function table
-   * above, so they do not occupy a slot here.
-   */
-  virtual WMT::Reference<WMT::VisibleFunctionTable> GetVisibleFunctionTable() const = 0;
+  RayDispatchPipeline direct;
+  virtual const RayDispatchPipeline *GetIndirectDispatchPipeline() = 0;
 };
 
 HRESULT

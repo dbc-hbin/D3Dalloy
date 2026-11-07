@@ -516,7 +516,7 @@ void submissionLongFrontier(UINT count) {
 }
 
 // Attachment dependencies span node 64. An existing clear-promoted group at
-// 62/63 must stay separate from 64/65. The second control instead places the
+// 62/63 may extend through 64/65. The second control instead places the
 // pending clear at 63: it must materialize before history is cleared at 64.
 void submissionFrontierBoundary(bool delayedClear) {
   Context c; constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -561,9 +561,61 @@ void submissionFrontierBoundary(bool delayedClear) {
       if (static_cast<const UINT *>(mapped)[i] != 0x13579bdfu) fail("frontier-boundary-copy-values");
     output->Unmap(0, nullptr);
     std::printf("%s_GRAPH_FRONTIER_BOUNDARY delayed_clear=%u replay=%u rgba=%08x render_encoders=%u clear_encoders=%u exact=1 sealed=1\n",
-        kPrefix, unsigned(delayedClear), replay, color.at<UINT>(0), delayedClear ? 1u : 2u, delayedClear ? 1u : 0u);
+        kPrefix, unsigned(delayedClear), replay, color.at<UINT>(0), 1u, delayedClear ? 1u : 0u);
   }
   pass(delayedClear ? "graph-frontier-delayed-clear-boundary" : "graph-frontier-overlap-group-boundary");
+}
+
+void submissionRenderCarry(UINT control) {
+  Context c;
+  constexpr auto fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+  constexpr UINT count = 130;
+  auto rt = committed(c.dev.Get(), D3D12_HEAP_TYPE_DEFAULT,
+      texDesc(fmt, 4, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET), D3D12_RESOURCE_STATE_RENDER_TARGET);
+  ComPtr<ID3D12DescriptorHeap> rtvHeap;
+  const auto rtv = descriptor(c.dev.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, rtvHeap);
+  c.dev->CreateRenderTargetView(rt.Get(), nullptr, rtv);
+  Draw draw(c.dev.Get(), fmt, DXGI_FORMAT_UNKNOWN, 1, "psMain", true);
+  const float black[] = {0, 0, 0, 1}, red[] = {1 / 255.0f, 0, 0, 0};
+  std::vector<Context::List> lists; std::vector<ID3D12CommandList *> batch;
+  Readback intermediate;
+  for (UINT i = 0; i < count; ++i) {
+    lists.push_back(c.list());
+    auto *list = lists.back().list.Get();
+    if (control == 1 && i == 128) {
+      D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+      list->ResourceBarrier(1, &barrier);
+    }
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    draw.draw(list, 4, 4, red);
+    if (control == 2 && i == 63) {
+      transition(list, rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      intermediate = copyOut(c.dev.Get(), list, rt.Get());
+      transition(list, rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    check(list->Close(), "Close(render-carry)"); batch.push_back(list);
+  }
+  auto clear = c.list(), read = c.list();
+  clear.list->ClearRenderTargetView(rtv, black, 0, nullptr);
+  check(clear.list->Close(), "Close(render-carry-clear)");
+  transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  auto final = copyOut(c.dev.Get(), read.list.Get(), rt.Get());
+  transition(read.list.Get(), rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  check(read.list->Close(), "Close(render-carry-read)");
+  for (UINT replay = 0; replay < 2; ++replay) {
+    c.executeSealed({clear.list.Get()});
+    graphPhaseLine("%s_GRAPH_PHASE begin=graph-render-carry-%u replay=%u\n", kPrefix, control, replay);
+    c.executeSealed(batch);
+    graphPhaseLine("%s_GRAPH_PHASE end=graph-render-carry-%u replay=%u\n", kPrefix, control, replay);
+    c.executeSealed({read.list.Get()});
+    for (UINT y = 0; y < 4; ++y) for (UINT x = 0; x < 4; ++x) {
+      if (final.at<UINT>(x, y) != 0xff000082u) fail("render-carry-final");
+      if (control == 2 && intermediate.at<UINT>(x, y) != 0xff000040u) fail("render-carry-observation");
+    }
+    std::printf("%s_RENDER_CARRY control=%u replay=%u final=%08x observed=%08x\n",
+        kPrefix, control, replay, final.at<UINT>(0), control == 2 ? intermediate.at<UINT>(0) : 0);
+  }
+  pass(control == 0 ? "render-carry-positive" : control == 1 ? "render-carry-global" : "render-carry-observer");
 }
 
 void submissionDisjointMips() {
@@ -1025,7 +1077,10 @@ void redundantRenderTargetBindings() {
   const float blue[4] = {0, 0, 16 / 255.0f, 0};
   const float otherBlue[4] = {0, 0, 128 / 255.0f, 0};
   l.list->OMSetRenderTargets(1, &rtv, TRUE, nullptr);
+  // The binding captures the CPU descriptor, including across the first native pass creation.
+  c.dev->CreateRenderTargetView(second.Get(), nullptr, rtv);
   add.draw(l.list.Get(), 4, 4, red);
+  c.dev->CreateRenderTargetView(first.Get(), &view, rtv);
   l.list->OMSetRenderTargets(1, &rtv, TRUE, nullptr);
   add.draw(l.list.Get(), 4, 4, green);
   // A different CPU handle resolving to the same native view is also redundant.
@@ -1100,7 +1155,9 @@ void redundantDepthStencilBindings() {
   const float green[4] = {0, 32 / 255.0f, 0, 0};
   const float blue[4] = {0, 0, 16 / 255.0f, 0};
   l.list->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
+  c.dev->CreateDepthStencilView(second.Get(), nullptr, dsv);
   add.draw(l.list.Get(), 4, 4, red, 0.5f);
+  c.dev->CreateDepthStencilView(first.Get(), &view, dsv);
   l.list->OMSetRenderTargets(1, &rtv, TRUE, &dsv);
   add.draw(l.list.Get(), 4, 4, green, 0.25f);
   l.list->OMSetRenderTargets(1, &rtv, FALSE, &alias);
@@ -1888,6 +1945,7 @@ int main() {
   submissionLongFrontier(512);
   submissionFrontierBoundary(false);
   submissionFrontierBoundary(true);
+  for (UINT control = 0; control < 3; ++control) submissionRenderCarry(control);
   submissionDisjointMips();
   submissionDepthClearSrvRead();
   submissionAttachmentUnion(false);

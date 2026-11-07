@@ -45,7 +45,6 @@ struct SRInputs {
     FrameInfo info() const {
         FrameInfo p{}; p.inputContent={size,size};
         p.colorRect=p.depthRect=p.motionRect={0,0,size,size}; p.outputRect={0,0,256,256};
-        p.color=(void*)color; p.depth=(void*)depth; p.motionVectors=(void*)motion; p.output=(void*)output;
         return p;
     }
 };
@@ -111,10 +110,9 @@ void srExtentProof(GPU& gpu) {
     require(exactDescriptorInput(small.color,p.colorRect,112,112,112,112,b->colorUsage) &&
             exactDescriptorInput(small.depth,p.depthRect,112,112,112,112,b->depthUsage) &&
             exactDescriptorInput(small.motion,p.motionRect,112,112,112,112,b->motionUsage),"exact-shrink-direct-inputs");
-    const uint64_t activation=b->activation;
-    require(ensureScaler(*core,p,small.textures(),{},&error)==b && b->activation==activation,"steady-extent-no-activation");
+    require(ensureScaler(*core,p,small.textures(),{},&error)==b && core->lastEncodedGeneration==0,"steady-extent-no-activation");
     p.resetHistory=true;
-    require(ensureScaler(*core,p,small.textures(),{},&error)==b && b->activation==activation,"caller-reset-keeps-exact-generation");
+    require(ensureScaler(*core,p,small.textures(),{},&error)==b && core->lastEncodedGeneration==0,"caller-reset-keeps-exact-generation");
     for (unsigned width=113;width<=121;++width) {
         p=large.info(); p.inputContent={width,width};
         auto next=ensureScaler(*core,p,large.textures(),{},&error); require(bool(next),error.message.c_str());

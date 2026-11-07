@@ -39,12 +39,14 @@ struct Core {
   WMT::Reference<WMT::SharedEvent> timeline;
   std::mutex encode_mutex;
   std::mutex submission_mutex;
-  ~Core() {
+  void DestroyContext() {
     if (context) {
       WMTFGdestroy_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_DESTROY, 0, context}};
       request(p.header);
+      context = 0;
     }
   }
+  ~Core() { DestroyContext(); }
 };
 constexpr GUID kInternalStateId = {0xb2a31090,0xa1f2,0x4717,{0xbb,0x50,0x61,0x7a,0x47,0xf2,0xa0,0x13}};
 struct IOwnedFrameGenerationStateInternal : IUnknown {
@@ -101,9 +103,10 @@ class OwnedFrameGenerationState final : public ComObject<IMTLD3D12FrameGeneratio
   // A direct Prepare records nothing; its Generate on the same list adopts these inputs.
   std::mutex direct_mutex_;
   std::shared_ptr<OwnedFrameGenerationFrame> direct_inputs_;
+  std::atomic<bool> enabled_{true}; // Native contexts start enabled.
 public:
   explicit OwnedFrameGenerationState(std::shared_ptr<Core> core) : core_(std::move(core)) {}
-  ~OwnedFrameGenerationState() { Configure(FALSE); }
+  ~OwnedFrameGenerationState() { core_->DestroyContext(); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) final {
     if (!object) return E_POINTER;
     *object = nullptr;
@@ -116,7 +119,10 @@ public:
   HRESULT STDMETHODCALLTYPE Configure(BOOL enabled) final {
     if (enabled != FALSE && enabled != TRUE) return E_INVALIDARG;
     WMTFGconfigure_packet p{{sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_CONFIGURE, 0, core_->context}, UINT(enabled)};
-    return request(p.header);
+    std::lock_guard lock(direct_mutex_);
+    const HRESULT hr = request(p.header);
+    if (SUCCEEDED(hr)) enabled_.store(enabled != FALSE, std::memory_order_release);
+    return hr;
   }
   HRESULT STDMETHODCALLTYPE RetireFrame(UINT64 frame_id, UINT64 *oldest, BOOL *pending) final {
     if (!oldest || !pending) return E_POINTER;
@@ -129,16 +135,38 @@ public:
   HRESULT Prepare(MTLD3D12Device *device, const MTL_FRAME_GENERATION_PREPARE_DESC &desc,
       std::shared_ptr<OwnedFrameGenerationFrame> &result) final {
     if (device != core_->device.ptr()) return E_INVALIDARG;
-    auto frame = std::make_shared<OwnedFrameGenerationFrame>(); frame->core = core_;
+    bool direct = false;
+    if (!enabled_.load(std::memory_order_acquire)) {
+      std::lock_guard lock(direct_mutex_);
+      if (!enabled_.load(std::memory_order_relaxed)) {
+        // Configure cannot enable this request halfway through native validation.
+        // Disabled Prepare never publishes a snapshot or adopts direct inputs.
+        OwnedFrameGenerationFrame temporary;
+        return SubmitPrepare(device, desc, temporary, direct);
+      }
+    }
+    auto frame = std::make_shared<OwnedFrameGenerationFrame>();
+    const HRESULT hr = SubmitPrepare(device, desc, *frame, direct);
+    if (FAILED(hr)) return hr;
+    frame->core = core_;
+    if (direct) {
+      frame->frame_id = desc.frame_id;
+      std::lock_guard lock(direct_mutex_);
+      direct_inputs_ = std::move(frame);
+    } else if (hr == S_OK) result = std::move(frame);
+    return hr;
+  }
+  HRESULT SubmitPrepare(MTLD3D12Device *device, const MTL_FRAME_GENERATION_PREPARE_DESC &desc,
+      OwnedFrameGenerationFrame &frame, bool &direct) {
     HRESULT hr;
-    if (FAILED(hr = retainTexture(device, desc.depth, frame->resources[0], frame->views[0], false, false)) ||
-        FAILED(hr = retainTexture(device, desc.motion_vectors, frame->resources[1], frame->views[1], true, false))) return hr;
-    frame->states = {desc.depth_state, desc.motion_vectors_state, D3D12_RESOURCE_STATE_COMMON};
+    if (FAILED(hr = retainTexture(device, desc.depth, frame.resources[0], frame.views[0], false, false)) ||
+        FAILED(hr = retainTexture(device, desc.motion_vectors, frame.resources[1], frame.views[1], true, false))) return hr;
+    frame.states = {desc.depth_state, desc.motion_vectors_state, D3D12_RESOURCE_STATE_COMMON};
     WMTFGNativeCommand command{device->GetMTLDevice().handle, device->GetMetal4Compiler().handle};
     WMTFGprepare_packet p{};
     p.header = {sizeof(p), WMTFG_BRIDGE_VERSION, WMTFG_PREPARE, 0, core_->context};
     p.command_list = WMT::Metal4CPUPointer(&command); p.frame_id = desc.frame_id;
-    p.depth = frame->views[0].texture().handle; p.motion_vectors = frame->views[1].texture().handle;
+    p.depth = frame.views[0].texture().handle; p.motion_vectors = frame.views[1].texture().handle;
     p.depth_state = desc.depth_state; p.motion_vectors_state = desc.motion_vectors_state;
     p.render_width = desc.render_width; p.render_height = desc.render_height;
     p.motion_width = desc.motion_width; p.motion_height = desc.motion_height;
@@ -161,17 +189,9 @@ public:
     std::memcpy(p.clip_to_previous_clip, desc.clip_to_previous_clip, sizeof(p.clip_to_previous_clip));
     p.projection_matrix_present = desc.projection_matrix_present;
     std::memcpy(p.view_to_clip, desc.view_to_clip, sizeof(p.view_to_clip));
-    if (FAILED(hr = request(p.header, &frame->native))) return hr;
-    if (!frame->native) {
-      // Native accepted the frame without a snapshot command (direct inputs or FG off).
-      if (p.flags & WMTFG_PREPARE_DIRECT_INPUTS) {
-        frame->frame_id = desc.frame_id;
-        std::lock_guard lock(direct_mutex_);
-        direct_inputs_ = std::move(frame);
-      }
-      return S_FALSE;
-    }
-    result = std::move(frame); return S_OK;
+    if (FAILED(hr = request(p.header, &frame.native))) return hr;
+    direct = !frame.native && (p.flags & WMTFG_PREPARE_DIRECT_INPUTS);
+    return frame.native ? S_OK : S_FALSE;
   }
   HRESULT Generate(MTLD3D12Device *device, const MTL_FRAME_GENERATION_GENERATE_DESC &desc,
       std::shared_ptr<OwnedFrameGenerationFrame> &result) final {

@@ -44,6 +44,10 @@ void testLogicalFenceRewindAndOverlap() {
   auto latch = std::make_shared<FenceCompletionLatch>();
   require(timeline.addCompletionWaiter(10, [latch] { latch->signal(); }), "future completion waiter allocation failed");
   require(!latch->ready(), "future waiter used stale initial completion after rewind");
+  require(!timeline.hasSubmittedProducer(10), "unsubmitted producer admitted a native wait");
+  timeline.markSubmitted(qualifying);
+  require(timeline.hasSubmittedProducer(10) && !timeline.hasSubmittedProducer(11) && !latch->ready(),
+          "committed producer proof must not satisfy a logical wait");
 
   timeline.complete(qualifying);
   require(latch->ready(), "qualifying producer was pinned behind blocked producer");
@@ -51,6 +55,7 @@ void testLogicalFenceRewindAndOverlap() {
 
   timeline.complete(blocked);
   require(timeline.completedValue() == 5, "late rewind completion did not become current value");
+  require(!timeline.hasSubmittedProducer(10), "retired producer reused after rewind");
   require(latch->ready(), "completion latch was undone by rewind");
   std::puts("QUEUE_ORDER_LOGICAL_PASS cpu_rewind=1 overlap=1 any_producer=1 latch=1");
 }

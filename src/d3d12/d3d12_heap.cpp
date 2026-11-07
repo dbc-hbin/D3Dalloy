@@ -165,6 +165,10 @@ public:
     heap = metal.supportsPlacementSparse() ? metal.newPlacementHeap(info, WMTSparsePageSize64) : metal.newHeap(info);
     if (!heap)
       return E_OUTOFMEMORY;
+    if (!IsCpuVisibleHeap(&desc_.Properties) && !(desc_.Flags & D3D12_HEAP_FLAG_DENY_BUFFERS)) {
+      try { placement_ranges = std::make_shared<owned_graphics::RTASPlacementRanges>(); }
+      catch (const std::bad_alloc &) { /* Optional proof; use the GPU metadata readback. */ }
+    }
 #ifdef __i386__
     if (IsCpuVisibleHeap(&desc_.Properties)) {
       if (size_aligned > SIZE_MAX)

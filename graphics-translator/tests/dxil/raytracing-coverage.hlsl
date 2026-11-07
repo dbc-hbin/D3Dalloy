@@ -62,8 +62,8 @@ struct LaneRay
     uint query;     // 0 none, 1 RayQuery<RAY_FLAG_SKIP_TRIANGLES>, 2 RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES>
 };
 
-RaytracingAccelerationStructure Scene : register(t0);
-StructuredBuffer<LaneRay> Rays : register(t1);
+RaytracingAccelerationStructure Scenes[2] : register(t0);
+StructuredBuffer<LaneRay> Rays : register(t2);
 RWStructuredBuffer<uint> Out : register(u0);
 
 cbuffer LocalConstants : register(b0, space1)
@@ -100,7 +100,7 @@ CallParams callChain(uint word)
 template <uint Flags>
 void runQuery(RayQuery<Flags> q, RayDesc ray, uint base)
 {
-    q.TraceRayInline(Scene, 0u, 0xffu, ray);
+    q.TraceRayInline(Scenes[0], 0u, 0xffu, ray);
     uint candidates = 0u;
     while (q.Proceed())
     {
@@ -146,7 +146,8 @@ void CvRayGen()
     Payload payload;
     payload.lane = lane;
     payload.kind = 0u;
-    TraceRay(Scene, source.flags, source.mask, source.contribution, source.multiplier, source.missIndex,
+    const uint scene = NonUniformResourceIndex((lane & 15u) == 8u ? 1u : 0u);
+    TraceRay(Scenes[scene], source.flags, source.mask, source.contribution, source.multiplier, source.missIndex,
              ray, payload);
     Out[base + 21u] = 0x100u | payload.kind;
     if (source.query == 1u)

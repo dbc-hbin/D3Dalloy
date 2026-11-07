@@ -17,6 +17,8 @@
  */
 
 #pragma once
+#include <atomic>
+#include <memory>
 
 #include "Metal.hpp"
 #include "d3dalloy_deptrack.hpp"
@@ -105,6 +107,7 @@ public:
   WMT::Reference<WMT::Heap> canonicalHeap;
   uint64_t canonicalHeapOffset = 0;
   ReservedResource *reservedResource = nullptr;
+  bool d3d12_gpu_only = false;
 
   WMT::Buffer
   buffer() const {

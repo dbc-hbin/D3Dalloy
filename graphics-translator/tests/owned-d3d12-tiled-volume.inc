@@ -1352,6 +1352,49 @@ void runVolumeCases(Context &c, int shaderCount, const char *const *paths) {
   // Raw CopyTiles readback checks complete 64KB physical pages, including padding and aliases.
   volumeCheckPhysicalBytes(c, volume, "volume-copyregion-RTV-clear-draw-64KB-alias-byte-oracle");
 
+  // Reuse the same two-slice RTV through a partial unmap, a second queue
+  // consuming that mapping, and a remap. Compare full physical pages, including
+  // aliases and bytes outside the W range.
+  {
+    const auto original = volume.mapping;
+    auto primary = c.queue;
+    ComPtr<ID3D12CommandQueue> other;
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&other)), "auxiliary sparse direct queue");
+    volumeRTVDesc.Texture3D = {0, volume.shape.DepthInTexels - 1, 2};
+    device->CreateRenderTargetView(volume.texture.Get(), &volumeRTVDesc, volumeRTV);
+    const auto &tiling = volume.tiling[0];
+    for (unsigned phase = 0; phase != 3; ++phase) {
+      if (phase != 1) {
+        for (UINT y = 0; y < tiling.HeightInTiles; ++y)
+          for (UINT x = 0; x < tiling.WidthInTiles; ++x) {
+            const auto tile = volume.tileAt(0, x * volume.shape.WidthInTexels, y * volume.shape.HeightInTexels,
+                                            volume.shape.DepthInTexels);
+            volume.remap(c, x, y, 1, phase == 0 ? -1 : original[tile]);
+          }
+      }
+      const auto producer = c.queue;
+      check(producer->Signal(c.fence.Get(), ++c.value), "auxiliary sparse producer");
+      c.queue = producer.Get() == primary.Get() ? other : primary;
+      check(c.queue->Wait(c.fence.Get(), c.value), "auxiliary sparse consumer");
+      const UINT red = 35 + phase * 23;
+      const float color[] = {float(red) / 255.0f, 0, 1, 1};
+      c.reset();
+      transition(c.list.Get(), volume.texture.Get(), anyShader, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      c.list->ClearRenderTargetView(volumeRTV, color, 0, nullptr);
+      transition(c.list.Get(), volume.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, anyShader);
+      c.execute("auxiliary sparse clear");
+      const UINT pixel = 0xffff0000u | red;
+      for (UINT z = volume.shape.DepthInTexels - 1; z <= volume.shape.DepthInTexels; ++z)
+        for (UINT y = 0; y < 64; ++y) for (UINT x = 0; x < 64; ++x)
+          if (volume.mapping[volume.tileAt(0, x, y, z)] >= 0)
+            std::memcpy(volume.bytes.data() + volume.address(0, x, y, z), &pixel, sizeof(pixel));
+    }
+    check(primary->Wait(c.fence.Get(), c.value), "auxiliary sparse return to primary");
+    c.queue = primary;
+    volumeCheckPhysicalBytes(c, volume, "volume-auxiliary-remap-cross-queue-64KB");
+  }
+
   VolumeResource mappings(c, DXGI_FORMAT_R8G8B8A8_TYPELESS, 4, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
   require(mappings.tiling[0].WidthInTiles == 2 && mappings.tiling[0].HeightInTiles == 2 && mappings.tiling[0].DepthInTiles == 2,
       "volume official RGBA8 32x32x16 mapping fixture");

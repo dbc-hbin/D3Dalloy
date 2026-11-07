@@ -23,7 +23,7 @@ struct Device {
 #include PRODUCTION_HELPER_KINDS
   std::mutex owned_helper_pipeline_mutex;
   WMT::Reference<WMT::Library> owned_predication_library;
-  std::array<WMT::Reference<WMT::ComputePipelineState>, 8> owned_predication_pipelines;
+  std::array<WMT::Reference<WMT::ComputePipelineState>, PredicationKernelCount> owned_predication_pipelines;
   unsigned libraryCalls = 0, functionCalls = 0, pipelineCalls = 0, failAt = 0;
   bool failLibrary = false;
   WMT::Reference<WMT::Library> builtIn;
@@ -59,9 +59,9 @@ struct Library {
 struct List {
   using CommandHelper = Device::CommandHelper;
   Device *device_;
-  WMT::Reference<WMT::ComputePipelineState> predication_snapshot_pipeline_, predication_arguments_pipeline_,
-      predication_copy_pipeline_, predication_pitched_copy_pipeline_, mesh_indirect_pipeline_, mesh_strip_cut_pipeline_,
-      tess_capture_clear_pipeline_, tess_capture_compact_pipeline_;
+  using PredicationKernel = Device::PredicationKernel;
+  using enum Device::PredicationKernel;
+  decltype(Device::owned_predication_pipelines) predicate_pipelines_;
   explicit List(Device &device) : device_(&device) {}
 #include PRODUCTION_HELPER
 };
@@ -110,28 +110,30 @@ int main() {
     lists[i] = std::make_unique<List>(shared);
     workers[i] = std::thread([&, i] {
       start.arrive_and_wait();
-      assert(lists[i]->EnsurePredicationPipelines());
-      assert(lists[i]->EnsurePredicationPipelines());
+      for (unsigned k = 0; k < Device::PredicationKernelCount; ++k) {
+        const auto kind = static_cast<Device::PredicationKernel>(k);
+        assert(lists[i]->EnsurePredicationPipeline(kind));
+        assert(lists[i]->EnsurePredicationPipeline(kind));
+      }
     });
   }
   for (auto &worker : workers) worker.join();
-  assert(shared.libraryCalls == 1 && shared.functionCalls == 8 && shared.pipelineCalls == 8);
-  for (const auto &list : lists) {
-    assert(list->predication_snapshot_pipeline_ == shared.owned_predication_pipelines[0]);
-    assert(list->tess_capture_compact_pipeline_ == shared.owned_predication_pipelines[7]);
-  }
+  constexpr unsigned count = Device::PredicationKernelCount;
+  assert(shared.libraryCalls == 1 && shared.functionCalls == count && shared.pipelineCalls == count);
+  for (const auto &list : lists) assert(list->predicate_pipelines_ == shared.owned_predication_pipelines);
   Device other; List independent(other);
-  assert(independent.EnsurePredicationPipelines());
-  assert(independent.predication_snapshot_pipeline_ != lists[0]->predication_snapshot_pipeline_);
-  Device failed; failed.failAt = 3; List first(failed), retry(failed);
-  assert(!first.EnsurePredicationPipelines());
+  assert(independent.EnsurePredicationPipeline(Device::PredicateArguments) && other.pipelineCalls == 1);
+  assert(independent.predicate_pipelines_[0] != lists[0]->predicate_pipelines_[0]);
+  Device failed; failed.failAt = 2; List first(failed), retry(failed);
+  assert(first.EnsurePredicationPipeline(Device::PredicateArguments));
   auto preserved = failed.owned_predication_pipelines[0];
-  assert(retry.EnsurePredicationPipelines() && failed.libraryCalls == 1 && failed.pipelineCalls == 9);
-  assert(retry.predication_snapshot_pipeline_ == preserved);
+  assert(!first.EnsurePredicationPipeline(Device::PredicateCopy));
+  assert(retry.EnsurePredicationPipeline(Device::PredicateCopy) && retry.EnsurePredicationPipeline(Device::PredicateArguments));
+  assert(failed.libraryCalls == 1 && failed.pipelineCalls == 3 && retry.predicate_pipelines_[0] == preserved);
   Device failedLibrary; failedLibrary.failLibrary = true; List libraryRetry(failedLibrary);
-  assert(!libraryRetry.EnsurePredicationPipelines() && libraryRetry.EnsurePredicationPipelines());
-  assert(failedLibrary.libraryCalls == 2 && failedLibrary.pipelineCalls == 8);
-  std::puts("STATIC_OPT_HELPER_PASS lists=12 library_creations=1 pipeline_creations=8 device_isolation=1 failed_retry=1");
+  assert(!libraryRetry.EnsurePredicationPipeline(Device::PredicateCopy) && libraryRetry.EnsurePredicationPipeline(Device::PredicateCopy));
+  assert(failedLibrary.libraryCalls == 2 && failedLibrary.pipelineCalls == 1);
+  std::printf("STATIC_OPT_HELPER_PASS lists=12 library_creations=1 pipeline_creations=%u device_isolation=1 failed_retry=1\n", count);
 
   Device commands;
   using Kind = Device::CommandHelper;
@@ -144,7 +146,7 @@ int main() {
         const auto kind = Kind(j);
         const auto name = std::to_string(j);
         results[i][j] = list.SharedCommandHelper(kind, name.c_str(),
-            kind >= Kind::AtomicCopyU32 ? "fixed source" : nullptr);
+            kind >= Kind::AtomicCopyU32 && kind <= Kind::RaysIndirect ? "fixed source" : nullptr);
         assert(results[i][j]);
       }
     });

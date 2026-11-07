@@ -25,11 +25,13 @@ inline bool ReserveMetal4Present(WMT::MTL4CommandBuffer command_buffer, WMT::Met
 }
 class TemporalFrame : public WMT::Object {
 public:
-  int32_t encode(WMT::MTL4CommandBuffer buffer, WMT::Fence fence, bool reset) const {
+  int32_t encode(WMT::MTL4CommandBuffer buffer, WMT::Fence fence, bool reset, bool spatial, uint32_t &handoff) const {
     struct WMTMetal4Call call{};
-    call.operation = WMTMetal4FXEncodeTemporal;
+    call.operation = spatial ? WMTMetal4FXEncodeSpatial : WMTMetal4FXEncodeTemporal;
     call.args[0] = buffer.handle; call.args[1] = handle; call.args[2] = fence.handle; call.args[3] = reset;
+    call.args[4] = handoff;
     const auto status = WMTMetal4Call(&call);
+    handoff = status ? 0 : uint32_t(call.ret[3]);
     return status ? int32_t(0x887a0020) : int32_t(call.ret[1]);
   }
 };
@@ -44,16 +46,16 @@ public:
   static WMT::Reference<TemporalFeature> Create(WMT::Device device, Compiler compiler,
       const WMTMetal4FXTemporalInfo &info, int32_t &result) {
     struct WMTMetal4Call call{};
-    call.operation = WMTMetal4FXCreateTemporal;
+    call.operation = info.feature_flags == WMTMetal4FXSpatialFlag ? WMTMetal4FXCreateSpatial : WMTMetal4FXCreateTemporal;
     call.args[0] = device.handle; call.args[1] = compiler.handle; call.args[2] = WMT::Metal4CPUPointer(&info);
     const auto status = WMTMetal4Call(&call);
     result = status ? int32_t(0x887a0020) : int32_t(call.ret[1]);
     return WMT::Reference<TemporalFeature>(call.ret[0]);
   }
   WMT::Reference<TemporalFrame> prepare(const WMTMetal4FXTemporalFrame &info, int32_t &result,
-                                      uint64_t &generation) const {
+                                      uint64_t &generation, bool spatial = false) const {
     struct WMTMetal4Call call{};
-    call.operation = WMTMetal4FXPrepareTemporal;
+    call.operation = spatial ? WMTMetal4FXPrepareSpatial : WMTMetal4FXPrepareTemporal;
     call.args[0] = handle; call.args[1] = WMT::Metal4CPUPointer(&info);
     const auto status = WMTMetal4Call(&call);
     result = status ? int32_t(0x887a0020) : int32_t(call.ret[1]);

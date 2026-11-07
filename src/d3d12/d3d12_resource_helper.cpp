@@ -670,7 +670,7 @@ MakeStandardSwizzleLayout(MTLD3D12Device *device, const D3D12_RESOURCE_DESC &des
       desc.MipLevels, unit_bytes, bc ? 4 : paired ? 2 : 1, bc ? 4 : 1, volume
   );
   if (!layout || layout->total_tiles > UINT32_MAX ||
-      layout->size_bytes > device->GetMTLDevice().maxBufferLength())
+      layout->size_bytes > device->max_buffer_length)
     return std::nullopt;
   for (uint32_t i = 0; i < layout->mip_count; ++i) {
     if (layout->mips[i].tiles_x > UINT32_MAX || layout->mips[i].tiles_y > UINT16_MAX ||
@@ -751,7 +751,6 @@ ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS
   if ((Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) && IsCpuVisibleHeap(pHeapProps))
     return E_INVALIDARG;
 
-  // TODO(d3d12): check NodeMask
   return S_OK;
 }
 

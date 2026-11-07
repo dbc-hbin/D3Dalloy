@@ -32,7 +32,7 @@ void srMaskCropProof(GPU& gpu) {
         info.colorRect=info.motionRect=info.depthRect=info.outputRect={0,0,w,h};
         info.compositionRect=info.reactiveRect={3,5,w,h};
         FrameOperations ops{}; ops.combineCompositionMask=true;
-        auto t=in.textures(); t.reactive=info.reactiveMask=(void*)b; t.composition=info.compositionMask=(void*)a;
+        auto t=in.textures(); t.reactive=(void*)b; t.composition=(void*)a;
         auto generation=ensureScaler(*core,info,t,ops,&error); require(bool(generation),error.message.c_str());
         auto m=class_getInstanceMethod(object_getClass(generation->scaler),@selector(setReset:));
         require(m,"crop-proof-reset-observer"); originalSRReset=(SetReset)method_setImplementation(m,(IMP)observeSRReset);
@@ -51,12 +51,12 @@ void srMaskCropProof(GPU& gpu) {
             gpu.upload(in.color,colors.data(),w*8);
             info.jitterOffsetX=mode==1 ?.25f:-.25f;
             info.resetHistory=mode==2; info.compositionRect.width=w-(mode==2 ? 1:0);
-            t.reactive=info.reactiveMask=(void*)b;
+            t.reactive=(void*)b;
             observedInputs[0]=a; inputCopies[0]=0;
             auto rf=reference->prepare(info,t,&error,ops); require(bool(rf),error.message.c_str());
             auto expected=executeSRPrepared(gpu,rf,in,rg,mode!=1);
             require(inputCopies[0]==0,"reference-combines-both-masks");
-            t.reactive=info.reactiveMask=mode==1 ? (void*)a : nullptr;
+            t.reactive=mode==1 ? (void*)a : nullptr;
             auto cf=candidate->prepare(info,t,&error,ops); require(bool(cf),error.message.c_str());
             auto actual=executeSRPrepared(gpu,cf,in,cg,mode!=1);
             require(expected==actual,"sr-mask-crop-exact-fp16-output");

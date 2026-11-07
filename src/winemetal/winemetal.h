@@ -1095,6 +1095,9 @@ enum WMTBlitCommandType : uint16_t {
   WMTBlitCommandCopyFromTextureToBufferWithBlitOption,
   WMTBlitCommandResetCommandsInBuffer,
   WMTBlitCommandCopyTexture,
+  WMTBlitCommandSnapshotPredicate, /* Same layout as CopyFromBufferToBuffer; preserves native trace identity. */
+  WMTBlitCommandMarkerIn, /* D3D12-only Metal4 ordering commands; no payload. */
+  WMTBlitCommandMarkerOut,
 };
 
 enum WMTBlitOption : uint16_t {
@@ -1276,6 +1279,14 @@ enum WMTComputeCommandType : uint16_t {
   WMTComputeCommandSetVisibleFunctionTable,
   WMTComputeCommandSetIntersectionFunctionTable,
   WMTComputeCommandSetAccelerationStructure,
+  WMTComputeCommandDispatchCompact,
+  WMTComputeCommandDispatchIndirectRange,
+};
+
+struct wmtcmd_compute_dispatch_compact {
+  enum WMTComputeCommandType type;
+  uint16_t x, y, z;
+  struct WMTMemoryPointer next;
 };
 
 struct wmtcmd_compute_nop {
@@ -1460,6 +1471,14 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetStencilRefFrontBack,
   WMTRenderCommandSetVertexAmplification,
   WMTRenderCommandSetDepthBounds,
+  WMTRenderCommandDrawCompact,
+  WMTRenderCommandDrawIndexedCompact,
+  WMTRenderCommandDrawIndexedSmall,
+  WMTRenderCommandDrawIndirectRange,
+  WMTRenderCommandDrawIndexedIndirectRange,
+  WMTRenderCommandDrawRun,
+  WMTRenderCommandDrawIndexedRun,
+  WMTRenderCommandSetViewportScissors,
 };
 
 struct wmtcmd_render_nop {
@@ -1536,9 +1555,14 @@ enum WMTDepthClipMode : uint8_t {
   WMTDepthClipModeClamp = 1,
 };
 
+enum WMTRasterField {
+  WMTRasterFill = 1, WMTRasterCull = 2, WMTRasterClip = 4, WMTRasterWinding = 8, WMTRasterBias = 16,
+  WMTRasterAll = 31,
+};
 struct wmtcmd_render_setrasterizerstate {
   enum WMTRenderCommandType type;
-  uint16_t reserved[3];
+  uint16_t changed; /* zero denotes a full state packet */
+  uint16_t reserved[2];
   struct WMTMemoryPointer next;
   enum WMTTriangleFillMode fill_mode;
   enum WMTCullMode cull_mode;
@@ -1591,6 +1615,110 @@ enum WMTPrimitiveType : uint8_t {
   WMTPrimitiveTypeTriangleStrip = 4,
 };
 
+// Every run can replay independently. An indexed run either embeds its immutable
+// binding immediately after the header, or points back to a prior binding in the arena.
+enum { WMTDrawRunSmall = 1, WMTDrawRunIndex32 = 2 };
+struct wmtcmd_render_draw_run {
+  enum WMTRenderCommandType type;
+  enum WMTPrimitiveType primitive_type;
+  uint8_t flags;
+  uint16_t count;
+  uint16_t binding_back8;
+  struct WMTMemoryPointer next;
+};
+struct wmtdraw_index_binding {
+  obj_handle_t index_buffer;
+  uint64_t index_offset;
+};
+struct wmtdraw_parameters { uint32_t count, instances, first, base_instance; };
+struct wmtdraw_indexed_parameters { uint32_t count, instances, first, base_instance; int32_t base_vertex; };
+struct wmtdraw_small_parameters { uint16_t count, first; uint8_t instances, base_instance; int16_t base_vertex; };
+STATIC_ASSERT(sizeof(struct wmtcmd_render_draw_run) == 16);
+STATIC_ASSERT(sizeof(struct wmtdraw_index_binding) == 16);
+STATIC_ASSERT(sizeof(struct wmtdraw_parameters) == 16);
+STATIC_ASSERT(sizeof(struct wmtdraw_indexed_parameters) == 20);
+STATIC_ASSERT(sizeof(struct wmtdraw_small_parameters) == 8);
+
+static inline const struct wmtdraw_index_binding *
+wmt_draw_run_binding(const struct wmtcmd_render_draw_run *run) {
+  if (!run->binding_back8)
+    return (const struct wmtdraw_index_binding *)(run + 1);
+  return (const struct wmtdraw_index_binding *)((uintptr_t)run - (uint32_t)run->binding_back8 * 8);
+}
+
+static inline const void *wmt_draw_run_tuples(const struct wmtcmd_render_draw_run *run) {
+  if (run->type == WMTRenderCommandDrawIndexedRun && !run->binding_back8)
+    return (const struct wmtdraw_index_binding *)(run + 1) + 1;
+  return run + 1;
+}
+
+static inline struct wmtdraw_indexed_parameters
+wmt_draw_run_at(const struct wmtcmd_render_draw_run *run, const void *tuples, uint32_t i) {
+  if (run->flags & WMTDrawRunSmall) {
+    const struct wmtdraw_small_parameters *p = (const struct wmtdraw_small_parameters *)tuples + i;
+    struct wmtdraw_indexed_parameters args = {p->count, p->instances, p->first, p->base_instance, p->base_vertex};
+    return args;
+  }
+  if (run->type == WMTRenderCommandDrawIndexedRun)
+    return ((const struct wmtdraw_indexed_parameters *)tuples)[i];
+  const struct wmtdraw_parameters *p = (const struct wmtdraw_parameters *)tuples + i;
+  struct wmtdraw_indexed_parameters args = {p->count, p->instances, p->first, p->base_instance, 0};
+  return args;
+}
+
+// Dispatch the tuple format once per packet. The body may break on a rejected draw.
+#define WMT_REPLAY_DRAW_RUN(run, wide_type, draw, ...) do { \
+  const void *tuples = wmt_draw_run_tuples(run); \
+  const uint32_t count = (run)->count; \
+  if ((run)->flags & WMTDrawRunSmall) { \
+    for (uint32_t i = 0; i < count; ++i) { \
+      const struct wmtdraw_small_parameters draw = ((const struct wmtdraw_small_parameters *)tuples)[i]; \
+      __VA_ARGS__ \
+    } \
+  } else { \
+    for (uint32_t i = 0; i < count; ++i) { \
+      const struct wide_type draw = ((const struct wide_type *)tuples)[i]; \
+      __VA_ARGS__ \
+    } \
+  } \
+} while (0)
+
+struct wmtcmd_render_draw_compact {
+  enum WMTRenderCommandType type;
+  enum WMTPrimitiveType primitive_type;
+  uint8_t reserved;
+  uint32_t vertex_count;
+  struct WMTMemoryPointer next;
+  uint32_t vertex_start;
+  uint32_t padding;
+};
+
+struct wmtcmd_render_draw_indexed_small {
+  enum WMTRenderCommandType type;
+  enum WMTPrimitiveType primitive_type;
+  enum WMTIndexType index_type;
+  uint16_t index_count;
+  uint16_t index_buffer_offset;
+  struct WMTMemoryPointer next;
+  obj_handle_t index_buffer;
+};
+
+struct wmtcmd_render_draw_indexed_compact {
+  enum WMTRenderCommandType type;
+  enum WMTPrimitiveType primitive_type;
+  enum WMTIndexType index_type;
+  uint32_t index_count;
+  struct WMTMemoryPointer next;
+  obj_handle_t index_buffer;
+  uint32_t index_buffer_offset;
+  int32_t base_vertex;
+};
+
+STATIC_ASSERT(sizeof(struct wmtcmd_compute_dispatch_compact) == 16);
+STATIC_ASSERT(sizeof(struct wmtcmd_render_draw_compact) == 24);
+STATIC_ASSERT(sizeof(struct wmtcmd_render_draw_indexed_compact) == 32);
+STATIC_ASSERT(sizeof(struct wmtcmd_render_draw_indexed_small) == 24);
+
 struct wmtcmd_render_draw {
   enum WMTRenderCommandType type;
   uint16_t reserved[3];
@@ -1635,6 +1763,20 @@ struct wmtcmd_render_draw_indexed_indirect {
   uint64_t index_buffer_offset;
   obj_handle_t indirect_args_buffer;
   uint64_t indirect_args_offset;
+};
+
+enum { WMTDrawIndirectCachedIMPMinCount = 64 };
+struct wmtcmd_render_draw_indirect_range {
+  struct wmtcmd_render_draw_indirect command;
+  uint32_t count, stride;
+};
+struct wmtcmd_render_draw_indexed_indirect_range {
+  struct wmtcmd_render_draw_indexed_indirect command;
+  uint32_t count, stride;
+};
+struct wmtcmd_compute_dispatch_indirect_range {
+  struct wmtcmd_compute_dispatch_indirect command;
+  uint32_t count, stride;
 };
 
 struct wmtcmd_render_draw_meshthreadgroups {
@@ -1694,6 +1836,15 @@ struct WMTScissorRect {
   uint64_t width;
   uint64_t height;
 };
+
+// Inline WMTViewport[viewport_count] followed by WMTScissorRect[scissor_count].
+struct wmtcmd_render_set_viewport_scissors {
+  enum WMTRenderCommandType type;
+  uint8_t viewport_count, scissor_count;
+  uint32_t reserved;
+  struct WMTMemoryPointer next;
+};
+STATIC_ASSERT(sizeof(struct wmtcmd_render_set_viewport_scissors) == 16);
 
 struct wmtcmd_render_setscissorrects {
   enum WMTRenderCommandType type;

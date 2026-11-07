@@ -20,8 +20,9 @@ struct Job {
   uint64_t source, offset, sourceStride;
   uint32_t bytes, stride, count, mode, flags;
 };
-struct Params { uint64_t asAddress, metadataSource; uint32_t count, mode; Metadata metadata; };
-static_assert(sizeof(Metadata) == 48 && sizeof(Job) == 48 && sizeof(Params) == 72);
+struct Params { uint64_t asAddress, metadataSource; uint32_t count, mode; Metadata metadata;
+  uint64_t resourceID = 0; uint32_t versionToken = 0, mirrorSlot = 0; };
+static_assert(sizeof(Metadata) == 48 && sizeof(Job) == 48 && sizeof(Params) == 88);
 static_assert(sizeof(d3dalloy_as_prepass_params) == 96);
 static int failures = 0, cases = 0;
 static id<MTLDevice> device;
@@ -56,7 +57,7 @@ static void equal(const char *name, const void *actual, const void *expected, si
 }
 static id<MTLCommandBuffer> encodeShadow(unsigned which, id<MTLBuffer> destination,
     Params params, id<MTLBuffer> geometries, id<MTLBuffer> jobs, NSArray<id<MTLBuffer>> *sources,
-    unsigned repetitions = 1) {
+    unsigned repetitions = 1, id<MTLBuffer> mirror = nil) {
   auto cb = [queue commandBuffer];
   auto e = [cb computeCommandEncoder];
   [e setComputePipelineState:shadowPipeline[which]];
@@ -64,6 +65,7 @@ static id<MTLCommandBuffer> encodeShadow(unsigned which, id<MTLBuffer> destinati
   [e setBytes:&params length:sizeof(params) atIndex:0];
   [e setBuffer:geometries offset:0 atIndex:1];
   [e setBuffer:jobs offset:0 atIndex:2];
+  if (which) [e setBuffer:mirror ? mirror : destination offset:0 atIndex:3];
   [e useResource:destination usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   for (id<MTLBuffer> source in sources) [e useResource:source usage:MTLResourceUsageRead];
   for (unsigned i = 0; i < repetitions; ++i) {
@@ -120,6 +122,20 @@ static void shadowCases(bool timing) {
   equal("shadow-before-cpu",before.contents,expected.data(),expected.size());
   equal("shadow-after-cpu",after.contents,expected.data(),expected.size());
   if (!timing) {
+    auto mirror = buffer(256);
+    auto fused = params;
+    fused.resourceID = 0x1234567811223344ull;
+    fused.versionToken = 0x3210aabb;
+    fused.mirrorSlot = 2;
+    encodeShadow(1,after,fused,geometries,jobBuffer,@[source,pointers],1,mirror);
+    auto fusedExpected = expected;
+    std::memcpy(fusedExpected.data(), &fused.resourceID, 8);
+    std::memset(fusedExpected.data()+8, 0, 8);
+    equal("fused-blas-header-shadow",after.contents,fusedExpected.data(),fusedExpected.size());
+    std::array<uint32_t,64> tokens;
+    tokens.fill(0xa7a7a7a7);
+    tokens[fused.mirrorSlot] = fused.versionToken;
+    equal("fused-blas-mirror",mirror.contents,tokens.data(),sizeof(tokens));
     for (unsigned version = 0; version < 2; ++version) {
       auto clone = buffer(expected.size()); params.mode = 1; params.metadataSource = before.gpuAddress;
       encodeShadow(version,clone,params,geometries,jobBuffer,@[before]);
@@ -177,7 +193,7 @@ static void tlasCase(unsigned count, bool pointerLayout) {
     [e setComputePipelineState:prepass[which]];
     [e setBuffer:pointerLayout?pointers:source offset:0 atIndex:0];
     [e setBuffer:converted offset:0 atIndex:1]; [e setBuffer:header offset:0 atIndex:2];
-    [e setBuffer:contribution offset:0 atIndex:3]; [e setBytes:&params length:which?96:48 atIndex:4];
+    [e setBuffer:contribution offset:0 atIndex:3]; [e setBytes:&params length:sizeof(params) atIndex:4];
     [e setBuffer:mirror offset:0 atIndex:5]; [e useResource:source usage:MTLResourceUsageRead];
     [e useResource:blas usage:MTLResourceUsageRead];
     [e dispatchThreads:MTLSizeMake(std::max(count,1u),1,1) threadsPerThreadgroup:MTLSizeMake(std::min(std::max(count,1u),256u),1,1)];

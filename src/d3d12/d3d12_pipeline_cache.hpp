@@ -19,6 +19,12 @@ namespace d3dalloy {
 // D3D12 device admission requires a Metal 4 compiler; Atomic64 stages select 4.1.
 inline constexpr auto kD3D12ShaderMetalVersion = SM50_SHADER_METAL_400;
 
+class MTLD3D12Device;
+struct ShaderImmutableConstants;
+WMT::Reference<WMT4::Function> CompilePipelineVariant(
+    MTLD3D12Device *device, const SharedShaderBytecode &shader, const SharedShaderBytecode &explicit_root,
+    const char *name, void *next, ShaderImmutableConstants &constants, bool root_independent = false);
+
 struct GraphicsPipelineExtras;
 HRESULT PipelineCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, Sha1Digest &key,
                          const GraphicsPipelineExtras *extras = nullptr, Sha1Digest *effective = nullptr);
@@ -62,6 +68,7 @@ struct NativePipelineArtifact {
 // Immutable native DXR executable only. State-object identifiers, relocated
 // constants, visible/intersection tables and dispatch bindings are never cached.
 struct NativeRaytracingArtifact : NativePipelineArtifact {
+  bool shader_validation = false;
   WMT::Reference<WMT4::Library> library;
   std::vector<WMT::Reference<WMT::FunctionHandle>> handles;
 };
@@ -72,10 +79,12 @@ struct WorkGraphArtifact : ShaderStageArtifact {
   size_t size() const { return ShaderStageArtifact::size() + sizeof(info); }
 };
 struct RaytracingArtifact : ShaderStageArtifact {
+  SM50ShaderBitcode reusable_exports;
+  size_t reusable_bytes = 0;
   std::vector<SM50_RT_FUNCTION_INFO> functions;
   std::vector<std::string> names, export_names;
   size_t size() const {
-    size_t bytes = ShaderStageArtifact::size() + functions.size() * sizeof(SM50_RT_FUNCTION_INFO);
+    size_t bytes = ShaderStageArtifact::size() + reusable_bytes + functions.size() * sizeof(SM50_RT_FUNCTION_INFO);
     for (const auto &name : names) bytes += name.size();
     for (const auto &name : export_names) bytes += name.size();
     return bytes;
@@ -103,7 +112,8 @@ public:
   // Only immutable serialized output is shared; shader/LLVM handles stay invocation-local.
   int Compile(Stage stage, DeviceShaderArtifactCache &artifacts, D3D12_SHADER_BYTECODE source,
               sm50_shader_t shader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-              const char *name, sm50_error_t *error);
+              const char *name, sm50_error_t *error, ID3D12RootSignature *root,
+              const MTL_SHADER_REFLECTION &reflection);
   const Sha1Digest &stageKey(Stage stage) const { return stage_keys_[stage]; }
   HRESULT GetBlob(ID3DBlob **blob);
   // Internal immutable owner only. Never return this writable COM view to an app.
@@ -165,11 +175,11 @@ public:
   WMT::Reference<WMT4::Library> Library(WMT4::Compiler compiler, const SM50_COMPILED_BITCODE &code,
                                       sm50_bitcode_t owner, WMT::Error &error);
   WMT::Reference<WMT4::Function> SampleMaskFunction(WMT4::Library library, const char *name,
-      D3D12_SHADER_BYTECODE root, uint32_t mask, WMT::Error &error);
+      uint32_t mask, WMT::Error &error);
   WMT::Reference<WMT4::Function> Function(WMT4::Library library, const char *name);
   std::shared_ptr<const NativeRaytracingArtifact> NativeRaytracing(
       WMT4::Compiler compiler, WMT4::Library library, const std::vector<SM50_RT_FUNCTION_INFO> &functions,
-      uint32_t max_call_stack_depth, WMT::Error &error);
+      uint32_t max_call_stack_depth, bool indirect, WMT::Error &error);
   std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
       const WMTComputePipelineInfo &info, WMT::Error &error);
   std::shared_ptr<const NativePipelineArtifact> NativePipeline(WMT4::Compiler compiler,
@@ -181,10 +191,8 @@ public:
               SM50_SHADER_COMPILATION_ARGUMENT_DATA *args, const char *name, sm50_bitcode_t *output,
               sm50_error_t *error, std::shared_ptr<const ShaderStageArtifact> &artifact,
               const std::function<int(sm50_bitcode_t *, sm50_error_t *)> &compile,
-              Sha1Digest *stage_key = nullptr);
-  int CompileShader(D3D12_SHADER_BYTECODE source, SM50_SHADER_COMPILATION_ARGUMENT_DATA *args,
-                    const char *name, sm50_bitcode_t *output, sm50_error_t *error,
-                    std::shared_ptr<const ShaderStageArtifact> &artifact);
+              Sha1Digest *stage_key = nullptr, bool root_independent = false,
+              std::span<const uint32_t> vertex_table_key = {});
 
 private:
   friend class PipelineCache;

@@ -341,7 +341,6 @@ void frame12(Backend &b, IDXGISwapChain3 *chain) {
   require(WaitForSingleObject(event, kWaitMs) == WAIT_OBJECT_0 && fence->GetCompletedValue() >= 2,
           "PresentQueue12");
   CloseHandle(event);
-  std::puts("OWNED_DXGI_FULLSCREEN_FRAME api=d3d12 pixels=3888 exact=1 fence=complete present=ok");
 }
 void frame11(Backend &b, IDXGISwapChain1 *chain) {
   ComPtr<ID3D11Texture2D> buffer;
@@ -453,7 +452,12 @@ void run(bool d3d12) {
   proxy->fault = OutputFault::None;
   check(chain->ResizeTarget(&mode), "ResizeTarget-fullscreen");
   check(chain->ResizeBuffers(2, 72, 54, DXGI_FORMAT_UNKNOWN, 0), "ResizeBuffers-fullscreen");
-  if (d3d12) frame12(b, chain12.Get()); else frame11(b, chain);
+  if (d3d12) {
+    frame12(b, chain12.Get());
+    std::puts("OWNED_DXGI_FULLSCREEN_FRAME api=d3d12 pixels=3888 exact=1 fence=complete present=ok");
+  } else {
+    frame11(b, chain);
+  }
   if (d3d12) {
     DXGI_FRAME_STATISTICS measured{};
     const ULONGLONG deadline = GetTickCount64() + kWaitMs;
@@ -590,6 +594,41 @@ void run(bool d3d12) {
   std::printf("OWNED_DXGI_FULLSCREEN_INVALID_CREATION api=%s rejected=1 null_output=1\n", api);
 }
 
+void removedStatistics() {
+  api = "d3d12";
+  Backend b(true);
+  Window window;
+  auto chain = b.create12(window, true);
+  check(chain->ResizeBuffers(2, 72, 54, DXGI_FORMAT_UNKNOWN, 0), "removal-stats-resize");
+  frame12(b, chain.Get());
+  DXGI_FRAME_STATISTICS chainStats{}, outputStats{};
+  const ULONGLONG deadline = GetTickCount64() + kWaitMs;
+  HRESULT chainResult, outputResult;
+  do {
+    check(b.output->WaitForVBlank(), "removal-stats-vblank");
+    chainResult = chain->GetFrameStatistics(&chainStats);
+    outputResult = b.output->GetFrameStatistics(&outputStats);
+    require(chainResult == S_OK || chainResult == DXGI_ERROR_FRAME_STATISTICS_DISJOINT,
+            "removal-stats-chain-result");
+    require(outputResult == S_OK || outputResult == DXGI_ERROR_FRAME_STATISTICS_DISJOINT,
+            "removal-stats-output-result");
+    require(GetTickCount64() < deadline, "removal-stats-timeout");
+  } while (chainResult != S_OK || outputResult != S_OK);
+  require(chainStats.PresentCount && outputStats.PresentCount, "removal-stats-presented");
+  // frame12 retired the queue and both observers saw its presentation. No
+  // pending Present can invalidate statistics on the removal callback's behalf.
+  ComPtr<ID3D12Device5> device5;
+  check(b.device12.As(&device5), "removal-stats-device5");
+  device5->RemoveDevice();
+  chainResult = chain->GetFrameStatistics(&chainStats);
+  outputResult = b.output->GetFrameStatistics(&outputStats);
+  check(chain->SetFullscreenState(FALSE, nullptr), "removal-stats-leave");
+  window.restored();
+  expect(chainResult, DXGI_ERROR_FRAME_STATISTICS_DISJOINT, "removed-chain-stats-disjoint");
+  expect(outputResult, DXGI_ERROR_FRAME_STATISTICS_DISJOINT, "removed-output-stats-disjoint");
+  std::puts("OWNED_DXGI_REMOVAL_STATISTICS_PASS presented=1 pending=0 swapchain=disjoint output=disjoint");
+}
+
 void backend() {
   HMODULE module = LoadLibraryW(L"d3d12.dll");
   require(module != nullptr, "d3d12-module");
@@ -602,9 +641,15 @@ void backend() {
 int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const bool d3d12Only = argc == 2 && std::strcmp(argv[1], "--d3d12-only") == 0;
-  require(argc == 1 || d3d12Only, "arguments");
+  const bool removalOnly = argc == 2 && std::strcmp(argv[1], "--removal-statistics-only") == 0;
+  require(argc == 1 || d3d12Only || removalOnly, "arguments");
   backend();
+  if (removalOnly) {
+    removedStatistics();
+    return 0;
+  }
   run(true);
+  removedStatistics();
   if (!d3d12Only)
     run(false);
   std::puts("OWNED_DXGI_FULLSCREEN_PASS");

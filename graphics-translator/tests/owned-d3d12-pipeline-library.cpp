@@ -893,13 +893,13 @@ void testStageArtifacts(Fixture &f) {
   const UINT color[4]{17, 34, 51, 255};
   for (auto &pso : psos) f.draw(pso.Get(), color, 0xff332211u, "distinct_graphics_shared_stages");
 
-  // Same entry bytecode but a different root ABI must make new stage artifacts.
+  // Changing the root ABI recompiles the consuming PS while the root-free VS is shared.
   auto oldRoot = f.graphicsRoot;auto bytes = serializeRoot(8, false);
   f.graphicsRoot = root(f.device.Get(), bytes.Get());
   auto changed = f.graphicsDesc();ComPtr<ID3D12PipelineState> rootPso;
   std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE begin=root_abi\n");std::fflush(stderr);
   check(f.device->CreateGraphicsPipelineState(&changed, IID_PPV_ARGS(&rootPso)), "different root ABI create");
-  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=root_abi air=2 libraries_max=2\n");std::fflush(stderr);
+  std::fprintf(stderr, "OWNED_D3D12_PIPELINE_LIBRARY_ARTIFACT_PHASE end=root_abi air=1 libraries_max=1\n");std::fflush(stderr);
   f.draw(rootPso.Get(), color, 0xff332211u, "different_root_abi");f.graphicsRoot = oldRoot;
 
   // The ordinary PS epilogue consumes SampleMask. VS may share; PS must not.
